@@ -1,9 +1,4 @@
-"""LLM scene writer: story state + viewer profile + decision -> scene plan.
-
-Uses the OpenAI Chat Completions API over httpx (OPENAI_API_KEY,
-OPENAI_MODEL). Without a key a deterministic template writes the plan and
-is labelled "template" everywhere, so rehearsals never pretend to be AI.
-"""
+"""Bounded OpenAI decisions; local, small adjustments to existing prompts."""
 import json
 import os
 from pathlib import Path
@@ -12,6 +7,64 @@ import httpx
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 GENRES = {"suspense", "action", "humor", "romance", "drama"}
+ACTIONS = ("keep", "focus_character", "faster_pacing", "slower_pacing", "subtle_suspense", "subtle_humor", "clearer_dialogue")
+
+
+def decision_schema(names):
+    return dict(type="object", properties={
+        "action": dict(type="string", enum=list(ACTIONS)),
+        "focus": dict(type=["string", "null"], enum=[None, *names]),
+        "reason": dict(type="string", maxLength=300),
+    }, required=["action", "focus", "reason"], additionalProperties=False)
+
+
+def validate_decision(value, names):
+    if (not isinstance(value, dict) or set(value) != {"action", "focus", "reason"}
+            or value["action"] not in ACTIONS or value["focus"] not in [None, *names]
+            or not isinstance(value["reason"], str) or len(value["reason"]) > 300):
+        raise ValueError("OpenAI returned an invalid engagement decision.")
+    if (value["action"] == "focus_character") != (value["focus"] is not None):
+        raise ValueError("OpenAI's character focus does not match its action.")
+    # Keep the existing dashboard contract; these fields describe one decision.
+    return dict(**value, tension="higher" if value["action"] == "subtle_suspense" else "same",
+                pacing={"faster_pacing": "faster", "slower_pacing": "slower"}.get(value["action"], "same"),
+                dialogue="more" if value["action"] == "clearer_dialogue" else "same",
+                tone="humor" if value["action"] == "subtle_humor" else None,
+                event=False, reasons=[value["reason"]])
+
+
+def local_decision(hint, names):
+    """Clearly labelled no-key rehearsal fallback, constrained to one choice."""
+    action, focus = "keep", None
+    if hint.get("focus") in names:
+        action, focus = "focus_character", hint["focus"]
+    elif hint.get("pacing") == "faster":
+        action = "faster_pacing"
+    elif hint.get("tone") == "humor":
+        action = "subtle_humor"
+    elif hint.get("tension") == "higher":
+        action = "subtle_suspense"
+    elif hint.get("dialogue") == "more":
+        action = "clearer_dialogue"
+    return validate_decision(dict(action=action, focus=focus, reason="; ".join(hint.get("reasons", []))[:300]), names)
+
+
+def adjust_prompt(base, decision):
+    """Append at most one controlled cue. Never truncate or replace the scene."""
+    cue = {
+        "keep": "",
+        "focus_character": f"Gently emphasize {decision['focus']}'s existing reaction with a subtle camera push; preserve all scripted actions and lines.",
+        "faster_pacing": "Slightly quicken the existing gestures and camera movement; preserve every scripted action and spoken line.",
+        "slower_pacing": "Slightly soften the pace of existing gestures and camera movement; preserve every scripted action and spoken line.",
+        "subtle_suspense": "Add a subtle anticipatory pause and restrained ambience to the existing action, without introducing events or changing dialogue.",
+        "subtle_humor": "Gently emphasize the humor of the existing facial reactions, without adding jokes, events, or changing dialogue.",
+        "clearer_dialogue": "Make the existing spoken lines slightly clearer through natural delivery and restrained background sound; retain their exact wording.",
+    }[decision["action"]]
+    if not cue:
+        return base
+    addition = "\n\nSubtle engagement adjustment: " + cue
+    # A full-length user prompt wins over the optional cue.
+    return base + addition if len(base + addition) <= 8000 else base
 
 
 def system_prompt(duration):
@@ -38,7 +91,7 @@ def validate(plan, names, duration):
                       dialogue=False, tags=[])]
     return dict(scene_title=str(plan.get("scene_title", "Next scene"))[:120],
                 summary=str(plan.get("summary", ""))[:600], beats=beats,
-                video_prompt=plan["video_prompt"].strip()[:1500],
+                video_prompt=plan["video_prompt"],
                 change_note=str(plan.get("change_note", ""))[:300])
 
 
@@ -72,21 +125,25 @@ def user_message(story, profile, decision, duration):
         scene_number=len(story["scenes"]) + 1,
         duration_s=duration,
         viewer_profile=profile,
-        adaptation_decision=decision), indent=1)
+        next_prompt=story.get("next_prompt", story["premise"]),
+        viewer_analysis=story.get("viewer_analysis"),
+        viewer_data_available=bool(story["scenes"])), indent=1)
 
 
 async def write_scene(story, profile, decision, duration, transport=None):
     names = [c["name"] for c in story["characters"]]
     key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not key:
+    if not key or not story["scenes"]:
         return template(story, decision, duration, names), "template"
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    model = os.getenv("OPENAI_MODEL", "gpt-6-luna").strip() or "gpt-6-luna"
     async with httpx.AsyncClient(timeout=60, transport=transport) as client:
         response = await client.post(
-            "https://api.openai.com/v1/chat/completions",
+            "https://api.openai.com/v1/responses",
             headers={"Authorization": f"Bearer {key}"},
-            json=dict(model=model, response_format={"type": "json_object"}, temperature=0.8,
-                      messages=[{"role": "system", "content": system_prompt(duration)},
+            json=dict(model=model, store=False, max_output_tokens=1200, reasoning={"effort": "none"},
+                      text={"format": dict(type="json_schema", name="engagement_decision", strict=True,
+                                          schema=decision_schema(names))},
+                      input=[{"role": "system", "content": system_prompt(duration)},
                                 {"role": "user", "content": user_message(story, profile, decision, duration)}]))
     if not response.is_success:
         try:
@@ -94,35 +151,34 @@ async def write_scene(story, profile, decision, duration, transport=None):
         except ValueError:
             detail = ""
         raise ValueError(f"OpenAI request failed ({response.status_code}). {detail}".replace(key, "[redacted]")[:600])
-    content = response.json()["choices"][0]["message"]["content"]
-    return validate(json.loads(content), names, duration), f"openai:{model}"
+    payload = response.json()
+    if payload.get("status") != "completed":
+        raise ValueError("OpenAI decision did not complete. No new Fal generation was submitted.")
+    contents = [c for output in payload.get("output", []) if output.get("type") == "message"
+                for c in output.get("content", [])]
+    if any(c.get("type") == "refusal" for c in contents):
+        raise ValueError("OpenAI declined the engagement decision. No new Fal generation was submitted.")
+    texts = [c.get("text", "") for c in contents if c.get("type") == "output_text"]
+    if len(texts) != 1:
+        raise ValueError("OpenAI returned no usable engagement decision.")
+    choice = validate_decision(json.loads(texts[0]), names)
+    plan = template(story, choice, duration, names)
+    plan["decisionRequestId"] = payload.get("id")
+    return plan, f"openai:{model}"
 
 
 def template(story, decision, duration, names):
+    # This function assembles a plan locally; the model never supplies Fal text.
+    decision = decision if "action" in decision else local_decision(decision, names)
+    base = story.get("next_prompt", story["premise"])
+    if not isinstance(base, str) or not base.strip() or len(base) > 8000:
+        raise ValueError("The next scene needs its original prompt (1–8,000 characters).")
     focus = decision.get("focus")
-    others = [n for n in names if n != focus]
-    look = {c["name"]: c.get("description", "") for c in story["characters"]}
-    if focus:
-        action = (f"The camera slowly pushes in on {focus} ({look[focus]}), who steps into the center of the frame "
-                  f"and takes charge of the moment while {', '.join(others) or 'the others'} fall back into soft focus.")
-    else:
-        action = f"The camera holds a balanced two-shot of {' and '.join(names)} as the moment unfolds."
-    mood = {"higher": " Tension rises: low rumbling score, sharper light, quicker movements."}.get(decision.get("tension"), "")
-    if decision.get("event"):
-        mood += " Suddenly something unexpected crashes into the scene and everyone reacts."
-    if decision.get("tone"):
-        mood += f" The mood leans into {decision['tone']}."
-    pace = " Fast, energetic movement." if decision.get("pacing") == "faster" else ""
-    talk = " No dialogue, only ambience." if decision.get("dialogue") == "less" else ""
-    half = duration / 2
     return dict(
         scene_title=f"{focus} takes the lead" if focus else "The story continues",
-        summary=f"{focus or 'The group'} takes the lead as the story continues." ,
-        beats=[dict(t0=0.0, t1=half, description="Setup", characters=list(names), dialogue=False, speaker=None,
-                    tags=["drama"]),
-               dict(t0=half, t1=float(duration), description=f"{focus or 'Everyone'} in focus",
-                    characters=[focus] if focus else list(names), dialogue=decision.get("dialogue") != "less",
-                    speaker=focus if decision.get("dialogue") != "less" else None,
-                    tags=[decision.get("tone") or ("suspense" if decision.get("tension") == "higher" else "drama")])],
-        video_prompt=f"{story['premise']} {action}{mood}{pace}{talk}"[:1500],
+        summary=base[:600],
+        beats=parse_timeline(story.get("next_timeline", ""), names, duration) or
+              [dict(t0=0.0, t1=float(duration), description=base[:300], characters=list(names),
+                    dialogue=False, speaker=None, tags=[])],
+        base_prompt=base, video_prompt=adjust_prompt(base, decision), decision=decision,
         change_note=("; ".join(decision.get("reasons", [])))[:300])

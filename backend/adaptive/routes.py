@@ -57,6 +57,7 @@ class Sensors:
         self.gaze.close()
         if self.sim_task:
             self.sim_task.cancel()
+            await asyncio.gather(self.sim_task, return_exceptions=True)
 
 
 def number(value, lo, hi):
@@ -92,9 +93,18 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
             if len({c["name"] for c in characters}) != len(characters):
                 raise ValueError("Character names must be unique.")
             timeline = str(form.get("timeline", ""))[:20000]
+            use_sequence = str(form.get("use_saved_sequence", "0")) == "1"
+            bundles = None
+            if use_sequence:
+                records = e.clips.library()["clipDefinitions"]
+                bundles = e.bundles.validate([dict(id=c["id"], order=i,
+                                                **e.clips.settings(c).model_dump(mode="json"))
+                                             for i, c in enumerate(records)])
             video = form.get("opening")
+            if bundles and form.get("start"):
+                raise ValueError("Saved clips use their own frame pairs. Upload an opening video, or uncheck the saved-sequence option to use a custom opening frame.")
             frames = [] if video else await images(form, "start", 1)
-            if not frames and not video:
+            if not frames and not video and not bundles:
                 raise ValueError("Upload the opening episode clip (or an opening frame).")
             opening_video = None
             if video:
@@ -116,7 +126,7 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
                 sn.session = AdaptiveSession(e, sn.gaze, sn.eeg, e.directory, premise, characters,
                                              duration_value(form.get("duration", 10)),
                                              resolution_value(form.get("resolution", "480P")),
-                                             frames[0] if frames else None, opening_video, timeline)
+                                             frames[0] if frames else None, opening_video, timeline, bundles)
                 await sn.session.start()
             return sn.session.public()
         finally:

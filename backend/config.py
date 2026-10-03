@@ -1,5 +1,6 @@
 """Non-secret model configuration, ported from GOZ_TEST/config.js."""
 MODELS = {
+    "text": "minimax/h3-max-turbo/text-to-video",
     "frames": "minimax/h3-max-turbo/image-to-video",
     "characters": "minimax/h3-max/reference-to-video",
     "combined": "minimax/h3-max/reference-to-video",
@@ -19,7 +20,12 @@ def build_input(options, urls):
     duration = options.get("duration", DURATION)
     result = dict(prompt=options["prompt"], duration=duration,
                   resolution=options.get("resolution", "480P"),
-                  prompt_expansion_mode="disabled", enable_safety_checker=True, sync_mode=False)
+                  prompt_expansion_mode=options.get("promptExpansionMode", "disabled"), enable_safety_checker=True, sync_mode=False)
+    if options.get("seed") is not None:
+        result["seed"] = options["seed"]
+    if mode == "text":
+        result["aspect_ratio"] = options.get("aspectRatio", "16:9")
+        return result
     if mode == "frames":
         result["image_url"] = urls["start"]
         if urls.get("end"):

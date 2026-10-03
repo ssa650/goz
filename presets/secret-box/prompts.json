@@ -1,0 +1,124 @@
+{
+  "clips": [
+    {
+      "id": "secret-box-001",
+      "order": 0,
+      "duration": 15,
+      "seed": 741203,
+      "initialFrameFile": "00-00.jpg",
+      "endFrameFile": "00-15.jpg",
+      "promptExpansionMode": "disabled",
+      "prompt": "integrated_multimodal_description:\n\n[Shot 1] Begin exactly from the supplied black initial frame. Fade smoothly from black into the underwater neighborhood while preserving the exact visual style, character design, colors, proportions, and environment established by the supplied reference frames. Establishing wide shot. SpongeBob (S1) runs energetically through the neighborhood toward Patrick's rock while carrying jellyfishing nets. His movement is eager and bouncy. The camera follows his approach and settles into a closer exterior view of Patrick's rock. SpongeBob looks toward the rock and calls loudly and excitedly: <d>[English] Patrick! Patrick! Oh, Patrick! Are you ready to go jellyfishing?</d> Continue the action naturally until reaching the composition and character positions shown in the supplied end frame. Do not introduce additional characters or objects beyond those required by the scene.\n\noverall_soundscape:\nLight underwater neighborhood ambience, quick cartoon footsteps, subtle movement sounds from the jellyfishing nets.\n\nnon_diegetic_music:\nLight cheerful cartoon underscore supporting excited anticipation."
+    },
+    {
+      "id": "secret-box-002",
+      "order": 1,
+      "duration": 15,
+      "seed": 184927,
+      "initialFrameFile": "00-15.jpg",
+      "endFrameFile": "00-30.jpg",
+      "promptExpansionMode": "disabled",
+      "prompt": "integrated_multimodal_description:\n\n[Shot 1] Continue directly from the supplied initial frame. Preserve the exact appearances, scale, clothing, environment, and spatial layout established by the reference frame. Patrick (S2) emerges from beneath his rock carrying a small box and performs an enthusiastic acrobatic entrance. He lands near SpongeBob (S1), excited and energetic, and says: <d>[English] Oh, boy, am I!</d> SpongeBob happily presents Patrick with a jellyfishing net and says: <d>[English] Here's your net.</d>\n\n[Shot 2] The camera settles into a medium two-shot. Patrick's attention shifts from jellyfishing to the small box he is carrying. Patrick holds the box protectively and says: <d>[English] First, I have to put away my secret box.</d> SpongeBob's expression changes from cheerful anticipation to immediate curiosity. End naturally in the exact general pose and composition established by the supplied end frame.\n\noverall_soundscape:\nOutdoor underwater ambience, soft cartoon landing and movement sounds, subtle handling sounds from the net and box.\n\nnon_diegetic_music:\nPlayful light cartoon underscore."
+    },
+    {
+      "id": "secret-box-003",
+      "order": 2,
+      "duration": 15,
+      "seed": 593814,
+      "initialFrameFile": "00-30.jpg",
+      "endFrameFile": "00-45.jpg",
+      "promptExpansionMode": "disabled",
+      "prompt": "integrated_multimodal_description:\n\n[Shot 1] Continue from the supplied initial frame with SpongeBob (S1), Patrick (S2), and the secret box in their established positions. Maintain exact character appearance and environment from the reference frames. SpongeBob becomes intensely curious and reaches one hand toward the box, trying to peek inside. Patrick immediately pulls the box away from SpongeBob's reach and holds it tightly against himself. Patrick reacts protectively and says: <d>[English] Hey, hands off, PeepingBob! This here is my secret box!</d>\n\nPatrick keeps the box away from SpongeBob and explains with obvious certainty: <d>[English] Besides, if I showed you what was inside, it wouldn't be a secret anymore. Duh!</d> SpongeBob keeps his eyes fixed on the box, visibly intrigued. Use a medium two-shot followed by a slightly closer composition emphasizing Patrick and the box. Finish at the pose and framing established by the supplied end frame.\n\noverall_soundscape:\nQuiet outdoor ambience, subtle cloth and box handling sounds, quick cartoon movement when Patrick pulls the box away.\n\nnon_diegetic_music:\nLight teasing mystery."
+    },
+    {
+      "id": "secret-box-004",
+      "order": 3,
+      "duration": 15,
+      "seed": 318650,
+      "initialFrameFile": "00-45.jpg",
+      "endFrameFile": "01-00.jpg",
+      "promptExpansionMode": "disabled",
+      "prompt": "integrated_multimodal_description:\n\n[Shot 1] Continue seamlessly from the supplied initial frame. Patrick (S2) holds the secret box close to himself. Preserve the exact box design, character proportions, colors, background, and spatial continuity from the reference frames. Patrick turns the box toward himself, briefly opens the lid just enough for himself to see inside, looks down into it, and laughs with private amusement. SpongeBob (S1) immediately tries to lean in and see, but Patrick shuts the lid before SpongeBob can look inside.\n\nPatrick holds the closed box with a smug, teasing expression and says: <d>[English] Oh, SpongeBob... if only you could see what's inside my secret box, it would change your life!</d> SpongeBob becomes even more curious and moves around behind Patrick, stretching and leaning in an attempt to see over his shoulder while Patrick keeps the box protected against his body. End in the composition shown by the supplied end frame.\n\noverall_soundscape:\nOutdoor ambience, box lid opening and closing, Patrick's laughter, small cartoon movement sounds as SpongeBob changes position.\n\nnon_diegetic_music:\nPlayful comic mystery."
+    },
+    {
+      "id": "secret-box-005",
+      "order": 4,
+      "duration": 15,
+      "seed": 862145,
+      "initialFrameFile": "01-00.jpg",
+      "endFrameFile": "01-15.jpg",
+      "promptExpansionMode": "disabled",
+      "prompt": "integrated_multimodal_description:\n\n[Shot 1] Continue directly from the supplied initial frame. SpongeBob (S1) confidently reassures Patrick (S2) that he understands secrets. Maintain character designs and positions from the reference frame. SpongeBob becomes increasingly animated while speaking, using enthusiastic hand gestures and exaggerated facial expressions. SpongeBob says: <d>[English] I've got a gazillion secrets!</d>\n\nPatrick watches him. SpongeBob launches rapidly into an overly complicated explanation: <d>[English] Well, it's no secret that the best thing about a secret is secretly telling someone your secret, thereby secretly adding another secret to their secret collection of secrets. Secretly.</d> As SpongeBob talks faster, Patrick's expression shifts from attentive to completely confused. Use a medium two-shot and then emphasize SpongeBob while preserving Patrick's visible reaction. End at the supplied end-frame composition.\n\noverall_soundscape:\nOutdoor ambience and expressive cartoon gesture sounds. SpongeBob's dialogue is rapid and energetic.\n\nnon_diegetic_music:\nFast playful comedic underscore."
+    },
+    {
+      "id": "secret-box-006",
+      "order": 5,
+      "duration": 15,
+      "seed": 426731,
+      "initialFrameFile": "01-15.jpg",
+      "endFrameFile": "01-30.jpg",
+      "promptExpansionMode": "disabled",
+      "prompt": "integrated_multimodal_description:\n\n[Shot 1] Continue from the supplied initial frame. Preserve SpongeBob (S1), Patrick (S2), the box, and the environment exactly as established. SpongeBob changes from his complicated explanation to a warm, conspiratorial tone and asks Patrick if he wants to hear one of his secrets. SpongeBob moves closer to Patrick with eager body language. He pauses as if searching for the right secret, then leans beside Patrick and says warmly: <d>[English] Did you know that you're my best friend?</d>\n\nSpongeBob quickly moves away after revealing the secret. Patrick freezes for a beat, eyes widening in exaggerated amazement, then responds with delighted disbelief: <d>[English] No... way. Oh, let's hear another one!</d> Use close reaction shots and a close two-shot while maintaining continuity with the supplied boundary frames. Finish at the end-frame pose.\n\noverall_soundscape:\nSoft outdoor ambience, subtle cartoon movement sounds, short reaction beat after SpongeBob's revelation.\n\nnon_diegetic_music:\nWarm but silly playful underscore."
+    },
+    {
+      "id": "secret-box-007",
+      "order": 6,
+      "duration": 15,
+      "seed": 975284,
+      "initialFrameFile": "01-30.jpg",
+      "endFrameFile": "01-45.jpg",
+      "promptExpansionMode": "disabled",
+      "prompt": "integrated_multimodal_description:\n\n[Shot 1] Continue naturally from the supplied initial frame. Maintain the exact character designs, props, and exterior environment. SpongeBob (S1) considers another secret, then earnestly admits: <d>[English] Secretly... I'm a little bit naive.</d> His delivery is sincere rather than embarrassed.\n\nPatrick (S2) reacts as though SpongeBob has revealed something astonishing. Patrick looks impressed and studies SpongeBob with exaggerated fascination before saying: <d>[English] Wow! I'll never look at you the same way again, SpongeBob.</d> Patrick becomes excited and asks for more, saying: <d>[English] Tell me some more secrets!</d> SpongeBob happily prepares to continue. Use a medium two-shot with brief close reaction emphasis on Patrick. Reach the supplied end-frame state smoothly.\n\noverall_soundscape:\nOutdoor underwater ambience, small expressive movement sounds and clear dialogue.\n\nnon_diegetic_music:\nLighthearted comic confession music."
+    },
+    {
+      "id": "secret-box-008",
+      "order": 7,
+      "duration": 15,
+      "seed": 257419,
+      "initialFrameFile": "01-45.jpg",
+      "endFrameFile": "02-00.jpg",
+      "promptExpansionMode": "disabled",
+      "prompt": "integrated_multimodal_description:\n\n[Shot 1] Continue from the supplied initial frame. SpongeBob (S1) enthusiastically begins listing ordinary personal facts one after another while Patrick (S2) listens beside his rock with the secret box. Preserve character appearance, box design, colors, and background from the reference images. SpongeBob speaks rapidly and happily: <d>[English] Okay. I love my job at the Krusty Krab, I sleep with my shoes on, I like jelly on both sides of my toast, I've got an overdue library book...</d>\n\nAs SpongeBob continues talking without stopping, transition naturally to Patrick becoming increasingly relaxed. Patrick lowers himself and eventually rests his head against or near the secret box while SpongeBob continues his enthusiastic rambling nearby. The camera widens enough to show their positions beside Patrick's rock. End exactly in the general arrangement established by the supplied end frame.\n\noverall_soundscape:\nCalm outdoor ambience with SpongeBob's rapid continuous speech and subtle cartoon movement sounds.\n\nnon_diegetic_music:\nGentle humorous rambling underscore."
+    },
+    {
+      "id": "secret-box-009",
+      "order": 8,
+      "duration": 15,
+      "seed": 684352,
+      "initialFrameFile": "02-00.jpg",
+      "endFrameFile": "02-15.jpg",
+      "promptExpansionMode": "disabled",
+      "prompt": "integrated_multimodal_description:\n\n[Shot 1] Continue seamlessly from the supplied initial frame. SpongeBob (S1) finishes his extended list of ordinary secrets while Patrick (S2) remains nearby with the box. SpongeBob becomes especially enthusiastic for the final reveal and announces: <d>[English] And I'm wearing three pairs of underwear, right now.</d> SpongeBob performs the visual gag of revealing the three layers of underwear. Patrick reacts with genuine surprise and says: <d>[English] I never would have guessed.</d>\n\nSpongeBob quickly returns his attention to the secret box, hopeful that his honesty has earned access. He looks directly at Patrick and asks: <d>[English] Now will you show me what's inside your secret box?</d> Patrick's body language becomes guarded again as he secures the box. Finish in the supplied end-frame composition.\n\noverall_soundscape:\nOutdoor ambience, playful reveal sound accents, clear dialogue and subtle box movement.\n\nnon_diegetic_music:\nSilly reveal followed by a slight return to comic tension."
+    },
+    {
+      "id": "secret-box-010",
+      "order": 9,
+      "duration": 15,
+      "seed": 539781,
+      "initialFrameFile": "02-15.jpg",
+      "endFrameFile": "02-30.jpg",
+      "promptExpansionMode": "disabled",
+      "prompt": "integrated_multimodal_description:\n\n[Shot 1] Continue from the supplied initial frame. Patrick (S2) protects the secret box while SpongeBob (S1) waits expectantly. Keep exact visual continuity with both reference frames. Patrick firmly refuses and says: <d>[English] No, SpongeBob! It's for me to know and for you to never find out.</d> Patrick adopts an exaggeratedly serious and self-important posture and continues: <d>[English] You may be an open book, SpongeBob, but I'm a bit more complicated than that. The inner machinations of my mind are an enigma.</d>\n\n[Shot 2] At the appropriate comedic beat, briefly cut to Patrick's imagined mental image: a simple carton of milk tips over and spills by itself, presented as an absurd visual representation of his supposedly mysterious mind. Then transition back toward the exterior scene so the ending state matches the supplied end frame. Do not introduce unrelated imagery.\n\noverall_soundscape:\nOutdoor ambience during the conversation, then an intentionally simple liquid-pouring sound during the milk-carton gag.\n\nnon_diegetic_music:\nMock-serious mystery ending in absurd comedy."
+    },
+    {
+      "id": "secret-box-011",
+      "order": 10,
+      "duration": 15,
+      "seed": 103648,
+      "initialFrameFile": "02-30.jpg",
+      "endFrameFile": "02-45.jpg",
+      "promptExpansionMode": "disabled",
+      "prompt": "integrated_multimodal_description:\n\n[Shot 1] Continue from the supplied initial frame. SpongeBob (S1), frustrated that Patrick (S2) will not reveal the box, tries to prove that he also owns secret things. Preserve the established neighborhood, character appearance, and props. Begin with a close detail of SpongeBob indicating his socks while he proudly says: <d>[English] I've got my secret socks on.</d>\n\nSpongeBob rushes away and quickly returns carrying Gary's food bowl, presenting it dramatically and saying: <d>[English] And my secret Gary's bowl!</d> SpongeBob rushes away again and comes back pushing his television into the scene. He announces: <d>[English] My secret TV!</d> Patrick remains near the secret box and is largely unimpressed by SpongeBob's increasingly elaborate display. Use energetic medium and wide compositions while keeping the positions compatible with the supplied end frame.\n\noverall_soundscape:\nFast cartoon footsteps, objects sliding and being placed down, outdoor ambience and clear dialogue.\n\nnon_diegetic_music:\nEscalating playful comedy."
+    },
+    {
+      "id": "secret-box-012",
+      "order": 11,
+      "duration": 15,
+      "seed": 821576,
+      "initialFrameFile": "02-45.jpg",
+      "endFrameFile": "03-00.jpg",
+      "promptExpansionMode": "disabled",
+      "prompt": "integrated_multimodal_description:\n\n[Shot 1] Continue directly from the supplied initial frame with SpongeBob (S1), Patrick (S2), the television, and the surrounding belongings in their established positions. SpongeBob switches on the television. Cut briefly to the television screen displaying plain off-air color bars. SpongeBob proudly declares: <d>[English] And my secret TV channel.</d>\n\n[Shot 2] Return to a wider view. SpongeBob looks toward Patrick and asks eagerly: <d>[English] What do you think of that, Patrick? Patrick?</d> Patrick pays almost no attention to SpongeBob's display. Instead, Patrick settles beside his secret box, looks privately into it, and begins giggling. His laughter grows increasingly amused as his attention remains completely focused on the box. SpongeBob watches, increasingly frustrated that Patrick is ignoring him. Preserve the exact end-state, visual composition, box position, and character appearances established by the supplied end frame.\n\noverall_soundscape:\nOutdoor ambience, television switching on, faint electronic television noise, Patrick's growing laughter.\n\nnon_diegetic_music:\nComic anticlimax with a light mysterious undertone."
+    }
+  ]
+}

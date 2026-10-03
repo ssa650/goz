@@ -3,7 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check frontend/app.js && node --check frontend/queue.js",
-    "test": "node --test tests/player.test.js"
+    "check": "node --check frontend/adaptive.js && node --check frontend/app.js && node --check frontend/queue.js && node --check frontend/clip-state.js && node --check frontend/clip-editor.js && node --check frontend/sequence-playback.js && node --check frontend/sequence-controller.js",
+    "test": "node --test tests/*.test.js",
+    "typecheck": "tsc -p jsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }

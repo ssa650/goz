@@ -36,3 +36,18 @@ body.adaptive main{width:min(1480px,100%);padding:20px 22px 40px}
 #characters .row{display:grid;grid-template-columns:140px 1fr;gap:8px;margin:6px 0}
 #characters input{background:#111317;color:#e8e8eb;border:1px solid #3b414c;border-radius:6px;padding:8px}
 @media(max-width:1000px){.layout{grid-template-columns:1fr}}
+/* Keep dashboard forms self-contained when the main player has no editors. */
+.adaptive .panel-heading,.adaptive .player-footer{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.adaptive .panel-heading h2{font-size:18px;margin:0 0 14px}
+.adaptive .hint{font-size:12px;color:#959ca8}
+.adaptive #setup>label:not(.check){display:flex;flex-direction:column;gap:6px;margin:12px 0;font-size:13px}
+.adaptive textarea,.adaptive select{font:inherit;background:#111317;color:#e8e8eb;border:1px solid #3b414c;border-radius:6px;padding:8px;max-width:100%}
+.adaptive textarea{width:100%;resize:vertical;min-height:70px}
+.adaptive input[type=file]{font:inherit;font-size:12px}
+.adaptive .settings{display:flex;gap:16px;margin:12px 0}
+.adaptive .settings label{display:flex;align-items:center;gap:8px;font-size:12px}
+.adaptive select:disabled{opacity:.5}
+.adaptive pre{white-space:pre-wrap;overflow:auto;overflow-wrap:anywhere;font-size:12px}
+.adaptive #error{color:#ffaaa0;white-space:pre-wrap}
+.adaptive .stage-col{min-width:0}
+@media(max-width:600px){.adaptive .player-footer,.adaptive .settings{align-items:flex-start;flex-direction:column}.adaptive .toggles{flex-wrap:wrap}}

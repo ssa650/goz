@@ -2,7 +2,8 @@
 
 Scene N+1 is planned when playback of scene N passes ANALYZE_AT of its
 duration (so generation overlaps viewing), from the response measured so
-far. Each scene starts from the actual last frame of the previous one.
+far. Saved bundles keep their original prompt and frame pair. Custom
+scenes start from the actual last frame of the previous one.
 All signals are logged with wall-clock timestamps under
 data/adaptive/<session>/.
 """
@@ -10,11 +11,13 @@ import asyncio
 import json
 import os
 import time
+from copy import deepcopy
 from pathlib import Path
 from uuid import uuid4
 
 from . import director, fusion, profile as profiles, tracks
 from ..frames import ffmpeg
+from ..clip_settings import generation_options
 
 ANALYZE_AT = float(os.getenv("GOZ_ANALYZE_AT", "0.7"))
 MAX_SCENES = int(os.getenv("GOZ_MAX_SCENES", "4"))
@@ -24,7 +27,7 @@ DEMO_COLORS = ["0xe07a5f", "0x3d85c6", "0x81b29a", "0xf2cc8f"]
 
 class AdaptiveSession:
     def __init__(self, engine, gaze, eeg, directory, premise, characters, duration, resolution, opening,
-                 opening_video=None, timeline=""):
+                 opening_video=None, timeline="", clip_bundles=None):
         self.engine, self.gaze, self.eeg = engine, gaze, eeg
         self.id = str(uuid4())
         self.dir = Path(directory)/"adaptive"/self.id
@@ -33,6 +36,8 @@ class AdaptiveSession:
         self.story = dict(premise=premise, characters=characters, scenes=[])
         self.duration, self.resolution, self.opening = duration, resolution, opening
         self.opening_video, self.timeline = opening_video, timeline
+        self.clip_bundles = deepcopy(clip_bundles or [])
+        self.max_scenes = min(MAX_SCENES, len(self.clip_bundles)) if self.clip_bundles else MAX_SCENES
         self.profile = profiles.new_profile(self.names)
         self.clips, self.events = [], []
         self.stage, self.error, self.status = "starting", None, "running"
@@ -55,7 +60,7 @@ class AdaptiveSession:
         clips = [{k: v for k, v in c.items() if k not in ("ticks", "timeline", "image")} for c in self.clips]
         return dict(id=self.id, status=self.status, stage=self.stage, error=self.error, names=self.names,
                     story=self.story, profile=self.profile, clips=clips, playing=self.playing,
-                    duration=self.duration, demo=self.engine.adapter.demo, maxScenes=MAX_SCENES,
+                    duration=self.duration, demo=self.engine.adapter.demo, maxScenes=self.max_scenes,
                     events=self.events[-12:])
 
     # -- live helpers (dashboard + simulator) ------------------------------
@@ -166,13 +171,16 @@ class AdaptiveSession:
                                                               timeline=timeline, analysis=analysis))
             self.profile, changes = profiles.update(self.profile, analysis)
             self.log("profile", clip=index, changes=changes)
-            if len(self.clips) >= MAX_SCENES:
-                self.set_stage(f"finished: {MAX_SCENES}-scene limit reached")
+            if len(self.clips) >= self.max_scenes:
+                self.set_stage(f"finished: {self.max_scenes}-scene limit reached")
                 self.status = "finished"
                 return
-            decision = profiles.decide(self.profile, analysis)
+            self.story["viewer_analysis"] = analysis
+            # Only the no-key rehearsal uses a heuristic decision. OpenAI sees
+            # the measurements and chooses the adjustment itself.
+            decision = profiles.decide(self.profile, analysis) if not os.getenv("OPENAI_API_KEY", "").strip() else {}
             self.set_stage(f"extracting last frame of scene {index + 1}")
-            image = await self.engine.extractor(clip["path"])
+            image = None if self.clip_bundles else await self.engine.extractor(clip["path"])
             await self.make_scene(decision, image, seeds=tracks.final_boxes(clip.get("track") or []), changes=changes)
         except Exception as error:
             self.fail(error)
@@ -180,27 +188,42 @@ class AdaptiveSession:
     async def make_scene(self, decision, image, seeds, changes):
         index = len(self.clips)
         try:
-            self.set_stage(f"writing scene {index + 1}")
-            plan, writer = await director.write_scene(self.story, self.profile, decision, self.duration)
+            bundle = self.clip_bundles[index] if self.clip_bundles else None
+            duration = bundle["duration"] if bundle else self.duration
+            self.story["next_prompt"] = bundle["prompt"] if bundle else self.story["premise"]
+            self.set_stage(f"deciding a subtle adjustment for scene {index + 1}")
+            plan, writer = await director.write_scene(self.story, self.profile, decision, duration)
+            decision = plan["decision"]
             if self.status != "running":
                 return
             clip = dict(index=index, status="generating", decision=decision, changes=changes, plan=plan,
-                        writer=writer, duration=self.duration, ticks=[], seeds=seeds, createdAt=time.time())
+                        writer=writer, duration=duration, ticks=[], seeds=seeds, createdAt=time.time(),
+                        bundle=deepcopy(bundle), basePrompt=plan["base_prompt"])
             self.clips.append(clip)
             self.story["scenes"].append(dict(title=plan["scene_title"], summary=plan["summary"]))
             self.log("decision", clip=index, decision=decision, writer=writer, change_note=plan["change_note"])
             self.set_stage(f"generating scene {index + 1}")
-            job = self.engine.new_job(dict(mode="frames", prompt=plan["video_prompt"], duration=self.duration,
-                                           resolution=self.resolution), adaptiveSession=self.id, sceneIndex=index)
+            if bundle:
+                options = generation_options(self.engine.clips.settings(bundle))
+                options["prompt"] = plan["video_prompt"]
+                images = {}  # Stored first/end frames win; never replace them with another clip's frame.
+            else:
+                options = dict(mode="frames", prompt=plan["video_prompt"], duration=duration, resolution=self.resolution)
+                images = {"start": [image]}
+            job = self.engine.new_job(options, adaptiveSession=self.id, sceneIndex=index,
+                                      clipId=bundle["id"] if bundle else None,
+                                      sourceClipId=bundle["id"] if bundle else None,
+                                      basePrompt=plan["base_prompt"], engagementDecision=decision,
+                                      decisionModel=writer, decisionRequestId=plan.get("decisionRequestId"))
             clip["jobId"] = job["id"]
-            await self.engine.run_job(job, {"start": [image]})
+            await self.engine.run_job(job, images)
             if job["status"] != "completed":
                 raise ValueError(job.get("error", "Generation did not complete."))
             path = await self.engine.media_path(job)
             if self.engine.adapter.demo:
-                await self.demo_render(path, decision.get("focus"))
+                await self.demo_render(path, decision.get("focus"), duration)
             self.set_stage(f"tracking characters in scene {index + 1}")
-            clip["track"] = await self.track(path, seeds, decision.get("focus"))
+            clip["track"] = await self.track(path, seeds, decision.get("focus"), duration)
             clip.update(path=str(path), url=f"/api/jobs/{job['id']}/video", status="ready",
                         generatedS=round(time.time() - clip["createdAt"], 1),
                         detected=sum(1 for f in clip["track"] if f["boxes"]))
@@ -225,11 +248,11 @@ class AdaptiveSession:
         boxes = self.demo_boxes(focus)
         return [dict(t=round(i / tracks.SAMPLE_FPS, 3), boxes=boxes) for i in range(int(seconds * tracks.SAMPLE_FPS) + 1)]
 
-    async def demo_render(self, path, focus):
+    async def demo_render(self, path, focus, duration=None):
         filters = ",".join(f"drawbox=x=iw*{b[0]}:y=ih*{b[1]}:w=iw*{b[2] - b[0]}:h=ih*{b[3] - b[1]}:color={DEMO_COLORS[i % 4]}:t=fill"
                            for i, b in enumerate(self.demo_boxes(focus).values()))
         temporary = Path(str(path) + ".demo.mp4")
-        await ffmpeg("-f", "lavfi", "-i", "color=c=0x1d2330:s=640x360:r=24", "-t", str(self.duration), "-vf", filters,
+        await ffmpeg("-f", "lavfi", "-i", "color=c=0x1d2330:s=640x360:r=24", "-t", str(duration or self.duration), "-vf", filters,
                      "-c:v", "libx264", "-threads", "2", "-pix_fmt", "yuv420p", "-movflags", "+faststart", temporary)
         os.replace(temporary, path)
 

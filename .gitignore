@@ -8,3 +8,5 @@ data/
 output/
 *.log
 .DS_Store
+
+node_modules/

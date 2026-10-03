@@ -325,10 +325,201 @@ async def test_prompt_file_splitting_and_video_byte_ranges(tmp_path):
         assert response.status_code==202,response.text
         run=e.sequences[data['id']]
         await until(lambda:run['status']=='completed')
-        assert len(run['prompts'])==2
-        assert 'part 1 of 2' in run['prompts'][0]
+        assert len(run['clipDefinitions'])==2
+        assert 'part 1 of 2' in run['clipDefinitions'][0]['prompt']
         video=await c.get(run['clips'][0]['url'],headers={'Range':'bytes=0-31'})
         assert video.status_code==206 and len(video.content)==32
         assert video.headers['content-type']=='video/mp4'
         download=await c.get(f"/api/jobs/{run['clips'][0]['jobId']}/download")
         assert download.status_code==200 and 'attachment' in download.headers['content-disposition']
+
+
+async def upload_reference(client, color='red'):
+    r=await client.post('/api/images',files={'image':('frame.png',png(color),'image/png')})
+    assert r.status_code==201,r.text
+    return r.json()
+
+
+@pytest.mark.asyncio
+async def test_individual_clips_seed_stability_duplicate_and_frame_isolation(tmp_path):
+    async with harness(tmp_path) as (e,a,c):
+        first=await upload_reference(c)
+        end=await upload_reference(c,'green')
+        r=await c.post('/api/clips',json=dict(prompt='Clip one',seed=483729,firstFrame=first['id'],endFrame=end['id'],promptExpansionMode='balanced',duration=8,resolution='768P'))
+        assert r.status_code==201,r.text
+        clip1=r.json()
+        clip2=(await c.post('/api/clips',json={'prompt':'Clip two'})).json()
+        original_seed=clip2['seed']
+        for _ in range(3):
+            cards=(await c.get('/api/clips')).json()
+            assert cards[1]['seed']==original_seed
+        duplicate=(await c.post(f"/api/clips/{clip1['id']}/duplicate")).json()
+        assert duplicate['id']!=clip1['id']
+        for field in ('prompt','seed','firstFrame','endFrame','promptExpansionMode','duration','resolution'):
+            assert duplicate[field]==clip1[field]
+        assert duplicate['result'] is None
+        await c.patch(f"/api/clips/{duplicate['id']}",json={'prompt':'Different prompt','seed':42,'firstFrame':None,'endFrame':None})
+        cards=(await c.get('/api/clips')).json()
+        assert cards[0]['seed']==483729 and cards[0]['firstFrame']['id']==first['id']
+        assert cards[1]['firstFrame'] is None
+        assert cards[2]['firstFrame'] is None and cards[2]['seed']==42
+        assert (await c.get(first['previewUrl'])).content==png()
+        assert not a.uploads # selection persists locally without provider calls
+    async with harness(tmp_path) as (e,a,c):
+        cards=(await c.get('/api/clips')).json()
+        assert cards[0]['seed']==483729 and cards[1]['seed']==original_seed
+        assert cards[0]['firstFrame']['id']==first['id']
+
+
+@pytest.mark.asyncio
+async def test_per_clip_validation_and_invalid_uploads(tmp_path):
+    async with harness(tmp_path) as (e,a,c):
+        first=await upload_reference(c)
+        for patch in ({'seed':1.5},{'seed':True},{'seed':'12'},{'seed':None},{'seed':2**53},{'promptExpansionMode':'unknown'},
+                      {'endFrame':first['id']},{'firstFrame':str(uuid4())},{'duration':4},{'resolution':'2K'}):
+            r=await c.post('/api/clips',json={'prompt':'Test',**patch})
+            assert r.status_code==400,r.text
+        invalid=await c.post('/api/images',files={'image':('fake.png',b'not an image','image/png')})
+        assert invalid.status_code==400
+        oversized=await c.post('/api/images',files={'image':('big.png',b'x'*(10*1024*1024+1),'image/png')})
+        assert oversized.status_code==400
+        assert (await c.post('/api/images',data={})).status_code==400
+        assert not a.submissions
+
+
+@pytest.mark.asyncio
+async def test_outgoing_h3_http_payloads_and_regeneration_for_all_frame_states(tmp_path):
+    """Inspect serialized POST bodies at the installed HTTP adapter boundary."""
+    calls=[]
+    def provider(request):
+        if request.method=='POST':
+            calls.append((str(request.url),json.loads(request.content)))
+            return httpx.Response(200,json={'request_id':f'paid-{len(calls)}'})
+        if request.url.path.endswith('/status'):
+            return httpx.Response(200,json={'status':'COMPLETED'})
+        return httpx.Response(200,json={'video':{'url':'https://fal.media/result.mp4'}})
+    adapter=FalAdapter('fake-secret',transport=httpx.MockTransport(provider))
+    uploads=[]
+    async def upload(image):
+        uploads.append(image)
+        return f'https://fal.media/upload-{len(uploads)}.png'
+    adapter.upload=upload
+    async with harness(tmp_path,adapter) as (e,a,c):
+        initial=await upload_reference(c)
+        end=await upload_reference(c,'blue')
+        for frames in ({},{'firstFrame':initial['id']},{'firstFrame':initial['id'],'endFrame':end['id']}):
+            card=(await c.post('/api/clips',json=dict(prompt='Test exact payload',seed=483729,promptExpansionMode='quality',duration=8,resolution='768P',**frames))).json()
+            token=str(uuid4())
+            r=await c.post(f"/api/clips/{card['id']}/generate",json={'token':token})
+            assert r.status_code==202,r.text
+            job=e.jobs[r.json()['id']]
+            await until(lambda:job['status']=='completed')
+            url,payload=calls[-1]
+            assert url=='https://queue.fal.run/minimax/h3-max-turbo/'+('image-to-video' if frames else 'text-to-video')
+            assert payload['prompt']=='Test exact payload' and payload['seed']==483729
+            assert payload['prompt_expansion_mode']=='quality' and payload['duration']==8 and payload['resolution']=='768P'
+            assert ('image_url' in payload)==('firstFrame' in frames)
+            assert ('end_image_url' in payload)==('endFrame' in frames)
+            assert 'firstFrame' not in payload and 'endFrame' not in payload
+            assert job['seed']==483729 # documented result has no seed echo
+            assert job['generationInput']==payload
+            assert 'fake-secret' not in json.dumps(job)
+            before=len(calls)
+            retry=await c.post(f"/api/clips/{card['id']}/generate",json={'token':token})
+            assert retry.json()['id']==job['id'] and len(calls)==before
+            regenerated=await c.post(f"/api/clips/{card['id']}/generate",json={'token':str(uuid4())})
+            new_job=e.jobs[regenerated.json()['id']]
+            await until(lambda:new_job['status']=='completed')
+            assert calls[-1]==(url,payload)
+        assert len(uploads)==2 # persisted references reused for exact payloads
+        saved=json.loads((tmp_path/'history.json').read_text())
+        assert all(j['seed']==483729 and j.get('generationInput') for j in saved)
+
+
+@pytest.mark.asyncio
+async def test_independent_concurrent_clips_failure_and_restart_metadata(tmp_path):
+    a=FakeAdapter();a.queued=True
+    async with harness(tmp_path,a) as (e,a,c):
+        cards=[(await c.post('/api/clips',json={'prompt':f'Clip {i}','seed':i})).json() for i in range(4)]
+        accepted=await asyncio.gather(*(c.post(f"/api/clips/{card['id']}/generate",json={'token':str(uuid4())}) for card in cards))
+        assert all(r.status_code==202 for r in accepted)
+        await until(lambda:len(a.submissions)==4)
+        assert (await c.patch(f"/api/clips/{cards[0]['id']}",json={'seed':9})).status_code==409
+        assert (await c.post(f"/api/clips/{cards[0]['id']}/generate",json={'token':str(uuid4())})).status_code==409
+        original_result=a.result
+        async def result(model,request_id):
+            if request_id=='request-3':raise FalError('Clip 3 rejected',422)
+            return await original_result(model,request_id)
+        a.result=result;a.queued=False
+        await until(lambda:all(j['status'] in ('completed','failed') for j in e.jobs.values()))
+        results=(await c.get('/api/clips')).json()
+        assert [r['status'] for r in results]==['completed','completed','failed','completed']
+        assert results[2]['result']['error']=='Clip 3 rejected'
+        assert results[0]['result']['seed']==0 and results[3]['result']['seed']==3
+    async with harness(tmp_path) as (e,a,c):
+        results=(await c.get('/api/clips')).json()
+        assert results[0]['result']['generationInput']['seed']==0
+        assert results[2]['status']=='failed' and results[3]['status']=='completed'
+        r=await c.post(f"/api/clips/{results[2]['id']}/generate",json={'token':str(uuid4())})
+        assert r.status_code==202
+        await until(lambda:e.jobs[r.json()['id']]['status']=='completed')
+
+
+@pytest.mark.asyncio
+async def test_old_prompt_strings_migrate_once_and_unknown_legacy_seed_is_not_claimed(tmp_path):
+    (tmp_path/'history.json').write_text(json.dumps([dict(id='old-job',mode='frames',model=MODELS['frames'],prompt='Old prompt',status='completed',seed=None,duration=5,resolution='480P')]))
+    (tmp_path/'sequences.json').write_text(json.dumps([dict(id='old-sequence',mode='keyframes',status='completed',prompts=['Old prompt'],duration=5,resolution='480P',clips=[{'index':0,'jobId':'old-job'}])]))
+    async with harness(tmp_path) as (e,a,c):
+        old=(await c.get('/api/clips')).json()[0]
+        assert type(old['seed']) is int and old['promptExpansionMode']=='disabled'
+        assert old['firstFrame'] is None and old['endFrame'] is None
+        assert old['result']['seed'] is None and old['legacyMetadata']
+        again=(await c.get('/api/clips')).json()[0]
+        assert again['id']==old['id'] and again['seed']==old['seed']
+        legacy=(await c.get('/api/sequences')).json()
+        assert len(legacy)==1 and legacy[0]['id']=='old-sequence'
+    async with harness(tmp_path) as (e,a,c):
+        again=(await c.get('/api/clips')).json()[0]
+        assert again['id']==old['id'] and again['seed']==old['seed']
+
+
+@pytest.mark.asyncio
+async def test_upload_failure_and_missing_provider_url_are_visible_per_clip(tmp_path):
+    a=FakeAdapter()
+    async def bad_upload(image):return None
+    a.upload=bad_upload
+    async with harness(tmp_path,a) as (e,a,c):
+        image=await upload_reference(c)
+        bad=(await c.post('/api/clips',json={'prompt':'With frame','firstFrame':image['id']})).json()
+        r=await c.post(f"/api/clips/{bad['id']}/generate",json={'token':str(uuid4())})
+        await until(lambda:e.jobs[r.json()['id']]['status']=='failed')
+        assert 'no usable URL' in e.jobs[r.json()['id']]['error']
+        assert not a.submissions
+        good=(await c.post('/api/clips',json={'prompt':'Text only'})).json()
+        r=await c.post(f"/api/clips/{good['id']}/generate",json={'token':str(uuid4())})
+        assert r.status_code==202
+        await until(lambda:e.jobs[r.json()['id']]['status']=='completed')
+
+
+@pytest.mark.asyncio
+async def test_replacing_same_image_keeps_duplicate_attachment_and_frozen_payload(tmp_path):
+    async with harness(tmp_path) as (e,a,c):
+        first=await upload_reference(c)
+        card=(await c.post('/api/clips',json={'prompt':'Frame test','seed':17,'firstFrame':first['id']})).json()
+        generated=await c.post(f"/api/clips/{card['id']}/generate",json={'token':str(uuid4())})
+        old_job=e.jobs[generated.json()['id']]
+        await until(lambda:old_job['status']=='completed')
+        old_payload=old_job['generationInput'].copy()
+        duplicate=(await c.post(f"/api/clips/{card['id']}/duplicate")).json()
+        replacement=await upload_reference(c)
+        assert replacement['id']!=first['id'] and replacement['providerUrl'] is None
+        await c.patch(f"/api/clips/{card['id']}",json={'firstFrame':replacement['id']})
+        generated=await c.post(f"/api/clips/{card['id']}/generate",json={'token':str(uuid4())})
+        new_job=e.jobs[generated.json()['id']]
+        await until(lambda:new_job['status']=='completed')
+        assert old_job['generationInput']==old_payload
+        assert new_job['generationInput']['image_url']!=old_payload['image_url']
+        assert old_job['seedSource']=='submitted' and new_job['seed']==17
+        cards=(await c.get('/api/clips')).json()
+        dup=next(record for record in cards if record['id']==duplicate['id'])
+        assert dup['firstFrame']['id']==first['id'] and dup['firstFrame']['providerUrl']==old_payload['image_url']

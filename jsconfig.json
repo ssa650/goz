@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM"]
+  },
+  "include": ["frontend/app.js", "frontend/sequence-controller.js", "frontend/clip-state.js", "frontend/clip-editor.js", "frontend/sequence-playback.js", "frontend/queue.js"]
+}

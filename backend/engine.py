@@ -11,6 +11,9 @@ from .config import MODELS, POLL_SECONDS, MAX_CLIPS
 from .frames import download_video, extract_last_frame, video_url
 from .fal_adapter import FalError
 from .prompts import plan
+from .clip_settings import random_seed, build_h3_request, ReferenceFrame
+from .clips import ClipService
+from .bundle_sequence import BundleSequenceService
 
 JOB_TERMINAL = {"completed", "failed", "cancelled"}
 SEQUENCE_TERMINAL = JOB_TERMINAL | {"interrupted"}
@@ -23,10 +26,15 @@ class Engine:
         self.directory = Path(directory)
         self.media = self.directory/"media"
         self.media.mkdir(parents=True, exist_ok=True)
+        self.images = self.directory/"images"
+        self.images.mkdir(parents=True, exist_ok=True)
+        self.image_refs = {p.stem: json.loads(p.read_text()) for p in self.images.glob("*.json")}
         self.poll_seconds, self.max_job_seconds = poll_seconds, max_job_seconds
         self.extractor = extractor
         self.jobs = self.load("history.json")
         self.sequences = self.load("sequences.json")
+        self.clips = ClipService(self)
+        self.bundles = BundleSequenceService(self)
         self.lock = asyncio.Lock()
         self.tasks, self.sequence_tasks, self.uploads, self.media_locks = set(), {}, {}, {}
         self.monitored = set()
@@ -44,10 +52,13 @@ class Engine:
         return {record["id"]: record for record in json.loads(path.read_text())}
 
     def persist(self):
+        protected_jobs = {c.get("jobId") for s in self.sequences.values() if s.get("mode") == "individual" for c in s.get("clipDefinitions", [])}
+        protected_jobs.update(c.get("jobId") for s in self.sequences.values() if s.get("mode") == "individual" for c in s.get("beforeImport", []))
+        protected_jobs.update(c.get("jobId") for s in self.sequences.values() if s.get("mode") == "bundles" for c in s["clips"])
         for name, records, limit in (("history.json", self.jobs, 100), ("sequences.json", self.sequences, 20)):
             while len(records) > limit:
                 removable = next((key for key, record in records.items()
-                    if record["status"] in SEQUENCE_TERMINAL and not record.get("requestUncertain")), None)
+                    if record["status"] in SEQUENCE_TERMINAL and record.get("mode") != "individual" and record["id"] not in protected_jobs and not record.get("requestUncertain")), None)
                 if removable is None:
                     break
                 records.pop(removable)
@@ -68,7 +79,13 @@ class Engine:
             s["status"] not in SEQUENCE_TERMINAL for s in self.sequences.values())
 
     def snapshot(self, sequence):
-        return {**sequence, "generationBusy": self.busy()}
+        if sequence.get("mode") == "bundles":
+            return self.bundles.snapshot(sequence)
+        result = {**sequence, "generationBusy": self.busy()}
+        if sequence.get("clipDefinitions") and sequence.get("mode") != "individual":
+            # Read-only compatibility for older clients. Definitions are the source.
+            result["prompts"] = [c["prompt"] for c in sequence["clipDefinitions"]]
+        return result
 
     def public_job(self, job):
         result = {**job, "serverNow": now()}
@@ -88,6 +105,8 @@ class Engine:
             sequence = self.sequences[record["sequenceId"]]
             if sequence["status"] not in SEQUENCE_TERMINAL:
                 sequence.update(generationStatus=record["status"], requestId=record.get("requestId"), warning=record.get("connectionWarning"))
+        self.clips.job_updated(record)
+        self.bundles.job_updated(record)
         self.persist()
 
     def finish(self, job, **patch):
@@ -95,6 +114,11 @@ class Engine:
                     apiElapsedMs=now()-job["apiStartedAt"] if job.get("apiStartedAt") else None)
 
     def new_job(self, options, **metadata):
+        options = {**options}
+        if options["mode"] in ("text", "frames"):
+            if options.get("seed") is None:
+                options["seed"] = random_seed()
+            options.setdefault("promptExpansionMode", "disabled")
         job = dict(id=str(uuid4()), **options, **metadata, model=MODELS[options["mode"]], status="uploading", startedAt=now())
         self.jobs[job["id"]] = job
         self.persist()
@@ -106,7 +130,12 @@ class Engine:
             self.uploads[digest] = asyncio.create_task(self.adapter.upload(image))
         task = self.uploads[digest]
         try:
-            return await task
+            url = await task
+            if not isinstance(url, str) or not url.strip():
+                raise ValueError("Image upload returned no usable URL. Try uploading the image again.")
+            if not self.adapter.demo:
+                video_url(url)
+            return url
         except Exception:
             self.uploads.pop(digest, None)
             raise
@@ -122,18 +151,35 @@ class Engine:
 
     async def run_job(self, job, images):
         try:
-            names = list(images)
-            urls_list = await asyncio.gather(*(self.upload(image) for name in names for image in images[name]))
+            mapping = {}
+            if job.get("clipId"):
+                for field, key in (("firstFrame", "start"), ("endFrame", "end")):
+                    if job.get(field):
+                        mapping[key] = await self.upload_reference(job[field])
+            else:
+                names = list(images)
+                urls_list = await asyncio.gather(*(self.upload(image) for name in names for image in images[name]))
+                cursor = 0
+                for name in names:
+                    values = urls_list[cursor:cursor+len(images[name])]
+                    cursor += len(values)
+                    mapping[name] = values if name == "characters" else values[0]
+                    if name in ("start", "end"):
+                        reference = self.save_reference(images[name][0])
+                        reference["providerUrl"] = values[0]
+                        self.persist_reference(reference)
+                        job["firstFrame" if name == "start" else "endFrame"] = reference["id"]
             if not self.can_continue(job):
                 self.finish(job, status="cancelled")
                 return job
-            mapping, cursor = {}, 0
-            for name in names:
-                values = urls_list[cursor:cursor+len(images[name])]
-                cursor += len(values)
-                mapping[name] = values if name == "characters" else values[0]
-            from .config import build_input
-            payload = build_input(job, mapping)
+            if job["mode"] in ("frames", "text"):
+                model, payload = build_h3_request(job, mapping)
+                job["model"] = model
+            else:
+                from .config import build_input
+                payload = build_input(job, mapping)
+            # Freeze the exact provider input, including uploaded URLs, before submission.
+            job["generationInput"] = payload
             self.update(job, uploadElapsedMs=now()-job["startedAt"], apiStartedAt=now(), status="submitting")
             submitted = await self.adapter.submit(job["model"], payload)
             if not submitted.get("request_id"):
@@ -143,6 +189,8 @@ class Engine:
                 await self.cancel_job(job)
             await self.monitor(job)
         except Exception as error:
+            if getattr(error, "status", None) is not None:
+                job["providerStatus"] = error.status
             if job.get("apiStartedAt") and not job.get("requestId") and getattr(error, "status", None) not in (400,401,403,422):
                 job["requestUncertain"] = True
             self.finish(job, status="failed", error=self.error(error)+(" Check Fal request history; new submissions are blocked." if job.get("requestUncertain") else ""))
@@ -183,7 +231,8 @@ class Engine:
                     if not self.adapter.demo:
                         video_url(data["video"]["url"])
                     self.finish(job, status="completed", video=data["video"], timings=data.get("timings"),
-                                seed=data.get("seed"), expandedPrompt=data.get("expanded_prompt"), apiReadyMs=api_ready)
+                                seed=data.get("seed") if type(data.get("seed")) is int else job.get("seed"),
+                                seedSource="provider" if type(data.get("seed")) is int else "submitted" if job.get("seed") is not None else "unknown", expandedPrompt=data.get("expanded_prompt"), apiReadyMs=api_ready)
                     return
                 await asyncio.sleep(self.poll_seconds)
         except Exception as error:
@@ -214,25 +263,33 @@ class Engine:
             planned = plan(text, mode, duration)
             if len(frames) != planned["frameCount"]:
                 raise ValueError(f"Upload exactly {planned['frameCount']} frames for {len(planned['clips'])} clips.")
-            sequence = dict(id=run_id, mode=mode, prompts=planned["clips"], scenes=planned["scenes"], duration=duration,
+            # Convert the deprecated multipart interface into atomic bundles at
+            # ingress. The runner never indexes a separate prompt/frame array.
+            references = [self.save_reference(image)["id"] for image in frames]
+            definitions = [dict(id=str(uuid4()), order=index, prompt=prompt, seed=random_seed(),
+                                firstFrame=references[index] if mode == "keyframes" else references[0] if index == 0 else None,
+                                endFrame=references[index+1] if mode == "keyframes" else None,
+                                duration=duration, resolution=resolution, promptExpansionMode="disabled")
+                           for index, prompt in enumerate(planned["clips"])]
+            sequence = dict(id=run_id, mode=mode, clipDefinitions=definitions, scenes=planned["scenes"], duration=duration,
                             resolution=resolution, model=MODELS["frames"], status="preparing", index=0, clips=[], startedAt=now())
             self.sequences[run_id] = sequence
             self.persist()
-            self.sequence_tasks[run_id] = self.spawn(self.run_sequence(sequence, frames))
+            self.sequence_tasks[run_id] = self.spawn(self.run_sequence(sequence))
             return sequence
 
-    async def run_sequence(self, sequence, frames):
-        image = frames[0]
+    async def run_sequence(self, sequence):
         try:
-            for index, prompt in enumerate(sequence["prompts"]):
+            for index, definition in enumerate(sequence["clipDefinitions"]):
                 if sequence["status"] in SEQUENCE_TERMINAL:
                     return
                 self.update(sequence, status="generating", index=index)
-                images = {"start": [frames[index]], "end": [frames[index+1]]} if sequence["mode"] == "keyframes" else {"start": [image]}
-                job = self.new_job(dict(mode="frames", prompt=prompt, duration=sequence["duration"], resolution=sequence["resolution"]),
+                from .clip_settings import generation_options
+                job = self.new_job(generation_options(self.clips.settings(definition)), clipId=definition["id"],
                                    sequenceId=sequence["id"], sequenceIndex=index, frameControl=sequence["mode"])
+                definition["jobId"] = job["id"]
                 self.update(sequence, activeJobId=job["id"])
-                await self.run_job(job, images)
+                await self.run_job(job, {})
                 if sequence["status"] in SEQUENCE_TERMINAL:
                     return
                 if job["status"] != "completed":
@@ -242,13 +299,14 @@ class Engine:
                             apiReadyMs=job.get("apiReadyMs"), inferenceMs=(job["timings"]["inference"]*1000 if (job.get("timings") or {}).get("inference") is not None else None))
                 sequence["clips"].append(clip)
                 self.update(sequence, activeJobId=None, requestId=None, generationStatus=None)
-                if index+1 == len(sequence["prompts"]):
+                if index+1 == len(sequence["clipDefinitions"]):
                     self.update(sequence, status="completed", finishedAt=now())
                     return
                 if sequence["mode"] == "chain":
                     self.update(sequence, status="extracting")
                     started = time.monotonic()
                     image = await self.extractor(await self.media_path(job))
+                    sequence["clipDefinitions"][index+1]["firstFrame"] = self.save_reference(image)["id"]
                     clip["extractMs"] = (time.monotonic()-started)*1000
                     self.persist()
         except Exception as error:
@@ -258,6 +316,8 @@ class Engine:
             self.sequence_tasks.pop(sequence["id"], None)
 
     async def cancel_sequence(self, sequence):
+        if sequence.get("mode") == "bundles":
+            return await self.bundles.cancel(sequence)
         if sequence["status"] not in SEQUENCE_TERMINAL:
             extracting = sequence["status"] == "extracting"
             self.update(sequence, status="cancelled", finishedAt=now(), warning="No further clips will start. An accepted Fal request may still finish and be charged.")
@@ -286,6 +346,53 @@ class Engine:
                 temporary.unlink(missing_ok=True)
                 raise
         return path
+
+    def persist_reference(self, reference):
+        path = self.images/f"{reference['id']}.json"
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(reference))
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+        self.image_refs[reference["id"]] = reference
+
+    def save_reference(self, image, reuse=True):
+        digest = hashlib.sha256(image.data).hexdigest()
+        existing = next((ref for ref in self.image_refs.values() if ref.get("sha256") == digest), None)
+        if existing and reuse:
+            return existing
+        # An explicit replacement owns a new reference, even for identical bytes.
+        # Refresh a completed upload cache entry so replacing an expired URL can recover.
+        cached = self.uploads.get(digest)
+        if not reuse and cached and cached.done():
+            self.uploads.pop(digest, None)
+        reference_id = str(uuid4())
+        path = self.images/f"{reference_id}.bin"
+        path.write_bytes(image.data)
+        path.chmod(0o600)
+        reference = dict(id=reference_id, name=image.name, contentType=image.content_type,
+                         size=len(image.data), previewUrl=f"/api/images/{reference_id}", providerUrl=None, sha256=digest)
+        self.persist_reference(reference)
+        return reference
+
+    def reference_exists(self, reference_id):
+        return reference_id in self.image_refs and (self.images/f"{reference_id}.bin").is_file()
+
+    def reference(self, reference_id):
+        if not self.reference_exists(reference_id):
+            raise ValueError("The reference image is missing. Upload it again.")
+        return ReferenceFrame.model_validate(self.image_refs[reference_id]).model_dump(mode="json")
+
+    async def upload_reference(self, reference_id):
+        reference = self.image_refs[reference_id]
+        if reference.get("providerUrl"):
+            if not self.adapter.demo:
+                video_url(reference["providerUrl"])
+            return reference["providerUrl"]
+        from .frames import verify_image
+        image = await asyncio.to_thread(verify_image, (self.images/f"{reference_id}.bin").read_bytes(), reference["name"])
+        reference["providerUrl"] = await self.upload(image)
+        self.persist_reference(reference)
+        return reference["providerUrl"]
 
     async def resume(self):
         for job in self.jobs.values():

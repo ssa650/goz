@@ -22,11 +22,17 @@ function addCharacter(name = '', description = '') {
   row.append(n, d); $('characters').append(row);
 }
 $('add-character').addEventListener('click', () => addCharacter());
+function syncSequenceSettings() {
+  $('duration').disabled = $('resolution').disabled = $('use-sequence').checked;
+}
+$('use-sequence').addEventListener('change', syncSequenceSettings);
 $('setup').addEventListener('submit', async event => {
   event.preventDefault(); error('');
   const characters = [...$('characters').children].map(r => ({ name: r.children[0].value.trim(), description: r.children[1].value.trim() })).filter(c => c.name);
   const body = new FormData(), file = $('opening').files[0];
-  body.append(file && file.type.startsWith('video/') ? 'opening' : 'start', file); body.append('premise', $('premise').value);
+  if (file) body.append(file.type.startsWith('video/') ? 'opening' : 'start', file);
+  body.append('use_saved_sequence', $('use-sequence').checked ? '1' : '0');
+  body.append('premise', $('premise').value);
   body.append('timeline', $('timeline').value);
   body.append('characters', JSON.stringify(characters)); body.append('duration', $('duration').value); body.append('resolution', $('resolution').value);
   $('start').disabled = true;
@@ -184,6 +190,7 @@ async function init() {
   try {
     const config = await request('/api/config');
     $('duration').replaceChildren(...config.durations.map(n => new Option(String(n), String(n)))); $('duration').value = '10';
+    syncSequenceSettings();
     $('cost-note').textContent = config.demo ? 'DEMO mode: synthetic clips, no Fal calls.' : config.configured
       ? 'Each scene is a paid Fal generation (and an OpenAI call if OPENAI_API_KEY is set).' : 'Fal key missing: set FAL_KEY in .env and restart.';
   } catch (e) { error(e.message); }

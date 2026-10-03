@@ -91,3 +91,55 @@ async def extract_last_frame(path):
                      "scale='min(1920,iw)':'min(1920,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
                      "-fps_mode", "passthrough", "-threads", "2", "-update", "1", output)
         return verify_image(output.read_bytes(), "actual-last-frame.png")
+
+
+def media_metadata(path):
+    reader = imageio_ffmpeg.read_frames(str(path))
+    try:
+        return next(reader)
+    finally:
+        reader.close()
+
+
+async def stitch_videos(clips, destination):
+    """Normalize local clips then concatenate strictly by their explicit order.
+
+    Preserve source audio; add silence for clips without audio. Mixed image
+    aspect ratios are letterboxed to the first clip's canvas, without cropping.
+    Trim/pad each segment to its requested duration (provider output can vary).
+    """
+    import os
+    ordered = sorted(clips, key=lambda clip:clip["order"])
+    if not ordered or [c["order"] for c in ordered] != list(range(len(ordered))):
+        raise ValueError("Cannot stitch an incomplete or ambiguous clip order.")
+    if len({c["clipId"] for c in ordered}) != len(ordered):
+        raise ValueError("Cannot stitch duplicate clip IDs.")
+    metadata = [await asyncio.to_thread(media_metadata, c["path"]) for c in ordered]
+    width, height = metadata[0]["size"]
+    factor = min(1, 1920/max(width,height))
+    width, height = max(2,int(width*factor)//2*2), max(2,int(height*factor)//2*2)
+    temporary = destination.with_suffix(".part.mp4")
+    try:
+        with tempfile.TemporaryDirectory(prefix="goz-stitch-", dir=destination.parent) as directory:
+            directory = Path(directory)
+            files = []
+            for index, (clip, meta) in enumerate(zip(ordered,metadata)):
+                output = directory/f"clip-{index:03}.mp4"
+                args = ["-protocol_whitelist", "file,pipe", "-threads", "2", "-i", clip["path"]]
+                if not meta.get("audio_codec"):
+                    args += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+                args += ["-map", "0:v:0", "-map", "0:a:0" if meta.get("audio_codec") else "1:a:0",
+                         "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24,tpad=stop_mode=clone:stop_duration={clip['duration']}",
+                         "-af", "apad", "-t", clip["duration"], "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                         "-threads", "2", "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "48000", "-ac", "2", output]
+                await ffmpeg(*args)
+                files.append(output.name)
+            manifest = directory/"clips.txt"
+            manifest.write_text("".join(f"file '{name}'\n" for name in files))
+            await ffmpeg("-protocol_whitelist", "file,pipe", "-f", "concat", "-safe", "1", "-i", manifest,
+                         "-c", "copy", "-movflags", "+faststart", temporary)
+            temporary.chmod(0o600)
+            os.replace(temporary,destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
