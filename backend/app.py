@@ -94,8 +94,12 @@ def create_app(engine=None):
             app.state.engine = Engine(adapter, directory)
         else:
             app.state.engine = engine
+        from .adaptive.routes import Sensors
+        app.state.sensors = Sensors()
+        await app.state.sensors.start()
         await app.state.engine.resume()
         yield
+        await app.state.sensors.close()
         await app.state.engine.close()
 
     app = FastAPI(title="GOZ", lifespan=lifespan)
@@ -289,6 +293,9 @@ def create_app(engine=None):
             raise FalError("Video not found.", 404)
         path = await e.media_path(job)
         return FileResponse(path, media_type="video/mp4", filename=f"goz-{job_id}.mp4" if request.url.path.endswith("/download") else None)
+
+    from .adaptive.routes import register
+    register(app, json_body, images, multipart, duration_value, resolution_value)
 
     app.mount("/", StaticFiles(directory=ROOT/"frontend", html=True), name="frontend")
     return app

@@ -6,3 +6,9 @@ python-dotenv==1.2.4
 fal-client==0.14.1
 imageio-ffmpeg==0.6.0
 pillow==12.3.0
+# adaptive story: EEG band powers, person detection, Muse 2 over LSL
+numpy>=1.26
+# 1.0.1 aborts in model init on macOS
+mediapipe>=1.0.0,!=1.0.1
+pylsl>=1.17
+muselsl>=2.2
