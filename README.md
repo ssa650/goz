@@ -1,7 +1,4 @@
 # GOZ
-
-Hackathon starter migrated from `/Users/shayan/GOZ_TEST`.
-
 The **Python backend** handles Fal uploads, model payloads, queue submission/status/results, cancellation, prompt parsing and scene splitting, actual last-frame extraction, history, and MP4 downloads. The **plain JavaScript frontend** is a video player with temporary debug controls for frame uploads, prompt files/pasting, duration, resolution, run status, timings, and downloads. It calls only this local backend; it has no provider SDK or API credentials.
 
 ## Start
