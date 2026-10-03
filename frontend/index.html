@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GOZ · Video player</title><link rel="stylesheet" href="/style.css"><script type="module" src="/app.js"></script>
+</head>
+<body><main>
+  <header><a class="brand" href="/">GOZ<span class="dot"></span></a><span id="backend-status" class="badge">Connecting…</span></header>
+  <section class="player-panel" aria-label="Video player">
+    <div class="player-heading"><h1>Your next scene.</h1><span class="eyebrow">VIDEO PLAYER</span></div>
+    <div id="screen">
+      <video id="video-a" muted playsinline preload="auto" disablepictureinpicture disableremoteplayback hidden></video>
+      <video id="video-b" muted playsinline preload="auto" disablepictureinpicture disableremoteplayback hidden></video>
+      <div id="overlay">Upload frames and prompts to start your sequence.</div>
+    </div>
+    <div class="player-footer"><p id="playback-status" role="status">Playback starts when clip 1 is ready.</p><div><button id="view" type="button" hidden>Start viewing</button><button id="sound" class="secondary" type="button">Enable sound</button></div></div>
+  </section>
+  <section class="debug-panel" aria-label="Generation debug controls">
+    <div class="panel-heading"><h2>Debug controls</h2><span class="eyebrow">HACKATHON BUILD</span></div>
+    <p class="intro">Add your frames and scene prompts, then watch the clips arrive in order.</p>
+    <details id="key-panel"><summary id="key-status">Checking Fal key…</summary><form id="key-form"><label>Fal key <input id="key" type="password" autocomplete="off" required></label><button>Use key</button></form><p>Stored in local Python server memory. You can also set FAL_KEY in .env.</p></details>
+    <form id="run-form"><fieldset id="inputs">
+      <label>Frame mode <select id="frame-mode"><option value="keyframes">Start and end keyframes for every clip</option><option value="chain">Initial frame → chain from each clip's last frame</option></select></label>
+      <label id="keyframes-field">Keyframes, in order <input id="keyframes" type="file" accept="image/png,image/jpeg,image/webp" multiple></label>
+      <p id="keyframe-count"></p>
+      <label id="image-field" hidden>Initial frame <input id="image" type="file" accept="image/png,image/jpeg,image/webp"></label>
+      <div id="frame-previews" aria-label="Selected frames"></div>
+      <div class="prompt-heading"><label for="prompt-file">Prompt file</label><span class="hint">.txt or .json · up to 100 KB</span></div>
+      <input id="prompt-file" type="file" accept=".txt,.json,text/plain,application/json">
+      <label>Ordered prompts <textarea id="prompts" rows="6" placeholder="One prompt per line, or a JSON array for multiline scenes." required></textarea></label>
+      <p id="batch-count">0 clips · maximum 12</p>
+      <div class="settings"><label>Seconds per clip <select id="duration"></select></label><label>Resolution <select id="resolution"><option value="480P">480p</option><option value="768P">768p</option><option value="1080P">1080p</option></select></label></div>
+    </fieldset><p id="mode-note"></p><div class="actions"><button id="run" type="submit" disabled>Run sequence</button><button id="cancel" class="secondary" type="button" disabled>Cancel</button></div></form>
+    <p id="status" role="status" aria-live="polite">Ready.</p><p id="error" role="alert" hidden></p>
+    <details><summary>Completed clips & timings</summary><div id="downloads"><p>No clips yet.</p></div></details>
+    <details><summary>Backend debug state</summary><pre id="debug-state">No run started.</pre></details>
+  </section>
+</main></body></html>

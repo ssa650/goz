@@ -1,0 +1,9 @@
+{
+  "name": "goz-player",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check frontend/app.js && node --check frontend/queue.js",
+    "test": "node --test tests/player.test.js"
+  }
+}
