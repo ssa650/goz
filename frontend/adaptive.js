@@ -18,15 +18,16 @@ function addCharacter(name = '', description = '') {
   const rows = $('characters').children.length; if (rows >= 4) return;
   const row = el('div', 'row');
   const n = el('input'); n.placeholder = `Character ${String.fromCharCode(65 + rows)}`; n.value = name; n.maxLength = 40; n.required = true;
-  const d = el('input'); d.placeholder = 'Look (e.g. red jacket, silver hair)'; d.value = description; d.maxLength = 200;
+  const d = el('input'); d.placeholder = 'Look (e.g. green octopus with a long nose)'; d.value = description; d.maxLength = 200;
   row.append(n, d); $('characters').append(row);
 }
 $('add-character').addEventListener('click', () => addCharacter());
 $('setup').addEventListener('submit', async event => {
   event.preventDefault(); error('');
   const characters = [...$('characters').children].map(r => ({ name: r.children[0].value.trim(), description: r.children[1].value.trim() })).filter(c => c.name);
-  const body = new FormData();
-  body.append('start', $('opening').files[0]); body.append('premise', $('premise').value);
+  const body = new FormData(), file = $('opening').files[0];
+  body.append(file && file.type.startsWith('video/') ? 'opening' : 'start', file); body.append('premise', $('premise').value);
+  body.append('timeline', $('timeline').value);
   body.append('characters', JSON.stringify(characters)); body.append('duration', $('duration').value); body.append('resolution', $('resolution').value);
   $('start').disabled = true;
   try { await request('/api/adaptive/sessions', { method: 'POST', body }); }
@@ -160,7 +161,8 @@ function render(st) {
   if (latest) {
     const d = latest.decision;
     $('decision').replaceChildren(el('span', `chip${d.focus ? ' on' : ''}`, `focus: ${d.focus || 'balanced'}`), el('span', `chip${d.tension !== 'same' ? ' on' : ''}`, `tension: ${d.tension}`),
-      el('span', `chip${d.dialogue !== 'same' ? ' on' : ''}`, `dialogue: ${d.dialogue}`), el('span', `chip${d.pacing !== 'same' ? ' on' : ''}`, `pacing: ${d.pacing}`));
+      el('span', `chip${d.dialogue !== 'same' ? ' on' : ''}`, `dialogue: ${d.dialogue}`), el('span', `chip${d.pacing !== 'same' ? ' on' : ''}`, `pacing: ${d.pacing}`),
+      el('span', `chip${d.tone ? ' on' : ''}`, `tone: ${d.tone || 'same'}`), el('span', `chip${d.event ? ' on' : ''}`, `new event: ${d.event ? 'yes' : 'no'}`));
     $('reasons').replaceChildren(...d.reasons.map(r => el('li', null, r)));
     $('change-note').textContent = latest.plan.change_note; $('writer').textContent = latest.writer;
     $('next-title').textContent = `Scene ${latest.index + 1}: ${latest.plan.scene_title}`; $('next-prompt').textContent = latest.plan.video_prompt;

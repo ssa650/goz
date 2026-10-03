@@ -18,11 +18,13 @@ from ..frames import ffmpeg
 
 ANALYZE_AT = float(os.getenv("GOZ_ANALYZE_AT", "0.7"))
 MAX_SCENES = int(os.getenv("GOZ_MAX_SCENES", "4"))
+TRACKER = os.getenv("GOZ_TRACKER", "fal")
 DEMO_COLORS = ["0xe07a5f", "0x3d85c6", "0x81b29a", "0xf2cc8f"]
 
 
 class AdaptiveSession:
-    def __init__(self, engine, gaze, eeg, directory, premise, characters, duration, resolution, opening):
+    def __init__(self, engine, gaze, eeg, directory, premise, characters, duration, resolution, opening,
+                 opening_video=None, timeline=""):
         self.engine, self.gaze, self.eeg = engine, gaze, eeg
         self.id = str(uuid4())
         self.dir = Path(directory)/"adaptive"/self.id
@@ -30,6 +32,7 @@ class AdaptiveSession:
         self.names = [c["name"] for c in characters]
         self.story = dict(premise=premise, characters=characters, scenes=[])
         self.duration, self.resolution, self.opening = duration, resolution, opening
+        self.opening_video, self.timeline = opening_video, timeline
         self.profile = profiles.new_profile(self.names)
         self.clips, self.events = [], []
         self.stage, self.error, self.status = "starting", None, "running"
@@ -110,9 +113,43 @@ class AdaptiveSession:
 
     # -- the loop -------------------------------------------------------------
     async def start(self):
-        decision = dict(focus=None, tension="same", dialogue="same", pacing="same",
+        decision = dict(focus=None, tension="same", dialogue="same", pacing="same", tone=None, event=False,
                         reasons=["Opening scene: no viewer data yet"])
-        self.task = asyncio.create_task(self.make_scene(decision, self.opening, seeds=None, changes=[]))
+        if self.opening_video:
+            self.task = asyncio.create_task(self.predefined_scene(decision))
+        else:
+            self.task = asyncio.create_task(self.make_scene(decision, self.opening, seeds=None, changes=[]))
+
+    async def predefined_scene(self, decision):
+        """Scene 1 is the uploaded episode segment; only the rest is generated."""
+        try:
+            import imageio_ffmpeg
+            path = self.opening_video
+            _, seconds = await asyncio.to_thread(imageio_ffmpeg.count_frames_and_secs, str(path))
+            seconds = round(seconds, 2)
+            beats = director.parse_timeline(self.timeline, self.names, seconds)
+            plan = dict(scene_title="Opening segment (predefined)", summary=self.story["premise"],
+                        beats=beats or [dict(t0=0.0, t1=seconds, description="Opening", characters=list(self.names),
+                                             dialogue=False, speaker=None, tags=[])],
+                        video_prompt="(predefined clip, not generated)", change_note="The episode starts as written.")
+            clip = dict(index=0, status="tracking", decision=decision, changes=[], plan=plan, writer="predefined",
+                        duration=seconds, ticks=[], seeds=None, createdAt=time.time(), path=str(path))
+            self.clips.append(clip)
+            self.story["scenes"].append(dict(title=plan["scene_title"], summary=plan["summary"]))
+            self.set_stage("tracking characters in the opening segment")
+            clip["track"] = await self.track(path, None, None, seconds)
+            clip.update(url=f"/api/adaptive/clips/{self.id}/0", status="ready",
+                        detected=sum(1 for f in clip["track"] if f["boxes"]))
+            self.set_stage("scene 1 ready")
+        except Exception as error:
+            self.fail(error)
+
+    async def track(self, path, seeds, focus, seconds=None):
+        if self.engine.adapter.demo:
+            return self.demo_track(focus, seconds or self.duration)
+        if TRACKER == "people":
+            return await tracks.track_clip(path, self.engine.directory, self.names, seeds)
+        return await tracks.detect_characters(path, self.story["characters"], self.engine.adapter.key)
 
     async def adapt(self, index):
         try:
@@ -161,10 +198,9 @@ class AdaptiveSession:
                 raise ValueError(job.get("error", "Generation did not complete."))
             path = await self.engine.media_path(job)
             if self.engine.adapter.demo:
-                clip["track"] = await self.demo_clip(path, decision.get("focus"))
-            else:
-                self.set_stage(f"tracking characters in scene {index + 1}")
-                clip["track"] = await tracks.track_clip(path, self.engine.directory, self.names, seeds)
+                await self.demo_render(path, decision.get("focus"))
+            self.set_stage(f"tracking characters in scene {index + 1}")
+            clip["track"] = await self.track(path, seeds, decision.get("focus"))
             clip.update(path=str(path), url=f"/api/jobs/{job['id']}/video", status="ready",
                         generatedS=round(time.time() - clip["createdAt"], 1),
                         detected=sum(1 for f in clip["track"] if f["boxes"]))
@@ -172,9 +208,8 @@ class AdaptiveSession:
         except Exception as error:
             self.fail(error)
 
-    async def demo_clip(self, path, focus):
-        """Demo mode only: draw one box per character (focus = big, centred)
-        and return their known tracks instead of running the detector."""
+    def demo_boxes(self, focus):
+        """Demo mode only: one box per character (focus = big, centred)."""
         n = len(self.names)
         boxes = {}
         for i, name in enumerate(self.names):
@@ -184,13 +219,19 @@ class AdaptiveSession:
                 slot = (i + 0.5) / n
                 w = 0.18 if focus else 0.24
                 boxes[name] = [max(0.02, slot - w / 2), 0.35 if focus else 0.2, min(0.98, slot + w / 2), 0.95]
+        return boxes
+
+    def demo_track(self, focus, seconds):
+        boxes = self.demo_boxes(focus)
+        return [dict(t=round(i / tracks.SAMPLE_FPS, 3), boxes=boxes) for i in range(int(seconds * tracks.SAMPLE_FPS) + 1)]
+
+    async def demo_render(self, path, focus):
         filters = ",".join(f"drawbox=x=iw*{b[0]}:y=ih*{b[1]}:w=iw*{b[2] - b[0]}:h=ih*{b[3] - b[1]}:color={DEMO_COLORS[i % 4]}:t=fill"
-                           for i, b in enumerate(boxes.values()))
+                           for i, b in enumerate(self.demo_boxes(focus).values()))
         temporary = Path(str(path) + ".demo.mp4")
         await ffmpeg("-f", "lavfi", "-i", "color=c=0x1d2330:s=640x360:r=24", "-t", str(self.duration), "-vf", filters,
                      "-c:v", "libx264", "-threads", "2", "-pix_fmt", "yuv420p", "-movflags", "+faststart", temporary)
         os.replace(temporary, path)
-        return [dict(t=round(i / tracks.SAMPLE_FPS, 3), boxes=boxes) for i in range(int(self.duration * tracks.SAMPLE_FPS) + 1)]
 
     def fail(self, error):
         self.error = self.engine.error(error)

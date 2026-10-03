@@ -61,6 +61,18 @@ def fixations(timeline):
     return runs
 
 
+def speaking_windows(timeline, beats):
+    """{speaker: [(wall_t0, wall_t1)]} for beats with a speaker, mapped from
+    video time to wall time through the labelled gaze timeline."""
+    out = {}
+    for beat in beats:
+        speaker = beat.get("speaker")
+        window = [e["t"] for e in timeline if beat["t0"] <= e["video_t"] < beat["t1"]]
+        if speaker and window:
+            out.setdefault(speaker, []).append((window[0], window[-1]))
+    return out
+
+
 def analyze(timeline, eeg, track, names, plan=None):
     """Clip-level response summary used by the profile and the dashboard."""
     dt = np.diff([e["t"] for e in timeline]) if len(timeline) > 1 else np.array([])
@@ -78,16 +90,22 @@ def analyze(timeline, eeg, track, names, plan=None):
     clip_z = float(np.mean(zs)) if zs else 0.0
     fix = fixations(timeline)
     characters = {}
+    lines = speaking_windows(timeline, (plan or {}).get("beats", []))
     for n in names:
         windows = [z for (name, onset, _) in fix if name == n
                    for (t, _, z, a) in eeg if not a and onset + EEG_LAG_S[0] <= t <= onset + EEG_LAG_S[1]]
         eeg_resp = float(np.mean(windows)) - clip_z if windows else 0.0
+        spoken = [z for (w0, w1) in lines.get(n, []) for (t, _, z, a) in eeg
+                  if not a and w0 + EEG_LAG_S[0] <= t <= w1 + EEG_LAG_S[0]]
+        speaking = float(np.mean(spoken)) - clip_z if spoken else None
         attention = dwell[n] / visible[n] if visible[n] > 0.5 else 0.0
+        boost = max(0.0, eeg_resp) + 0.5 * max(0.0, speaking or 0.0)
         characters[n] = dict(
             visible_s=round(visible[n], 2), dwell_s=round(dwell[n], 2), attention=round(attention, 3),
             fixations=sum(1 for f in fix if f[0] == n), eeg_response=round(eeg_resp, 3),
-            response=round(attention * (1 + max(0.0, eeg_resp)), 3),
-            strong=attention >= STRONG_ATTENTION and eeg_resp >= STRONG_EEG_Z)
+            speaking_response=round(speaking, 3) if speaking is not None else None,
+            response=round(attention * (1 + boost), 3),
+            strong=attention >= STRONG_ATTENTION and (eeg_resp >= STRONG_EEG_Z or (speaking or 0) >= STRONG_EEG_Z))
     span = (timeline[-1]["t"] - timeline[0]["t"]) if len(timeline) > 1 else 0.0
     blinks = sum(1 for a, b in zip(timeline, timeline[1:]) if b["blink"] and not a["blink"])
     away = [e for e in timeline if not e["on_video"] or abs(e.get("yaw") or 0) > LOOK_AWAY_YAW]

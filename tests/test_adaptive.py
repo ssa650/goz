@@ -72,6 +72,50 @@ def test_mvp_strong_response_to_b_makes_next_scene_focus_b():
     assert "pushes in on Bea" in plan["video_prompt"]
 
 
+def test_timeline_parsing_marks_speakers_and_tags():
+    beats = director.parse_timeline("0-3 SpongeBob: I'm ready! #humor\n3-7 Squidward: Not today.\n"
+                                    "7-12 Patrick crashes through the door #action\nnot a line", 
+                                    ["SpongeBob", "Squidward", "Patrick"], 10)
+    assert [b["speaker"] for b in beats] == ["SpongeBob", "Squidward", None]
+    assert beats[0]["tags"] == ["humor"] and beats[2]["characters"] == ["Patrick"] and beats[2]["t1"] == 10
+
+
+def test_eeg_rise_while_a_character_speaks_counts_as_strong():
+    ticks, track, gaze, _ = watch(favourite="Bea")
+    t0 = ticks[0]["wall"]
+    eeg = [(t0 + i * 0.25, 1.0, 1.4 if 4.3 <= i * 0.25 <= 8.3 else -0.6, False) for i in range(40)]
+    plan = dict(beats=[dict(t0=0, t1=4, speaker="Ana", dialogue=True, tags=[]),
+                       dict(t0=4, t1=8, speaker="Bea", dialogue=True, tags=[]),
+                       dict(t0=8, t1=10, speaker=None, dialogue=False, tags=[])])
+    analysis = fusion.analyze(fusion.label(gaze, ticks, track), eeg, track, ["Ana", "Bea"], plan)
+    assert analysis["characters"]["Bea"]["speaking_response"] > 0.5 > analysis["characters"]["Ana"]["speaking_response"]
+    assert analysis["characters"]["Bea"]["strong"]
+    profile, changes = profiles.update(profiles.new_profile(["Ana", "Bea"]), analysis)
+    assert "while Bea spoke" in next(c["why"] for c in changes if c["key"] == "character:Bea")
+
+
+@pytest.mark.asyncio
+async def test_fal_character_detection_labels_boxes_by_character(tmp_path):
+    from backend.frames import ffmpeg
+    video = tmp_path/"clip.mp4"
+    await ffmpeg("-f", "lavfi", "-i", "color=c=yellow:s=320x180:r=10", "-t", "1.5", "-pix_fmt", "yuv420p", video)
+    asked = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        asked.append(body["text_input"])
+        assert body["image_url"].startswith("data:image/jpeg;base64,")
+        if body["text_input"] == "green octopus":
+            return httpx.Response(200, json={"results": {"bboxes": [{"x": 300, "y": 30, "w": 150, "h": 200, "label": "o"}]}})
+        return httpx.Response(200, json={"results": {"bboxes": [{"x": 0, "y": 0, "w": 512, "h": 288, "label": "all"}]}})
+
+    chars = [dict(name="Squidward", description="green octopus"), dict(name="SpongeBob", description="yellow sponge")]
+    track = await tracks.detect_characters(video, chars, "k", transport=httpx.MockTransport(handler))
+    assert len(track) == 3 and set(asked) == {"green octopus", "yellow sponge"}
+    assert set(track[0]["boxes"]) == {"Squidward"}
+    assert track[0]["boxes"]["Squidward"] == [round(300 / 512, 4), round(30 / 288, 4), round(450 / 512, 4), round(230 / 288, 4)]
+
+
 def test_gaze_outside_playback_or_while_blinking_is_ignored():
     ticks, track, gaze, _ = watch()
     late = dict(gaze[0], t=gaze[0]["t"] + 500)
@@ -112,7 +156,7 @@ async def test_director_openai_request_and_validation(monkeypatch):
     plan, writer = await director.write_scene(story, profiles.new_profile(["Ana", "Bea"]), dict(focus="Bea"), 10,
                                               transport=httpx.MockTransport(handler))
     assert writer.startswith("openai:") and seen["response_format"] == {"type": "json_object"}
-    assert plan["beats"][0] == dict(t0=0.0, t1=10.0, description="", characters=["Bea"], dialogue=True, tags=["action"])
+    assert plan["beats"][0] == dict(t0=0.0, t1=10.0, description="", characters=["Bea"], dialogue=True, speaker=None, tags=["action"])
 
 
 @pytest.mark.asyncio
@@ -162,3 +206,47 @@ async def test_end_to_end_demo_loop_adapts_to_simulated_viewer(tmp_path, monkeyp
             assert state["eeg"]["source"] == "sim" and state["gaze"]["source"] == "sim"
             logged = list((tmp_path/"adaptive"/s["id"]).iterdir())
             assert any(p.name == "scene1_signals.json" for p in logged)
+
+
+@pytest.mark.asyncio
+async def test_predefined_opening_clip_is_scene_one(tmp_path, monkeypatch):
+    from backend.frames import ffmpeg
+    monkeypatch.setenv("GOZ_GAZE", "sim")
+    monkeypatch.setenv("GOZ_EEG", "sim")
+    monkeypatch.setenv("GOZ_SIM_BIAS", "0.95")
+    import backend.adaptive.session as session_module
+    monkeypatch.setattr(session_module, "ANALYZE_AT", 0.9)
+    clip = tmp_path/"episode.mp4"
+    await ffmpeg("-f", "lavfi", "-i", "color=c=yellow:s=320x180:r=24", "-t", "4", "-pix_fmt", "yuv420p", clip)
+    engine = Engine(DemoAdapter(tmp_path/"demo"), tmp_path, poll_seconds=.01)
+    app = create_app(engine)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as c:
+            r = await c.post("/api/adaptive/sessions", files=[("opening", ("episode.mp4", clip.read_bytes(), "video/mp4"))],
+                             data=dict(premise="A day at the Krusty Krab.", duration="5", resolution="480P",
+                                       timeline="0-2 SpongeBob: Order up! #humor\n2-4 Squidward: Ugh.",
+                                       characters=json.dumps([dict(name="SpongeBob", description="yellow sponge"),
+                                                              dict(name="Squidward", description="green octopus")])))
+            assert r.status_code == 202, r.text
+            for _ in range(200):
+                s = (await c.get("/api/adaptive/state")).json()["session"]
+                if s["clips"] and s["clips"][0]["status"] == "ready":
+                    break
+                await asyncio.sleep(.05)
+            first = s["clips"][0]
+            assert first["writer"] == "predefined" and abs(first["duration"] - 4) < 0.2
+            assert [b["speaker"] for b in first["plan"]["beats"]] == ["SpongeBob", "Squidward"]
+            assert (await c.get(first["url"])).status_code == 200
+            assert not engine.jobs, "the opening clip must not be generated"
+            rect, start = dict(x=0, y=0, w=640, h=360), time.time()
+            while time.time() - start < 3.8:
+                await c.post("/api/adaptive/tick", json=dict(clip=0, video_t=time.time() - start, playing=True,
+                                                             rect=rect, wall=time.time() * 1000))
+                await asyncio.sleep(.08)
+            for _ in range(300):
+                s = (await c.get("/api/adaptive/state")).json()["session"]
+                if len(s["clips"]) > 1 and s["clips"][1]["status"] == "ready":
+                    break
+                await asyncio.sleep(.05)
+            assert s["clips"][1]["decision"]["focus"] == "Squidward", s["clips"][1]["decision"]
+            assert len(engine.jobs) == 1

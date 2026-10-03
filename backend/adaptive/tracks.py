@@ -1,6 +1,8 @@
 """Where each character is on screen over a clip's timeline.
 
-People are detected with MediaPipe EfficientDet-Lite0 (COCO "person";
+Default (GOZ_TRACKER=fal, cartoon-safe): Florence-2 open-vocabulary
+detection on Fal finds each character by its description; see
+detect_characters. GOZ_TRACKER=people: live-action people are detected with MediaPipe EfficientDet-Lite0 (COCO "person";
 ~7 MB model, downloaded on first use to data/models/). Identities come
 from seeds: clip 1 uses the left-to-right character order of the opening
 frame; every later clip starts from the previous clip's actual last frame,
@@ -105,12 +107,71 @@ async def track_clip(video, directory, names, seeds=None):
     return assign(detections, names, seeds)
 
 
+FAL_DETECTOR = "https://fal.run/fal-ai/florence-2-large/open-vocabulary-detection"
+FAL_FPS = 2
+FAL_CONCURRENCY = 10
+
+
+def sample_jpegs(video, fps=FAL_FPS, width=512):
+    """[(t, jpeg_bytes, w, h)] frames sampled at `fps`."""
+    from io import BytesIO
+    from PIL import Image as PILImage
+    reader = imageio_ffmpeg.read_frames(str(video))
+    sw, sh = reader.__next__()["size"]
+    reader.close()
+    h = int(round(sh * width / sw / 2)) * 2
+    reader = imageio_ffmpeg.read_frames(str(video), output_params=["-vf", f"fps={fps},scale={width}:{h}"])
+    reader.__next__()
+    out = []
+    for i, raw in enumerate(reader):
+        buffer = BytesIO()
+        PILImage.frombytes("RGB", (width, h), raw).save(buffer, format="JPEG", quality=85)
+        out.append((round(i / fps, 3), buffer.getvalue(), width, h))
+    return out
+
+
+async def detect_characters(video, characters, key, transport=None, fps=FAL_FPS):
+    """Cartoon-safe tracks: Florence-2 open-vocabulary detection on Fal, one
+    query per character per sampled frame, prompted with the character's
+    look (or name). Labels are the identities, so no left/right seeding.
+    Boxes covering most of the frame are rejected as misses."""
+    import base64
+    frames = await asyncio.to_thread(sample_jpegs, video, fps)
+    gate = asyncio.Semaphore(FAL_CONCURRENCY)
+
+    async def query(client, jpeg, w, h, character):
+        prompt = character.get("description") or character["name"]
+        async with gate:
+            response = await client.post(FAL_DETECTOR, headers={"Authorization": f"Key {key}"}, json=dict(
+                image_url="data:image/jpeg;base64," + base64.b64encode(jpeg).decode(), text_input=prompt))
+        response.raise_for_status()
+        boxes = response.json().get("results", {}).get("bboxes", [])
+        if not boxes:
+            return None
+        b = max(boxes, key=lambda b: b["w"] * b["h"])
+        box = [b["x"] / w, b["y"] / h, (b["x"] + b["w"]) / w, (b["y"] + b["h"]) / h]
+        return None if (box[2] - box[0]) * (box[3] - box[1]) > 0.8 else [round(max(0.0, min(1.0, v)), 4) for v in box]
+
+    async with httpx.AsyncClient(timeout=60, transport=transport) as client:
+        results = await asyncio.gather(*(query(client, jpeg, w, h, c) for (_, jpeg, w, h) in frames for c in characters))
+    track, cursor = [], 0
+    for t, *_ in frames:
+        boxes = {}
+        for c in characters:
+            if results[cursor]:
+                boxes[c["name"]] = results[cursor]
+            cursor += 1
+        track.append({"t": t, "boxes": boxes})
+    return track
+
+
 def boxes_at(track, t):
     """Boxes of the sampled frame nearest to video time t."""
     if not track:
         return {}
     frame = min(track, key=lambda f: abs(f["t"] - t))
-    return frame["boxes"] if abs(frame["t"] - t) <= 1.0 / SAMPLE_FPS + 0.01 else {}
+    step = track[1]["t"] - track[0]["t"] if len(track) > 1 else 1.0 / SAMPLE_FPS
+    return frame["boxes"] if abs(frame["t"] - t) <= step / 2 + 0.01 else {}
 
 
 def final_boxes(track):

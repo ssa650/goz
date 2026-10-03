@@ -29,9 +29,11 @@
       <div id="scenes" class="scenes" aria-label="Scenes"></div>
       <form id="setup" class="card">
         <div class="panel-heading"><h2>Opening scene</h2><span class="eyebrow">SETUP</span></div>
-        <label>Opening frame (all characters visible) <input id="opening" type="file" accept="image/png,image/jpeg,image/webp" required></label>
-        <label>Story premise <textarea id="premise" rows="3" required placeholder="Two rival treasure hunters meet in a flooded temple at night…"></textarea></label>
-        <p class="hint">Characters, left to right as they appear in the opening frame.</p>
+        <label>Opening episode clip (scene 1, plays as-is) or an opening frame <input id="opening" type="file" accept="video/mp4,video/quicktime,video/webm,image/png,image/jpeg,image/webp" required></label>
+        <label>Story premise <textarea id="premise" rows="3" required placeholder="A normal day at the Krusty Krab turns chaotic when…"></textarea></label>
+        <label>Opening clip timeline <span class="hint">(optional · one line per moment · "Name: line" marks who speaks · #humor #action #suspense)</span>
+          <textarea id="timeline" rows="4" placeholder="0-3 SpongeBob: I'm ready! #humor&#10;3-7 Squidward: Not today. #humor&#10;7-10 Patrick crashes through the door #action"></textarea></label>
+        <p class="hint">Characters: name + how they look (the look is what the detector searches for). Left to right in the opening frame when using an image.</p>
         <div id="characters"></div>
         <button id="add-character" class="secondary" type="button">Add character</button>
         <div class="settings">

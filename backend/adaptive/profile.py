@@ -37,6 +37,8 @@ def update(profile, analysis):
                 why = f"looked at {name} {round(100 * c['attention'])}% of the time they were on screen"
                 if c["eeg_response"]:
                     why += f", EEG {c['eeg_response']:+.2f}σ after looking"
+                if c.get("speaking_response") is not None:
+                    why += f", EEG {c['speaking_response']:+.2f}σ while {name} spoke"
                 changes.append(dict(key=f"character:{name}", before=before, after=after,
                                     strong=c["strong"], why=why))
     z, blink, away = analysis["eeg_mean_z"], analysis["blink_rate_per_min"], analysis["look_away_frac"]
@@ -69,7 +71,7 @@ def update(profile, analysis):
 
 def decide(profile, analysis):
     """What the next scene should change, with human-readable reasons."""
-    decision = dict(focus=None, tension="same", dialogue="same", pacing="same", reasons=[])
+    decision = dict(focus=None, tension="same", dialogue="same", pacing="same", tone=None, event=False, reasons=[])
     ranked = sorted(profile["characters"].items(), key=lambda kv: kv[1], reverse=True)
     if len(ranked) >= 2 and ranked[0][1] - ranked[1][1] >= FOCUS_MARGIN:
         name = ranked[0][0]
@@ -83,7 +85,8 @@ def decide(profile, analysis):
         decision["reasons"].append(f"Speed up pacing: pacing preference {profile['pacing']:+.2f}")
     if analysis.get("look_away_frac") and analysis["look_away_frac"] > 0.25 or analysis["eeg_mean_z"] < -0.3:
         decision["tension"] = "higher"
-        decision["reasons"].append("Increase tension: attention dropped during this scene")
+        decision["event"] = True
+        decision["reasons"].append("Introduce a new event and raise tension: attention dropped during this scene")
     elif profile["genres"]["suspense"] >= 0.3:
         decision["tension"] = "higher"
         decision["reasons"].append(f"Increase tension: suspense preference {profile['genres']['suspense']:+.2f}")
@@ -93,6 +96,10 @@ def decide(profile, analysis):
     elif profile["dialogue"] >= 0.2:
         decision["dialogue"] = "more"
         decision["reasons"].append(f"More dialogue: dialogue preference {profile['dialogue']:+.2f}")
+    genre, weight = max(profile["genres"].items(), key=lambda kv: kv[1])
+    if weight >= 0.25:
+        decision["tone"] = genre
+        decision["reasons"].append(f"Shift tone toward {genre}: {genre} preference {weight:+.2f}")
     if not decision["reasons"]:
         decision["reasons"].append("No clear preference yet: continue the story evenly")
     return decision

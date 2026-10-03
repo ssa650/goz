@@ -6,12 +6,17 @@ import os
 import threading
 import time
 
+from uuid import uuid4
+
 from fastapi import Request
+from fastapi.responses import FileResponse
+from starlette.datastructures import UploadFile
 
 from .sensors import EegFeed, GazeFeed, Simulator, run_muse, GAZE_PORT
 from .session import AdaptiveSession
 
 MAX_CHARACTERS = 4
+MAX_OPENING_BYTES = 100 * 1024 * 1024
 
 
 class Sensors:
@@ -73,7 +78,7 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
     @app.post("/api/adaptive/sessions", status_code=202)
     async def start(request: Request):
         e, sn = request.app.state.engine, sensors(request)
-        form = await multipart(request, {"start"})
+        form = await multipart(request, {"start", "opening"})
         try:
             premise = str(form.get("premise", "")).strip()
             if not premise or len(premise) > 2000:
@@ -81,14 +86,28 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
             characters = json.loads(str(form.get("characters", "[]")))
             if (not isinstance(characters, list) or not 2 <= len(characters) <= MAX_CHARACTERS
                     or any(not isinstance(c, dict) or not str(c.get("name", "")).strip() for c in characters)):
-                raise ValueError("Name 2–4 characters, left to right as they appear in the opening frame.")
+                raise ValueError("Name 2–4 characters.")
             characters = [dict(name=str(c["name"]).strip()[:40], description=str(c.get("description", "")).strip()[:200])
                           for c in characters]
             if len({c["name"] for c in characters}) != len(characters):
                 raise ValueError("Character names must be unique.")
-            frames = await images(form, "start", 1)
-            if not frames:
-                raise ValueError("Upload the opening frame (both characters visible).")
+            timeline = str(form.get("timeline", ""))[:20000]
+            video = form.get("opening")
+            frames = [] if video else await images(form, "start", 1)
+            if not frames and not video:
+                raise ValueError("Upload the opening episode clip (or an opening frame).")
+            opening_video = None
+            if video:
+                if not isinstance(video, UploadFile) or not (video.content_type or "").startswith("video/"):
+                    raise ValueError("The opening clip must be a video file (MP4, MOV or WebM).")
+                data = await video.read(MAX_OPENING_BYTES + 1)
+                if not data or len(data) > MAX_OPENING_BYTES:
+                    raise ValueError("The opening clip must be at most 100 MB.")
+                uploads = e.directory/"adaptive"/"uploads"
+                uploads.mkdir(parents=True, exist_ok=True)
+                opening_video = uploads/f"{uuid4()}.mp4"
+                opening_video.write_bytes(data)
+                opening_video.chmod(0o600)
             async with e.lock:
                 if not e.adapter.configured():
                     raise ValueError("Add your Fal key first.")
@@ -96,11 +115,19 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
                     raise ValueError("A generation is already running. Stop it first.")
                 sn.session = AdaptiveSession(e, sn.gaze, sn.eeg, e.directory, premise, characters,
                                              duration_value(form.get("duration", 10)),
-                                             resolution_value(form.get("resolution", "480P")), frames[0])
+                                             resolution_value(form.get("resolution", "480P")),
+                                             frames[0] if frames else None, opening_video, timeline)
                 await sn.session.start()
             return sn.session.public()
         finally:
             await form.close()
+
+    @app.get("/api/adaptive/clips/{session_id}/{index}")
+    async def clip_file(request: Request, session_id: str, index: int):
+        s = session(request)
+        if s.id != session_id or not 0 <= index < len(s.clips) or not s.clips[index].get("path"):
+            raise ValueError("Clip not found.")
+        return FileResponse(s.clips[index]["path"], media_type="video/mp4")
 
     @app.post("/api/adaptive/tick")
     async def tick(request: Request):

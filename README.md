@@ -30,11 +30,20 @@ cd ../gazekit && python3 -m gazekit stream --camera 0
 .venv/bin/python -m backend
 ```
 
-Open the page in a browser window at 100 % zoom (full screen is most accurate: gaze arrives in screen points and the page maps it onto the video using its window position). Upload an opening frame showing the characters, name them left to right, write the premise, and press **Start**.
+Open the page in a browser window at 100 % zoom (full screen is most accurate: gaze arrives in screen points and the page maps it onto the video using its window position). Upload the **opening episode clip** (it plays as-is as scene 1; an opening image also works and is then generated from), name the characters with a short look description ("green octopus with a long nose"), write the premise, optionally add the clip's timeline, and press **Start**.
 
-- **Response to a character** = share of the time they were on screen that the viewer looked at them × (1 + EEG engagement z in the 0.3–2 s after each look). It is *strong* when attention ≥ 40 % and EEG ≥ +0.5σ.
+Timeline lines mark who speaks and the genre of each moment, so EEG changes during a character's lines count toward that character (generated scenes get speakers from the AI's plan):
+
+```
+0-3 SpongeBob: I'm ready! #humor
+3-7 Squidward: Not today. #humor
+7-10 Patrick crashes through the door #action
+```
+
+- **Response to a character** = share of the time they were on screen that the viewer looked at them × (1 + EEG z in the 0.3–2 s after each look + ½ × EEG z while they speak). It is *strong* when attention ≥ 40 % and either EEG measure ≥ +0.5σ.
+- **Decisions**: focus character, tension, dialogue, pacing, tone (top genre preference) and "introduce a new event" (when attention drops).
 - **EEG** = β/(α+θ) from the four Muse channels over 2 s windows every 0.25 s, z-scored against the last 60 s; windows over 150 µV peak-to-peak are treated as artifacts.
-- **Characters** are tracked with MediaPipe EfficientDet-Lite0 people detection (~7 MB model, downloaded to `data/models/` on first use). Identities are seeded left-to-right in scene 1 and from the previous scene's final boxes afterwards.
+- **Characters** are found per scene by Florence-2 open-vocabulary detection on Fal (`GOZ_TRACKER=fal`, default; works on cartoons): 2 frames/s × each character's look description, ~60 small paid calls per 15 s scene, labelled by character. `GOZ_TRACKER=people` uses local MediaPipe people detection instead (live action only; ~7 MB model downloaded to `data/models/`; identities seeded left to right).
 - Every signal, tick, analysis and decision is saved under `data/adaptive/<session>/`.
 - Fal generation usually takes longer than a scene plays, so the player holds the last frame and shows "Generating scene N…" until it is ready. `GOZ_MAX_SCENES` (default 4) caps paid generations per session. Without `OPENAI_API_KEY` a fixed template writes the scenes and the dashboard says **template**.
 

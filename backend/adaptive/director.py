@@ -28,9 +28,10 @@ def validate(plan, names, duration):
         except (KeyError, TypeError, ValueError):
             continue
         if t1 > t0:
+            speaker = b.get("speaker") if b.get("speaker") in names else None
             beats.append(dict(t0=t0, t1=t1, description=str(b.get("description", ""))[:300],
                               characters=[c for c in b.get("characters", []) if c in names],
-                              dialogue=bool(b.get("dialogue")),
+                              dialogue=bool(b.get("dialogue")) or speaker is not None, speaker=speaker,
                               tags=[t for t in b.get("tags", []) if t in GENRES]))
     if not beats:
         beats = [dict(t0=0.0, t1=float(duration), description=plan.get("summary", ""), characters=list(names),
@@ -39,6 +40,28 @@ def validate(plan, names, duration):
                 summary=str(plan.get("summary", ""))[:600], beats=beats,
                 video_prompt=plan["video_prompt"].strip()[:1500],
                 change_note=str(plan.get("change_note", ""))[:300])
+
+
+def parse_timeline(text, names, duration):
+    """Beats for a predefined clip, one per line:
+         0-4 SpongeBob: I'm ready!     (speaker line)
+         4-7 Squidward slams the door #humor
+    Lines naming no known speaker become silent beats; #tags set genres."""
+    import re
+    beats = []
+    for line in (text or "").splitlines():
+        m = re.match(r"\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s+(.*)", line)
+        if not m:
+            continue
+        t0, t1, rest = float(m[1]), min(float(m[2]), float(duration)), m[3]
+        tags = [t for t in re.findall(r"#(\w+)", rest) if t in GENRES]
+        rest = re.sub(r"#\w+", "", rest).strip()
+        head, sep, said = rest.partition(":")
+        speaker = head.strip() if sep and head.strip() in names else None
+        if t1 > t0:
+            beats.append(dict(t0=t0, t1=t1, description=rest[:300], speaker=speaker, dialogue=speaker is not None,
+                              characters=[n for n in names if n.lower() in rest.lower()], tags=tags))
+    return beats
 
 
 def user_message(story, profile, decision, duration):
@@ -85,15 +108,21 @@ def template(story, decision, duration, names):
     else:
         action = f"The camera holds a balanced two-shot of {' and '.join(names)} as the moment unfolds."
     mood = {"higher": " Tension rises: low rumbling score, sharper light, quicker movements."}.get(decision.get("tension"), "")
+    if decision.get("event"):
+        mood += " Suddenly something unexpected crashes into the scene and everyone reacts."
+    if decision.get("tone"):
+        mood += f" The mood leans into {decision['tone']}."
     pace = " Fast, energetic movement." if decision.get("pacing") == "faster" else ""
     talk = " No dialogue, only ambience." if decision.get("dialogue") == "less" else ""
     half = duration / 2
     return dict(
         scene_title=f"{focus} takes the lead" if focus else "The story continues",
         summary=f"{focus or 'The group'} takes the lead as the story continues." ,
-        beats=[dict(t0=0.0, t1=half, description="Setup", characters=list(names), dialogue=False, tags=["drama"]),
+        beats=[dict(t0=0.0, t1=half, description="Setup", characters=list(names), dialogue=False, speaker=None,
+                    tags=["drama"]),
                dict(t0=half, t1=float(duration), description=f"{focus or 'Everyone'} in focus",
                     characters=[focus] if focus else list(names), dialogue=decision.get("dialogue") != "less",
-                    tags=["suspense"] if decision.get("tension") == "higher" else ["drama"])],
+                    speaker=focus if decision.get("dialogue") != "less" else None,
+                    tags=[decision.get("tone") or ("suspense" if decision.get("tension") == "higher" else "drama")])],
         video_prompt=f"{story['premise']} {action}{mood}{pace}{talk}"[:1500],
         change_note=("; ".join(decision.get("reasons", [])))[:300])

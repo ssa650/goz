@@ -7,7 +7,10 @@ Write the next scene so it continues the story AND applies the adaptation
 decision. The decision comes from measured viewer responses (gaze + EEG);
 make it visibly obvious on screen, e.g. "focus on X" means X moves to the
 center of frame, the camera pushes in on X, X drives the action and gets
-the key line, while other characters recede.
+the key line, while other characters recede. "event": true means something
+new and surprising happens in this shot (an arrival, an accident, a
+discovery). "tone" names the genre the scene should lean into. Keep the
+established cartoon style, setting and character designs.
 
 Rules for video_prompt:
 - One continuous shot, present tense, concrete visual action, camera
@@ -23,7 +26,8 @@ Return ONLY a JSON object:
   "summary": "one or two sentences of what happens (becomes story state)",
   "beats": [
     {"t0": 0, "t1": 5, "description": "...", "characters": ["Name"],
-     "dialogue": false, "tags": ["suspense"|"action"|"humor"|"romance"|"drama"]}
+     "dialogue": false, "speaker": "Name or null",
+     "tags": ["suspense"|"action"|"humor"|"romance"|"drama"]}
   ],
   "video_prompt": "...",
   "change_note": "one sentence: how this scene applies the decision"
