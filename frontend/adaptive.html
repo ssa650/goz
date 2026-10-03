@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GOZ · Adaptive story</title>
+  <link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/adaptive.css">
+  <script type="module" src="/adaptive.js"></script>
+</head>
+<body class="adaptive"><main>
+  <header><a class="brand" href="/adaptive.html">GOZ<span class="dot"></span></a>
+    <span class="eyebrow">ADAPTIVE STORY · GAZE + EEG</span>
+    <span id="backend-status" class="badge">Connecting…</span></header>
+  <div class="layout">
+    <section class="stage-col" aria-label="Story player">
+      <div id="screen">
+        <video id="video" muted playsinline preload="auto" disablepictureinpicture disableremoteplayback></video>
+        <canvas id="overlay-canvas"></canvas>
+        <div id="overlay">Set up the opening scene below, then press Start.</div>
+      </div>
+      <div class="player-footer">
+        <p id="stage" role="status">Idle.</p>
+        <div class="toggles">
+          <label class="check"><input id="show-boxes" type="checkbox" checked> boxes</label>
+          <label class="check"><input id="show-gaze" type="checkbox" checked> gaze</label>
+          <button id="sound" class="secondary" type="button">Enable sound</button>
+          <button id="stop" class="secondary" type="button" disabled>Stop</button>
+        </div>
+      </div>
+      <div id="scenes" class="scenes" aria-label="Scenes"></div>
+      <form id="setup" class="card">
+        <div class="panel-heading"><h2>Opening scene</h2><span class="eyebrow">SETUP</span></div>
+        <label>Opening episode clip (scene 1, plays as-is) or an opening frame <input id="opening" type="file" accept="video/mp4,video/quicktime,video/webm,image/png,image/jpeg,image/webp" required></label>
+        <label>Story premise <textarea id="premise" rows="3" required placeholder="A normal day at the Krusty Krab turns chaotic when…"></textarea></label>
+        <label>Opening clip timeline <span class="hint">(optional · one line per moment · "Name: line" marks who speaks · #humor #action #suspense)</span>
+          <textarea id="timeline" rows="4" placeholder="0-3 SpongeBob: I'm ready! #humor&#10;3-7 Squidward: Not today. #humor&#10;7-10 Patrick crashes through the door #action"></textarea></label>
+        <p class="hint">Characters: name + how they look (the look is what the detector searches for). Left to right in the opening frame when using an image.</p>
+        <div id="characters"></div>
+        <button id="add-character" class="secondary" type="button">Add character</button>
+        <div class="settings">
+          <label>Seconds per scene <select id="duration"></select></label>
+          <label>Resolution <select id="resolution"><option value="480P">480p</option><option value="768P">768p</option><option value="1080P">1080p</option></select></label>
+        </div>
+        <p id="cost-note"></p>
+        <div class="actions"><button id="start" type="submit">Start adaptive story</button></div>
+        <p id="error" role="alert" hidden></p>
+      </form>
+    </section>
+    <aside class="dash" aria-label="Dashboard">
+      <div class="card">
+        <div class="card-head"><h3>Gaze target</h3><span id="gaze-source" class="pill">—</span></div>
+        <div id="gaze-target" class="big">—</div>
+        <div class="metrics"><span>blinks <b id="blinks">—</b>/min</span><span>head yaw <b id="yaw">—</b>°</span><span>gaze <b id="gaze-hz">—</b> Hz</span></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>EEG engagement</h3><span id="eeg-source" class="pill">—</span></div>
+        <div class="eeg-row"><canvas id="eeg-chart" width="300" height="70"></canvas><div id="eeg-z" class="big small">—</div></div>
+        <p id="eeg-state" class="hint">β/(α+θ), z vs. rolling 60 s baseline</p>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Viewer profile</h3><span id="profile-clips" class="pill">0 scenes</span></div>
+        <div id="affinity"></div>
+        <div id="prefs"></div>
+        <h4>What changed</h4>
+        <ul id="changes" class="changes"><li class="hint">Nothing yet: watch the first scene.</li></ul>
+      </div>
+      <div class="card decision">
+        <div class="card-head"><h3>AI decision for next scene</h3><span id="writer" class="pill">—</span></div>
+        <div id="decision" class="chips"></div>
+        <ul id="reasons" class="reasons"></ul>
+        <p id="change-note" class="note"></p>
+        <details><summary id="next-title">Next scene prompt</summary><pre id="next-prompt"></pre></details>
+      </div>
+    </aside>
+  </div>
+</main></body></html>
