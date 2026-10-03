@@ -69,7 +69,7 @@ def test_mvp_strong_response_to_b_makes_next_scene_focus_b():
     assert decision["focus"] == "Bea" and "strong" in decision["reasons"][0]
     plan = director.template(dict(premise="P.", characters=[dict(name="Ana"), dict(name="Bea")], scenes=[]),
                              decision, 10, ["Ana", "Bea"])
-    assert "pushes in on Bea" in plan["video_prompt"]
+    assert plan["video_prompt"].startswith("P.") and "Gently emphasize Bea" in plan["video_prompt"]
 
 
 def test_timeline_parsing_marks_speakers_and_tags():
@@ -146,17 +146,58 @@ async def test_director_openai_request_and_validation(monkeypatch):
     seen = {}
 
     def handler(request):
+        assert str(request.url) == "https://api.openai.com/v1/responses"
         seen.update(json.loads(request.content))
-        content = json.dumps(dict(scene_title="Bea's move", summary="Bea acts.", video_prompt="Bea steps forward.",
-                                  change_note="Focus on Bea.", beats=[dict(t0=0, t1=12, characters=["Bea", "Zed"],
-                                                                          tags=["action", "nope"], dialogue=True)]))
-        return httpx.Response(200, json=dict(choices=[dict(message=dict(content=content))]))
+        content = json.dumps(dict(action="focus_character", focus="Bea", reason="Higher measured attention to Bea."))
+        return httpx.Response(200, json=dict(id="resp-decision", status="completed", output=[
+            dict(type="message", content=[dict(type="output_text", text=content)])]))
 
-    story = dict(premise="P.", characters=[dict(name="Ana"), dict(name="Bea")], scenes=[])
+    story = dict(premise="P.", characters=[dict(name="Ana"), dict(name="Bea")], scenes=[dict(summary="Opening")],
+                 next_prompt="Ana and Bea open the box. Bea says: 'Look!'",
+                 viewer_analysis={"look_away_frac": 0.1})
     plan, writer = await director.write_scene(story, profiles.new_profile(["Ana", "Bea"]), dict(focus="Bea"), 10,
                                               transport=httpx.MockTransport(handler))
-    assert writer.startswith("openai:") and seen["response_format"] == {"type": "json_object"}
-    assert plan["beats"][0] == dict(t0=0.0, t1=10.0, description="", characters=["Bea"], dialogue=True, speaker=None, tags=["action"])
+    assert writer == "openai:gpt-6-luna" and seen["model"] == "gpt-6-luna"
+    fmt = seen["text"]["format"]
+    assert fmt["type"] == "json_schema" and fmt["strict"] is True
+    assert fmt["schema"]["additionalProperties"] is False
+    assert set(fmt["schema"]["properties"]) == set(fmt["schema"]["required"]) == {"action", "focus", "reason"}
+    assert seen["store"] is False and "temperature" not in seen
+    assert json.loads(seen["input"][1]["content"])["viewer_analysis"] == story["viewer_analysis"]
+    assert plan["base_prompt"] == story["next_prompt"]
+    assert plan["video_prompt"].startswith(story["next_prompt"] + "\n\n")
+    assert plan["decision"]["focus"] == "Bea" and plan["decisionRequestId"] == "resp-decision"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output", [
+    dict(status="incomplete", output=[]),
+    dict(status="completed", output=[dict(type="message", content=[dict(type="refusal", refusal="Declined")])]),
+    dict(status="completed", output=[]),
+    dict(status="completed", output=[dict(type="message", content=[dict(type="output_text", text=json.dumps(
+        dict(action="invent_new_scene", focus=None, reason="Unsupported")))])]),
+    dict(status="completed", output=[dict(type="message", content=[dict(type="output_text", text=json.dumps(
+        dict(action="focus_character", focus="Unknown", reason="Unsupported")))])]),
+    dict(status="completed", output=[dict(type="message", content=[dict(type="output_text", text=json.dumps(
+        dict(action="keep", focus=None, reason="ok", video_prompt="Replace the story")))])]),
+])
+async def test_unusable_openai_decisions_fail_before_generation(monkeypatch, output):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    story = dict(premise="P.", characters=[dict(name="Ana"), dict(name="Bea")], scenes=[dict(summary="Opening")])
+    with pytest.raises(ValueError):
+        await director.write_scene(story, {}, {}, 10, transport=httpx.MockTransport(lambda request: httpx.Response(200, json=output)))
+
+
+def test_adjustments_preserve_the_full_script_and_limit_size():
+    base = "Bea opens the box. Ana says: 'Keep it closed.' " * 45
+    assert len(base) > 1500
+    for action in director.ACTIONS:
+        decision = director.validate_decision(dict(action=action, focus="Bea" if action == "focus_character" else None,
+                                                   reason="Measured response"), ["Ana", "Bea"])
+        prompt = director.adjust_prompt(base, decision)
+        assert prompt.startswith(base) and len(prompt) - len(base) < 250
+        assert director.adjust_prompt("x" * 8000, decision) == "x" * 8000
+    assert director.adjust_prompt(base, director.local_decision({}, ["Ana", "Bea"])) == base
 
 
 @pytest.mark.asyncio
@@ -250,3 +291,59 @@ async def test_predefined_opening_clip_is_scene_one(tmp_path, monkeypatch):
                 await asyncio.sleep(.05)
             assert s["clips"][1]["decision"]["focus"] == "Squidward", s["clips"][1]["decision"]
             assert len(engine.jobs) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['text', 'initial', 'both', 'mixed'])
+async def test_adaptive_decision_preserves_ordered_bundle_payloads(tmp_path, monkeypatch, mode):
+    from test_backend import harness
+    from test_bundle_sequence import WireAdapter, make_clips
+    from backend.adaptive.session import AdaptiveSession
+    from backend.adaptive.sensors import GazeFeed
+    from pathlib import Path
+    from copy import deepcopy
+
+    async with harness(tmp_path, WireAdapter()) as (engine, adapter, client):
+        bundles = await make_clips(client, mode)
+        originals = deepcopy(bundles)
+        gaze, eeg = GazeFeed(), EegFeed()
+        session = AdaptiveSession(engine, gaze, eeg, tmp_path, 'Existing story.',
+                                  [dict(name='Ana'), dict(name='Bea')], 10, '768P', None, clip_bundles=bundles)
+        # The session must freeze complete bundles, not refer to editable objects.
+        bundles[1]['prompt'] = 'An unrelated later edit'
+        bundles[1]['seed'] = 99999
+        async def media_path(job): return Path('fake.mp4')
+        async def track(*args): return []
+        engine.media_path = media_path
+        session.track = track
+        real_write_scene = director.write_scene
+        monkeypatch.setenv('OPENAI_API_KEY', 'sk-test')
+        def decision_response(request):
+            context = json.loads(json.loads(request.content)['input'][1]['content'])
+            assert context['next_prompt'] == originals[len(session.clips)]['prompt']
+            return httpx.Response(200, json=dict(id='resp-test', status='completed', output=[dict(type='message', content=[
+                dict(type='output_text', text=json.dumps(dict(action='subtle_humor', focus=None, reason='Measured response to humor.')))])]))
+        async def write_scene(story, profile, hint, duration):
+            return await real_write_scene(story, profile, hint, duration, transport=httpx.MockTransport(decision_response))
+        monkeypatch.setattr(director, 'write_scene', write_scene)
+        for i in range(4):
+            await session.make_scene({}, None, None, [])
+            assert session.status == 'running', session.error
+            clip = session.clips[i]
+            job = engine.jobs[clip['jobId']]
+            model, payload = adapter.submissions[i]
+            original = originals[i]
+            assert clip['bundle'] == original and job['clipId'] == original['id'] and job['sceneIndex'] == i
+            assert payload['prompt'].startswith(original['prompt']) and job['basePrompt'] == original['prompt']
+            assert payload['seed'] == original['seed'] and payload['duration'] == original['duration']
+            assert payload['resolution'] == original['resolution']
+            assert payload['prompt_expansion_mode'] == original['promptExpansionMode']
+            assert payload.get('image_url') == (engine.reference(original['firstFrame'])['providerUrl'] if original['firstFrame'] else None)
+            assert payload.get('end_image_url') == (engine.reference(original['endFrame'])['providerUrl'] if original['endFrame'] else None)
+            if i == 0:
+                assert payload['prompt'] == original['prompt'] and job['decisionModel'] == 'template'
+            else:
+                assert job['decisionModel'] == 'openai:gpt-6-luna' and job['decisionRequestId'] == 'resp-test'
+                assert job['engagementDecision']['action'] == 'subtle_humor'
+        assert [c['bundle']['id'] for c in session.clips] == [c['id'] for c in originals]
+        assert [c['prompt'] for c in originals] == [f'Scene {i+1}' for i in range(4)]

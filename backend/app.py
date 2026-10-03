@@ -11,12 +11,16 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import UploadFile
+from pydantic import ValidationError
 from .config import (MODELS, DURATION, DURATIONS, MAX_IMAGE_BYTES, MAX_CHARACTERS,
                      MAX_CLIPS, MAX_PROMPT_BYTES, POLL_SECONDS)
 from .engine import Engine, JOB_TERMINAL
 from .fal_adapter import FalAdapter, FalError
 from .frames import verify_image
 from .prompts import plan
+from .bundle_sequence import ClipValidationError
+from .clip_import import filename_key
+from .preset import ensure_default_sequence, load_default_sequence
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT/".env")
@@ -59,8 +63,8 @@ async def json_body(request):
     return value
 
 
-async def multipart(request, allowed):
-    form = await request.form(max_files=13, max_fields=8, max_part_size=MAX_PROMPT_BYTES)
+async def multipart(request, allowed, max_files=13):
+    form = await request.form(max_files=max_files, max_fields=8, max_part_size=MAX_PROMPT_BYTES)
     for name, value in form.multi_items():
         if isinstance(value, UploadFile) and name not in allowed:
             await form.close()
@@ -92,6 +96,7 @@ def create_app(engine=None):
             else:
                 adapter = FalAdapter(os.getenv("FAL_KEY", ""))
             app.state.engine = Engine(adapter, directory)
+            await ensure_default_sequence(app.state.engine)
         else:
             app.state.engine = engine
         from .adaptive.routes import Sensors
@@ -111,7 +116,8 @@ def create_app(engine=None):
         if host not in ("127.0.0.1", "localhost", "testserver") or (origin and origin != f"http://{request.headers.get('host')}"):
             return JSONResponse({"error": "Only the local app can make this request."}, status_code=403)
         try:
-            if int(request.headers.get("content-length", "0")) > 13*MAX_IMAGE_BYTES+MAX_PROMPT_BYTES+12000:
+            max_files = MAX_CLIPS*2 if request.url.path == "/api/clips/frames" else 13
+            if int(request.headers.get("content-length", "0")) > max_files*MAX_IMAGE_BYTES+MAX_PROMPT_BYTES+12000:
                 return JSONResponse({"error": "Upload batch is too large."}, status_code=413)
         except ValueError:
             return JSONResponse({"error": "Invalid content length."}, status_code=400)
@@ -125,9 +131,18 @@ def create_app(engine=None):
     async def http_error(request, error):
         return JSONResponse({"error": str(error.detail)}, status_code=error.status_code)
 
+    @app.exception_handler(ValidationError)
+    async def invalid_settings(request, error):
+        messages = [f"{'.'.join(map(str, item['loc'])) or 'Settings'}: {item['msg']}" for item in error.errors()]
+        return JSONResponse({"error": "; ".join(messages)}, status_code=400)
+
     @app.exception_handler(ValueError)
     async def invalid(request, error):
         return JSONResponse({"error": str(error)}, status_code=400)
+
+    @app.exception_handler(ClipValidationError)
+    async def invalid_clips(request, error):
+        return JSONResponse({"error": str(error), "clipErrors": error.errors}, status_code=400)
 
     @app.exception_handler(FalError)
     async def provider_error(request, error):
@@ -142,7 +157,7 @@ def create_app(engine=None):
         e = request.app.state.engine
         return dict(configured=e.adapter.configured(), demo=e.adapter.demo, backend="python", models=MODELS,
                     duration=DURATION, durations=DURATIONS, maxImageBytes=MAX_IMAGE_BYTES,
-                    maxCharacters=MAX_CHARACTERS, maxClips=MAX_CLIPS, pollMs=int(e.poll_seconds*1000), sequenceRunner=True)
+                    maxCharacters=MAX_CHARACTERS, maxClips=MAX_CLIPS, promptExpansionModes=["disabled", "balanced", "quality"], individualClips=True, canUndoImport="beforeImport" in e.sequences.get("individual-clips", {}), pollMs=int(e.poll_seconds*1000), sequenceRunner=True, presetAvailable=True)
 
     @app.post("/api/key")
     async def key(request: Request):
@@ -158,6 +173,133 @@ def create_app(engine=None):
             await e.resume()
         return {"configured": True}
 
+    @app.get("/api/clips")
+    async def clip_list(request: Request):
+        return request.app.state.engine.clips.list()
+
+    @app.post("/api/clips/preset")
+    async def clip_preset(request: Request):
+        e = request.app.state.engine
+        async with e.lock:
+            return await load_default_sequence(e)
+
+    @app.post("/api/clips", status_code=201)
+    async def clip_add(request: Request):
+        e = request.app.state.engine
+        body = await json_body(request)
+        starter = body.pop("starter", False)
+        async with e.lock:
+            result = e.clips.add(body)
+            if starter:
+                e.clips.get(result["id"])["starter"] = True
+                e.persist()
+        return result
+
+    @app.post("/api/clips/import")
+    async def clip_import(request: Request):
+        e = request.app.state.engine
+        body = await json_body(request)
+        async with e.lock:
+            return e.clips.import_prompts(body.get("text", ""), body.get("mode"))
+
+    @app.post("/api/clips/import/undo")
+    async def clip_import_undo(request: Request):
+        e = request.app.state.engine
+        async with e.lock:
+            return e.clips.undo_import()
+
+    @app.post("/api/clips/frames")
+    async def clip_frames(request: Request):
+        e = request.app.state.engine
+        form = await multipart(request, {"frames"}, max_files=MAX_CLIPS*2)
+        try:
+            files = form.getlist("frames")
+            if not files or any(not isinstance(file, UploadFile) for file in files):
+                raise ValueError("Select the frame images referenced by your clips JSON.")
+            async with e.lock:
+                plan = e.clips.frame_plan([file.filename for file in files])
+                # Validate every image before changing any clip attachment.
+                uploaded = []
+                for file in files:
+                    try:
+                        uploaded.append(await asyncio.to_thread(verify_image, await file.read(MAX_IMAGE_BYTES+1), file.filename))
+                    except ValueError as error:
+                        raise ValueError(f"{file.filename}: {error}") from None
+                references = {filename_key(image.name):e.save_reference(image, reuse=False) for image in uploaded}
+                return e.clips.attach_frames(plan, references)
+        finally:
+            await form.close()
+
+    @app.patch("/api/clips/{clip_id}")
+    async def clip_edit(request: Request, clip_id: str):
+        e = request.app.state.engine
+        body = await json_body(request)
+        async with e.lock:
+            record = e.clips.get(clip_id)
+            result = e.clips.edit(clip_id, body)
+            if body:
+                record.pop("starter", None)
+                e.persist()
+            return result
+
+    @app.post("/api/clips/order")
+    async def clip_order(request: Request):
+        e = request.app.state.engine
+        body = await json_body(request)
+        async with e.lock:
+            return e.clips.reorder(body.get("clipIds"))
+
+    @app.delete("/api/clips/{clip_id}")
+    async def clip_remove(request: Request, clip_id: str):
+        e = request.app.state.engine
+        async with e.lock:
+            e.clips.remove(clip_id)
+        return {"removed": True}
+
+    @app.post("/api/clips/{clip_id}/duplicate", status_code=201)
+    async def clip_duplicate(request: Request, clip_id: str):
+        e = request.app.state.engine
+        async with e.lock:
+            return e.clips.duplicate(clip_id)
+
+    @app.post("/api/clips/{clip_id}/generate", status_code=202)
+    async def clip_generate(request: Request, clip_id: str):
+        body = await json_body(request)
+        token = body.get("token")
+        if not isinstance(token, str):
+            raise ValueError("Supply a unique generation token.")
+        return await request.app.state.engine.clips.generate(clip_id, token)
+
+    @app.post("/api/clips/{clip_id}/cancel")
+    async def clip_cancel(request: Request, clip_id: str):
+        e = request.app.state.engine
+        record = e.clips.get(clip_id)
+        job = e.jobs.get(record.get("jobId"))
+        if job:
+            await e.cancel_job(job)
+        return e.clips.snapshot(record)
+
+    @app.post("/api/images", status_code=201)
+    async def image_upload(request: Request):
+        e = request.app.state.engine
+        form = await multipart(request, {"image"})
+        try:
+            uploaded = await images(form, "image", 1)
+            if len(uploaded) != 1:
+                raise ValueError("Upload one PNG, JPEG, or WebP image, up to 10 MB.")
+            reference = e.save_reference(uploaded[0], reuse=False)
+            # Keep previews local. The provider URL is obtained by the existing upload
+            # service on generation, so frame selection works before adding a key.
+            return e.reference(reference["id"])
+        finally:
+            await form.close()
+
+    @app.get("/api/images/{reference_id}")
+    async def image_preview(request: Request, reference_id: str):
+        e = request.app.state.engine
+        reference = e.reference(reference_id)
+        return FileResponse(e.images/f"{reference_id}.bin", media_type=reference["contentType"])
+
     @app.post("/api/plan")
     async def preview(request: Request):
         body = await json_body(request)
@@ -166,7 +308,7 @@ def create_app(engine=None):
     @app.get("/api/sequences")
     async def sequences(request: Request):
         e = request.app.state.engine
-        return [e.snapshot(s) for s in reversed(list(e.sequences.values()))]
+        return [e.snapshot(s) for s in reversed(list(e.sequences.values())) if s.get("mode") != "individual"]
 
     def get_sequence(e, run_id):
         if run_id not in e.sequences:
@@ -181,6 +323,8 @@ def create_app(engine=None):
     @app.post("/api/sequences", status_code=202)
     async def start(request: Request):
         e = request.app.state.engine
+        if request.headers.get("content-type", "").split(";")[0] == "application/json":
+            return await e.bundles.start(await json_body(request))
         form = await multipart(request, {"start", "frames", "prompt_file"})
         try:
             run_id = str(form.get("id", ""))
@@ -216,6 +360,24 @@ def create_app(engine=None):
         e = request.app.state.engine
         return e.snapshot(await e.cancel_sequence(get_sequence(e, run_id)))
 
+    async def final_path(request, run_id):
+        e = request.app.state.engine
+        run = get_sequence(e, run_id)
+        if run.get("mode") != "bundles" or run["status"] != "completed" or not run.get("finalVideoUrl"):
+            raise FalError("The final video is not ready. All clips must complete and stitch first.", 409)
+        path = e.media/f"sequence-{run['id']}.mp4"
+        if not path.is_file():
+            raise FalError("The stitched video file is missing.", 404)
+        return path
+
+    @app.get("/api/sequences/{run_id}/video")
+    async def final_video(request: Request, run_id: str):
+        return FileResponse(await final_path(request, run_id), media_type="video/mp4")
+
+    @app.get("/api/sequences/{run_id}/download")
+    async def final_download(request: Request, run_id: str):
+        return FileResponse(await final_path(request, run_id), media_type="video/mp4", filename="final_video.mp4")
+
     @app.get("/api/jobs")
     async def jobs(request: Request):
         e = request.app.state.engine
@@ -232,7 +394,7 @@ def create_app(engine=None):
         form = await multipart(request, {"start", "end", "characters"})
         try:
             mode, prompt = form.get("mode"), form.get("prompt")
-            if mode not in MODELS:
+            if mode not in ("frames", "characters", "combined"):
                 raise ValueError("Choose a valid generation mode.")
             if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 8000:
                 raise ValueError("Write a prompt between 1 and 8,000 characters.")

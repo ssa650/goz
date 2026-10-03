@@ -29,7 +29,9 @@
       <div id="scenes" class="scenes" aria-label="Scenes"></div>
       <form id="setup" class="card">
         <div class="panel-heading"><h2>Opening scene</h2><span class="eyebrow">SETUP</span></div>
-        <label>Opening episode clip (scene 1, plays as-is) or an opening frame <input id="opening" type="file" accept="video/mp4,video/quicktime,video/webm,image/png,image/jpeg,image/webp" required></label>
+        <label class="check"><input id="use-sequence" type="checkbox" checked> Use the saved ordered prompts and frame pairs</label>
+        <p class="hint">Each next prompt keeps its seed, initial frame, end frame and settings. AI chooses only a subtle adjustment. An optional opening video plays in place of Clip 1.</p>
+        <label>Optional opening episode clip or frame <input id="opening" type="file" accept="video/mp4,video/quicktime,video/webm,image/png,image/jpeg,image/webp"></label>
         <label>Story premise <textarea id="premise" rows="3" required placeholder="A normal day at the Krusty Krab turns chaotic when…"></textarea></label>
         <label>Opening clip timeline <span class="hint">(optional · one line per moment · "Name: line" marks who speaks · #humor #action #suspense)</span>
           <textarea id="timeline" rows="4" placeholder="0-3 SpongeBob: I'm ready! #humor&#10;3-7 Squidward: Not today. #humor&#10;7-10 Patrick crashes through the door #action"></textarea></label>

@@ -1,5 +1,6 @@
 # GOZ
-The **Python backend** handles Fal uploads, model payloads, queue submission/status/results, cancellation, prompt parsing and scene splitting, actual last-frame extraction, history, and MP4 downloads. The **plain JavaScript frontend** is a video player with temporary debug controls for frame uploads, prompt files/pasting, duration, resolution, run status, timings, and downloads. It calls only this local backend; it has no provider SDK or API credentials.
+
+The **Python backend** handles Fal uploads, model payloads, queue submission/status/results, cancellation, prompt parsing and scene splitting, actual last-frame extraction, history, and MP4 downloads. The **plain JavaScript frontend** is a video player with Generate, Download, Regenerate, and a collapsed generation-times table. It calls only this local backend; it has no provider SDK or API credentials.
 
 ## Start
 
@@ -13,11 +14,11 @@ python3 -m venv .venv
 
 Open http://127.0.0.1:3210. On macOS, `Start GOZ.command` also sets up the environment on first launch and starts the server. No Node server or frontend build step is needed.
 
-Add your Fal key in the debug panel (Python server memory only), or copy `.env.example` to `.env` and set `FAL_KEY`. `.env` is ignored by Git and never served. The migration intentionally starts with fresh history and does not copy credentials, source Git metadata, node_modules, or old generated media.
+Copy `.env.example` to `.env` and set `FAL_KEY`, then restart the Python backend. `.env` is ignored by Git and never served. The migration intentionally starts with fresh history and does not copy credentials, source Git metadata, node_modules, or old generated media.
 
 ## Adaptive story (gaze + EEG → next scene)
 
-http://127.0.0.1:3210/adaptive.html plays a story that rewrites itself from the viewer's responses. While a 5–15 s scene plays, the backend timestamps gaze, blinks, head direction (from [gazekit](../gazekit), `gazekit stream`) and Muse 2 EEG engagement, hit-tests gaze against the characters detected in that scene, and updates a viewer profile. At 70 % of the scene a decision layer picks what changes (focus character, tension, dialogue, pacing), OpenAI writes the next scene plan and video prompt, and Fal generates it from the current scene's actual last frame. The dashboard shows the current gaze target, the EEG trace, which preference changed and why, and the AI's decision.
+http://127.0.0.1:3210/adaptive.html plays an ordered story with subtle adjustments from the viewer's responses. While a 5–15 s scene plays, the backend timestamps gaze, blinks, head direction (from [gazekit](../gazekit), `gazekit stream`) and Muse 2 EEG engagement, hit-tests gaze against the characters detected in that scene, and updates a viewer profile. At 70 % of the scene, `gpt-6-luna` chooses one bounded engagement action using the Responses API with strict Structured Outputs. Python applies one short, predefined cue to the next saved prompt; OpenAI never supplies a replacement video prompt. The original scene, dialogue, seed, initial/end frame asset IDs, expansion mode, duration and resolution are preserved. The dashboard shows the current gaze target, the EEG trace, which preference changed and why, and the AI's decision.
 
 Run it with three terminals:
 
@@ -30,9 +31,9 @@ cd ../gazekit && python3 -m gazekit stream --camera 0
 .venv/bin/python -m backend
 ```
 
-Open the page in a browser window at 100 % zoom (full screen is most accurate: gaze arrives in screen points and the page maps it onto the video using its window position). Upload the **opening episode clip** (it plays as-is as scene 1; an opening image also works and is then generated from), name the characters with a short look description ("green octopus with a long nose"), write the premise, optionally add the clip's timeline, and press **Start**.
+Open the page in a browser window at 100 % zoom (full screen is most accurate: gaze arrives in screen points and the page maps it onto the video using its window position). Keep **Use the saved ordered prompts and frame pairs** checked to freeze the existing clip bundles in their current order. No image upload is required for that mode. An optional opening episode clip plays as-is in place of Clip 1; uncheck the saved-sequence option to use a custom opening image/video and premise instead. Name the characters with a short look description ("green octopus with a long nose"), write the premise, optionally add the clip's timeline, and press **Start**.
 
-Timeline lines mark who speaks and the genre of each moment, so EEG changes during a character's lines count toward that character (generated scenes get speakers from the AI's plan):
+Timeline lines mark who speaks and the genre of each moment, so EEG changes during a character's lines count toward that character (speaker timing for generated scenes is unknown unless an explicit timeline is supplied; it is never inferred from the engagement decision):
 
 ```
 0-3 SpongeBob: I'm ready! #humor
@@ -41,11 +42,11 @@ Timeline lines mark who speaks and the genre of each moment, so EEG changes duri
 ```
 
 - **Response to a character** = share of the time they were on screen that the viewer looked at them × (1 + EEG z in the 0.3–2 s after each look + ½ × EEG z while they speak). It is *strong* when attention ≥ 40 % and either EEG measure ≥ +0.5σ.
-- **Decisions**: focus character, tension, dialogue, pacing, tone (top genre preference) and "introduce a new event" (when attention drops).
+- **Decisions**: keep, focus one character, slightly faster/slower pacing, subtle suspense/humor, or clearer delivery of the existing dialogue. Only one action is applied. The schema forbids arbitrary prompt text; invalid, incomplete or refused decisions stop before another Fal request. No events, plot changes or new dialogue are introduced. Prompts too close to the 8,000-character limit are retained unchanged rather than truncated.
 - **EEG** = β/(α+θ) from the four Muse channels over 2 s windows every 0.25 s, z-scored against the last 60 s; windows over 150 µV peak-to-peak are treated as artifacts.
 - **Characters** are found per scene by Florence-2 open-vocabulary detection on Fal (`GOZ_TRACKER=fal`, default; works on cartoons): 2 frames/s × each character's look description, ~60 small paid calls per 15 s scene, labelled by character. `GOZ_TRACKER=people` uses local MediaPipe people detection instead (live action only; ~7 MB model downloaded to `data/models/`; identities seeded left to right).
 - Every signal, tick, analysis and decision is saved under `data/adaptive/<session>/`.
-- Fal generation usually takes longer than a scene plays, so the player holds the last frame and shows "Generating scene N…" until it is ready. `GOZ_MAX_SCENES` (default 4) caps paid generations per session. Without `OPENAI_API_KEY` a fixed template writes the scenes and the dashboard says **template**.
+- Fal generation usually takes longer than a scene plays, so the player holds the last frame and shows "Generating scene N…" until it is ready. `GOZ_MAX_SCENES` (default 4) caps paid generations per session. Without `OPENAI_API_KEY`, a local heuristic chooses a bounded cue and the dashboard says **template**. The opening prompt stays unchanged because no viewer evidence exists yet. The next clip's original prompt, applied prompt, decision, model and OpenAI request ID are saved with its job. `OPENAI_MODEL` defaults to `gpt-6-luna`; add `OPENAI_API_KEY` and `FAL_KEY` to `.env`, then restart the backend.
 
 Rehearse without hardware or spending credits (synthetic clips, simulated viewer who prefers the second character):
 
@@ -55,15 +56,19 @@ GOZ_DEMO=1 GOZ_GAZE=sim GOZ_EEG=sim GOZ_DATA_DIR=output/demo-data PORT=3211 .ven
 
 `GOZ_GAZE` is `gazekit|sim|off`, `GOZ_EEG` is `muse|sim|off`. `GOZ_SIM_FAVORITE` (character index) and `GOZ_SIM_BIAS` tune the simulator. SIM sources are labelled on the dashboard.
 
-## Debug workflow
+## Ordered video sequence
 
-1. Choose **Start and end keyframes** or **Initial frame → chain**.
-2. Upload PNG, JPEG, or WebP frames, up to 10 MB each. Keyframes are sorted by file name; name them `01.png`, `02.png`, etc. A sequence of N clips needs N+1 keyframes. Chain mode needs just one initial frame.
-3. Upload `.txt` (one prompt per nonempty line) or `.json` (an array of strings), or paste prompts. Up to 12 scenes, 8,000 characters per scene, 100 KB per batch. The copied `prompts/bubble-studio.json` is available for debugging but is never loaded or submitted automatically.
-4. Select 5–15 seconds per clip and 480p/768p/1080p. In keyframe mode, Python splits scenes with `DURATION:` and timed blocks into shorter clips, keeping dialogue in a single part. The planning count shows the resulting frame requirement. Chain mode uses one prompt per clip.
-5. **Run sequence** starts paid Fal calls in live mode. Clips play muted in order as they become ready. Enable sound if desired. Cancel prevents subsequent clips and requests best-effort cancellation of an accepted request, which may still be charged.
+The supplied Secret Box prompts and 13 JPGs are bundled under `presets/secret-box/`. New workspaces load all 12 ordered, 15-second clip bundles with their original seeds and correctly paired initial/end frames. There are no prompt editors, file upload controls, or API-key forms in the player. Existing saved definitions and generation history remain intact.
 
-Two video elements preload/swap clips. Playback waits for late clips rather than skipping them; real generation can take longer than playback. Frame previews, inputs, and raw backend state are debug UI and can be removed when the project has another input source.
+**Generate** submits the saved ordered bundles. **Regenerate** starts a new run with the previous run's exact prompts, seeds, frame asset IDs, expansion modes, durations and resolutions. Neither action changes the seeds. Both actions submit paid Fal requests when demo mode is off. Buttons are locked while generation/stitching is active. A lost submission acknowledgement is retried with the same saved run UUID, preventing an accidental second batch; page reload reconnects an already accepted run.
+
+The player starts with audio enabled at full volume as soon as Clip 1 completes. Two video elements preload the next ordered clip and swap automatically, without rewinding or waiting for the final MP4. If the next clip is still generating, the player holds the last frame and resumes at that exact position when ready. Out-of-order completion never skips clips. There are no native playback controls, hover overlays, seeking, or pause actions. A separate **Fullscreen** button expands the player container, preserving fullscreen across clip transitions; press Escape to exit. Clicking Fullscreen also recovers playback if autoplay was blocked.
+
+After all clips complete, Python sorts by `order` immediately before stitching and creates `final_video.mp4`. **Download** becomes available after assembly. FFmpeg preserves audio, supplies silence for silent clips, normalizes mixed dimensions and frame rates, and trims/pads segments to the requested duration. Final stitching does not interrupt or restart live playback.
+
+The **Generation times** dropdown at the bottom lists all clips in sequence order, their individual status, total time (including waiting/uploads), and provider generation time (queue plus processing). Failed clip rows include readable provider errors. The main error also shows the actual cause, including exhausted Fal balance, rather than just a generic stitching failure. Account/authentication rejection stops not-yet-submitted clips; already accepted requests are preserved and monitored.
+
+Definitions remain atomic clip objects in `data/sequences.json`; frozen runs retain prompt, seed, both asset IDs, settings, status and result. Asset bytes live in `data/images/`, provider secrets remain server-side, and the existing import/edit APIs are still available for developer use without an upload screen.
 
 ## Local demo (no Fal calls)
 
@@ -76,20 +81,26 @@ Open http://127.0.0.1:3211. The UI explicitly says **DEMO**. This produces synth
 ## Project layout
 
 - `backend/app.py`: FastAPI routes and static frontend serving.
-- `backend/engine.py`: generation pipeline, sequence ordering, persistence and recovery.
+- `backend/clips.py`, `backend/clip_settings.py`: independent clip definitions, typed validation and shared H3 routing.
+- `backend/bundle_sequence.py`: frozen clip batches, bounded concurrency, per-clip validation and ordered assembly.
+- `backend/engine.py`: generation pipeline, history and recovery; deprecated multipart requests convert to complete clip definitions at ingress.
 - `backend/fal_adapter.py`: Fal storage upload and one-shot HTTP queue requests.
-- `backend/frames.py`: bounded media download and full-decode final-frame extraction.
+- `backend/frames.py`: bounded media download and full-decode final-frame extraction and audio-preserving MP4 stitching.
 - `backend/prompts.py`, `backend/config.py`: prompt planning and non-secret model settings.
-- `frontend/`: JavaScript player, debug controls and styles; the player queue is copied from GOZ_TEST.
-- `backend/adaptive/`: sensors (gaze UDP, Muse LSL, simulators), character tracks, gaze/EEG fusion, viewer profile + decision, OpenAI director, session loop and routes. `frontend/adaptive.*`: adaptive player and dashboard. `prompts/director.md`: the scene-writer system prompt.
+- `frontend/`: JavaScript player, sequence controller and styles. `sequence-playback.js` feeds ordered live snapshots into the two-element queue without restarting playback. Player UI, controller, clip state, playback adapter and queue use JSDoc types checked with TypeScript.
 - `tests/`: Python integration tests and JavaScript playback tests.
 
 ## API
 
+Individual cards use `GET/POST /api/clips`, `PATCH/DELETE /api/clips/{id}`, and `POST /api/clips/{id}/duplicate`, `/generate`, or `/cancel`. Generation takes `{ "token": "UUID" }`; edit/create takes the card settings, with `firstFrame`/`endFrame` as stored image IDs or null. `POST /api/clips/import` accepts `{ "text": "...", "mode": "replace" }` (or `append`). Without mode, structured clip objects replace the editor; legacy prompt strings append. `POST /api/clips/import/undo` restores the prior editor. `POST /api/clips/frames` takes multipart repeated `frames` and resolves imported filename bindings atomically. `POST /api/images` takes multipart `image`; `GET /api/images/{id}` serves its validated thumbnail/source image. Arbitrary client-supplied storage URLs are not accepted.
+
 - `GET /api/config`: non-secret settings, key configuration status, demo flag.
 - `POST /api/key`: `{ "key": "..." }`, stored only in server memory.
 - `POST /api/plan`: `{ "text": "...", "mode": "keyframes", "duration": 5 }`, returns clip prompts and required frame count.
-- `POST /api/sequences`: multipart `id` (UUID), `mode`, `prompts` (raw text or JSON array), `duration`, `resolution`, plus repeated `frames` or one `start`. An optional `prompt_file` can replace `prompts`. Each UUID identifies one retained run, including retries after completion or cancellation.
+- `POST /api/clips/order`: `{ "clipIds": ["UUID", "UUID"] }`, every current clip ID exactly once.
+- `POST /api/sequences`: `{ "id": "UUID", "clips": [{ "id": "clip UUID", "order": 0, "prompt": "...", "seed": 483729, "firstFrame": "asset UUID or null", "endFrame": null, "promptExpansionMode": "disabled", "duration": 15, "resolution": "480P" }] }`. The frontend sends array order; the backend validates and sorts explicit order. Each run ID is idempotent. Validation failures include a `clipErrors` map keyed by clip ID.
+- `GET /api/sequences/{id}/video` and `/download`: stream or save the completed stitched MP4.
+- Deprecated `POST /api/sequences` multipart `id` (UUID), `mode`, `prompts` (raw text or JSON array), `duration`, `resolution`, plus repeated `frames` or one `start`. An optional `prompt_file` can replace `prompts`. Each UUID identifies one retained run, including retries after completion or cancellation.
 - `GET /api/sequences`, `GET /api/sequences/{id}`, `POST /api/sequences/{id}/cancel`.
 - `GET /api/jobs/{id}/video`: Python downloads/caches the MP4 and serves it with byte-range support; browsers never fetch Fal directly.
 - `GET /api/jobs/{id}/download`: saves the same MP4.
@@ -98,7 +109,7 @@ The original `/api/jobs` frame/character/combined modes, job history, SSE events
 
 ## Recovery and local data
 
-The server binds to `127.0.0.1` and rejects foreign origins/hosts. Run one backend process, with one worker, per data directory. The entire `data/` folder is local and ignored by Git. Prompts, request IDs, timings, provider media URLs, and downloaded clips are persisted; keys and original uploaded frames are not. Keep downloaded clips you need; provider URLs can expire. Media cache is retained locally and can be removed with the server stopped when no longer needed.
+The server binds to `127.0.0.1` and rejects foreign origins/hosts. Run one backend process, with one worker, per data directory; independent clip jobs run asynchronously within it. The entire `data/` folder is local and ignored by Git. Clip settings, prompts, seeds, exact generation inputs, request IDs, timings, provider media URLs, reference images, and downloaded clips are persisted; keys are not. Keep downloaded clips you need; provider URLs can expire. Media cache is retained locally and can be removed with the server stopped when no longer needed.
 
 Reload reconnects without submitting another sequence. Server restart interrupts the sequence and never automatically submits its next clip; a known active Fal request can be monitored when the same key is configured. Paid POSTs are never automatically retried. If confirmation is lost or status monitoring times out after 20 minutes, a persistent `requestUncertain` flag blocks further generations. Check Fal request history before resolving that flag in `data/history.json` with the server stopped. Corrupt history fails startup rather than silently removing this block.
 
@@ -107,8 +118,16 @@ Reload reconnects without submitting another sequence. Server restart interrupts
 ```sh
 .venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python -m pytest -q
+npm ci
+npm run typecheck
 npm run check
 npm test
 ```
 
 Tests use fake adapters and synthetic media. They cover ordered chaining/keyframes, duplicate run tokens, concurrent runs, cancellation during upload/submission, reconnects, restart recovery, bounded inputs, one-shot queue submission, legacy modes, real final-frame decoding, and player order/buffering/autoplay. Browser verification uses local demo clips; paid generation and model quality have not been verified for this Python migration.
+
+There is no configured lint command. Verification includes the Python integration suite, 19 JavaScript tests, and strict TypeScript checks. HTTP transport tests inspect each atomic bundle's actual H3 payload for text-only, initial-frame, initial/end-frame and mixed modes; forced out-of-order completion must still stitch in the original order. Tests cover invalid batches, duplication/reordering, asset associations across reload, seed preservation, account rejection, idempotent retry after a lost acknowledgement, and exact Regenerate inputs. A real FFmpeg test decodes the stitched output to check segment order, duration and audio.
+
+The simplified player was checked with all 12 bundled clip inputs in an isolated local demo, using five-second synthetic clips and a delayed Clip 2. Clip 1 played while generation was active, the player waited for Clip 2, and all clips continued automatically through the end. Download produced a valid 60.02-second MP4; Regenerate retained every input and started a new run; reload recovered saved results without extra POSTs. The real saved failure was also checked: the UI now displays Fal's exhausted-balance error. No new paid generation was submitted during verification.
+
+Adaptive integration tests use fake OpenAI/Fal HTTP transports and simulated viewer data. They check strict JSON schemas, refusal/incomplete/invalid output, bounded prompt changes without truncation, and exact ordered clip prompt/seed/first/end-frame associations in all four input modes. Live provider calls and Muse/gaze hardware are not verified by those tests. The main `/` player remains the saved-sequence generator; `/adaptive.html` runs the sensor-driven decision loop.
