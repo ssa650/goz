@@ -15,6 +15,37 @@ Open http://127.0.0.1:3210. On macOS, `Start GOZ.command` also sets up the envir
 
 Add your Fal key in the debug panel (Python server memory only), or copy `.env.example` to `.env` and set `FAL_KEY`. `.env` is ignored by Git and never served. The migration intentionally starts with fresh history and does not copy credentials, source Git metadata, node_modules, or old generated media.
 
+## Adaptive story (gaze + EEG → next scene)
+
+http://127.0.0.1:3210/adaptive.html plays a story that rewrites itself from the viewer's responses. While a 5–15 s scene plays, the backend timestamps gaze, blinks, head direction (from [gazekit](../gazekit), `gazekit stream`) and Muse 2 EEG engagement, hit-tests gaze against the characters detected in that scene, and updates a viewer profile. At 70 % of the scene a decision layer picks what changes (focus character, tension, dialogue, pacing), OpenAI writes the next scene plan and video prompt, and Fal generates it from the current scene's actual last frame. The dashboard shows the current gaze target, the EEG trace, which preference changed and why, and the AI's decision.
+
+Run it with three terminals:
+
+```sh
+# 1. Muse 2 (turn it on; grant Bluetooth to the terminal)
+.venv/bin/muselsl stream
+# 2. gaze (calibrate first: python3 -m gazekit calibrate --camera 0)
+cd ../gazekit && python3 -m gazekit stream --camera 0
+# 3. GOZ (FAL_KEY + OPENAI_API_KEY in .env)
+.venv/bin/python -m backend
+```
+
+Open the page in a browser window at 100 % zoom (full screen is most accurate: gaze arrives in screen points and the page maps it onto the video using its window position). Upload an opening frame showing the characters, name them left to right, write the premise, and press **Start**.
+
+- **Response to a character** = share of the time they were on screen that the viewer looked at them × (1 + EEG engagement z in the 0.3–2 s after each look). It is *strong* when attention ≥ 40 % and EEG ≥ +0.5σ.
+- **EEG** = β/(α+θ) from the four Muse channels over 2 s windows every 0.25 s, z-scored against the last 60 s; windows over 150 µV peak-to-peak are treated as artifacts.
+- **Characters** are tracked with MediaPipe EfficientDet-Lite0 people detection (~7 MB model, downloaded to `data/models/` on first use). Identities are seeded left-to-right in scene 1 and from the previous scene's final boxes afterwards.
+- Every signal, tick, analysis and decision is saved under `data/adaptive/<session>/`.
+- Fal generation usually takes longer than a scene plays, so the player holds the last frame and shows "Generating scene N…" until it is ready. `GOZ_MAX_SCENES` (default 4) caps paid generations per session. Without `OPENAI_API_KEY` a fixed template writes the scenes and the dashboard says **template**.
+
+Rehearse without hardware or spending credits (synthetic clips, simulated viewer who prefers the second character):
+
+```sh
+GOZ_DEMO=1 GOZ_GAZE=sim GOZ_EEG=sim GOZ_DATA_DIR=output/demo-data PORT=3211 .venv/bin/python -m backend
+```
+
+`GOZ_GAZE` is `gazekit|sim|off`, `GOZ_EEG` is `muse|sim|off`. `GOZ_SIM_FAVORITE` (character index) and `GOZ_SIM_BIAS` tune the simulator. SIM sources are labelled on the dashboard.
+
 ## Debug workflow
 
 1. Choose **Start and end keyframes** or **Initial frame → chain**.
@@ -41,6 +72,7 @@ Open http://127.0.0.1:3211. The UI explicitly says **DEMO**. This produces synth
 - `backend/frames.py`: bounded media download and full-decode final-frame extraction.
 - `backend/prompts.py`, `backend/config.py`: prompt planning and non-secret model settings.
 - `frontend/`: JavaScript player, debug controls and styles; the player queue is copied from GOZ_TEST.
+- `backend/adaptive/`: sensors (gaze UDP, Muse LSL, simulators), character tracks, gaze/EEG fusion, viewer profile + decision, OpenAI director, session loop and routes. `frontend/adaptive.*`: adaptive player and dashboard. `prompts/director.md`: the scene-writer system prompt.
 - `tests/`: Python integration tests and JavaScript playback tests.
 
 ## API
