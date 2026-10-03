@@ -1,7 +1,16 @@
 """Fal storage SDK + one-shot HTTP queue submission (no paid POST retries)."""
+import re
+import unicodedata
 import httpx
 import fal_client
 from urllib.parse import quote
+
+
+def ascii_name(name):
+    # Fal sends the file name in an HTTP header, which must be ASCII.
+    text = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode()
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("._")
+    return text or "upload"
 
 
 class FalError(Exception):
@@ -28,7 +37,7 @@ class FalAdapter:
 
     async def upload(self, image):
         return await fal_client.AsyncClient(key=self.key, default_timeout=60).upload(
-            image.data, image.content_type, file_name=image.name)
+            image.data, image.content_type, file_name=ascii_name(image.name))
 
     async def request(self, method, url, **kwargs):
         response = await self.http.request(method, url, headers={"Authorization": f"Key {self.key}"}, **kwargs)
