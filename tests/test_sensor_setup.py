@@ -179,7 +179,7 @@ async def test_calibration_registration_does_not_wait_for_results_screen(tmp_pat
 @pytest.mark.parametrize('timestamp', [123.0, 1000.0])
 def test_muse_reader_selects_muse_and_handles_lsl_and_unix_clocks(monkeypatch, timestamp):
     import backend.adaptive.sensors as module
-    monkeypatch.setattr(module, 'time', SimpleNamespace(time=lambda: 1000.0))
+    monkeypatch.setattr(module, 'time', SimpleNamespace(time=lambda: 1000.0, monotonic=lambda: 100.0))
     stop, captured = threading.Event(), []
     class Info:
         def __init__(self, name): self.label = name
@@ -190,14 +190,16 @@ def test_muse_reader_selects_muse_and_handles_lsl_and_unix_clocks(monkeypatch, t
     class Inlet:
         def __init__(self, info, **kwargs): assert info.name() == 'Muse'
         def pull_chunk(self, timeout):
-            stop.set()
             return [[1, 2, 3, 4, 999]], [timestamp]
         def time_correction(self, timeout): return 0.0
         def close_stream(self): captured.append('closed')
     pylsl = SimpleNamespace(resolve_byprop=lambda *a, **k: [Info('Unrelated EEG'), Info('Muse')],
                             StreamInlet=Inlet, local_clock=lambda: 123.0)
+    def push(samples, stamps):
+        captured.append((samples, stamps))
+        stop.set()
     feed = SimpleNamespace(connected=lambda value: captured.append(value), disconnected=lambda: None,
-                           push=lambda samples, stamps: captured.append((samples, stamps)), state='')
+                           push=push, state='')
     _consume_muse(feed, stop, pylsl)
     assert captured == ['Muse-device', ([[1, 2, 3, 4]], [1000.0]), 'closed']
 

@@ -23,6 +23,9 @@ EEG_STEP_S = 0.25
 BASELINE_S = 60.0
 ARTIFACT_UV = 150.0
 EEG_FRESH_S = 3.0
+EEG_CLOCK_INITIAL_S = 2.0
+EEG_CLOCK_RETRY_S = 0.5
+EEG_CLOCK_POLL_S = 0.25
 EEG_CHANNELS = ("TP9", "AF7", "AF8", "TP10")
 BANDS = {"theta": (4, 8), "alpha": (8, 13), "beta": (13, 30)}
 
@@ -120,6 +123,7 @@ class EegFeed:
         self.last_sample_at = None
         self.samples_received = 0
         self.channel_quality = {}
+        self.acquisition_phase = "off"
 
     def _clear_baseline(self):
         self.raw.clear()
@@ -138,6 +142,7 @@ class EegFeed:
 
     def connected(self, identity):
         with self.lock:
+            self.acquisition_phase = "waiting_for_samples"
             self.device_id = identity
             self.connection_error = None
             self._clear_baseline()
@@ -153,6 +158,7 @@ class EegFeed:
 
     def disconnected(self):
         with self.lock:
+            self.acquisition_phase = "disconnected"
             self.device_id = None
             self._clear_baseline()
             self.last_sample_at = None
@@ -267,6 +273,7 @@ class EegFeed:
                     cleanSeconds=round(min(len(self.calibration_samples) * EEG_STEP_S, self.calibration_seconds), 1),
                     targetSeconds=self.calibration_seconds, outletAvailable=bool(self.device_id),
                     samplingState=sampling, samplesReceived=self.samples_received,
+                    acquisitionPhase=self.acquisition_phase,
                     lastSampleAt=self.last_sample_at, sampleAgeSeconds=None if sample_age is None else round(sample_age, 3),
                     channelQuality=dict(self.channel_quality))
 
@@ -283,16 +290,39 @@ def run_muse(feed, stop):
         feed.connection_error = feed.state
 
 
+def _muse_clock_correction(inlet, stop, timeouts, budget):
+    """Keep liblsl's estimator alive while waiting within a cancellable budget."""
+    deadline = time.monotonic() + budget
+    while not stop.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        timeout = min(EEG_CLOCK_POLL_S, remaining)
+        attempt_end = time.monotonic() + timeout
+        try:
+            correction = inlet.time_correction(timeout=timeout)
+            return None if stop.is_set() or time.monotonic() > deadline else correction
+        except timeouts:
+            # Normally liblsl used the whole timeout. Also bound retries when a
+            # provider returns early, without delaying cancellation.
+            stop.wait(max(0.0, min(deadline, attempt_end) - time.monotonic()))
+    return None
+
+
 def _consume_muse(feed, stop, pylsl):
     address = os.getenv("GOZ_MUSE_ADDRESS", "").strip()
     pinned = "Muse" + address if address else None
     # Current pylsl exposes these RuntimeError subclasses in util, not at root.
     # Keep root support for older versions; never catch all RuntimeError here.
     providers = (pylsl, getattr(pylsl, "util", None))
+    clock_timeouts = (TimeoutError,) + tuple(
+        error for provider in providers
+        if isinstance(error := getattr(provider, "TimeoutError", None), type))
     recoverable = (TimeoutError, OSError) + tuple(
         error for provider in providers for name in ("LostError", "TimeoutError")
         if isinstance(error := getattr(provider, name, None), type))
     while not stop.is_set():
+        feed.acquisition_phase = "resolving"
         feed.state = "searching for `muselsl stream`"
         try:
             streams = [s for s in pylsl.resolve_byprop("type", "EEG", timeout=1)
@@ -315,11 +345,17 @@ def _consume_muse(feed, stop, pylsl):
         inlet = None
         try:
             inlet = pylsl.StreamInlet(streams[0], max_buflen=5, max_chunklen=12, recover=False)
+            if stop.is_set():
+                break
             feed.connected(pinned)
             feed.state = "Muse LSL outlet advertised; waiting for EEG samples"
             idle = time.time()
+            initial_clock_attempt = True
+            pending = None
             while not stop.is_set():
-                chunk, stamps = inlet.pull_chunk(timeout=0.5)
+                chunk, stamps = pending if pending is not None else inlet.pull_chunk(timeout=0.5)
+                if stop.is_set():
+                    break
                 if stamps:
                     now = time.time()
                     # Clock correction applies only to LSL-clock timestamps. Unix-clock
@@ -327,16 +363,40 @@ def _consume_muse(feed, stop, pylsl):
                     if abs(stamps[-1] - now) < 60:
                         converted = stamps
                     else:
-                        correction = inlet.time_correction(timeout=0.5)
+                        if initial_clock_attempt:
+                            feed.acquisition_phase = "synchronizing_clock"
+                        budget = EEG_CLOCK_INITIAL_S if initial_clock_attempt else EEG_CLOCK_RETRY_S
+                        initial_clock_attempt = False
+                        pending = (chunk, stamps)
+                        # Retain this chunk through bootstrap; a clock-only timeout
+                        # must not recreate the inlet or reset its estimator.
+                        correction = _muse_clock_correction(inlet, stop, clock_timeouts, budget)
+                        if stop.is_set():
+                            break
+                        if correction is None:
+                            feed.acquisition_phase = "waiting_for_clock"
+                            feed.state = "Muse clock synchronization unavailable; retrying on the same inlet"
+                            feed.quality_error = "Muse clock synchronization unavailable; EEG timestamps cannot be verified."
+                            idle = time.time()  # Data arrived; this is not a lost stream.
+                            continue
+                        pending = None
                         now = time.time()
                         offset = now - pylsl.local_clock()
                         converted = [s + correction + offset for s in stamps]
-                    if len(chunk) != len(converted) or any(not math.isfinite(s) or abs(s - now) > EEG_FRESH_S for s in converted):
+                    if stop.is_set():
+                        break
+                    fresh = [(c, s) for c, s in zip(chunk, converted)
+                             if math.isfinite(s) and -0.5 <= now - s < EEG_FRESH_S]
+                    if len(chunk) != len(converted) or not fresh:
                         feed.quality_error = "Stale or invalid Muse sample timestamps; waiting for fresh EEG."
                     else:
                         before = getattr(feed, "samples_received", None)
-                        feed.push([c[:4] for c in chunk], converted)
+                        if getattr(feed, "quality_error", "").startswith((
+                                "Muse clock synchronization unavailable", "Stale or invalid Muse sample timestamps")):
+                            feed.quality_error = "Collecting a fresh 2-second EEG window."
+                        feed.push([c[:4] for c, _ in fresh], [s for _, s in fresh])
                         if before is None or feed.samples_received > before:
+                            feed.acquisition_phase = "streaming"
                             idle = now
                 if time.time() - idle > 5:
                     feed.state = "Muse LSL outlet has stopped delivering fresh EEG samples"

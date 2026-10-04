@@ -9,8 +9,12 @@ from backend.adaptive.sensors import EegFeed, _consume_muse
 from test_eeg_acquisition import Info, clock
 
 
-@pytest.mark.parametrize('error_type',[lsl_errors.TimeoutError,lsl_errors.LostError])
-@pytest.mark.parametrize('phase',['open','pull','clock'])
+# Clock timeouts retain the inlet; clock stream loss still reconnects.
+@pytest.mark.parametrize('error_type,phase', [
+    (error, phase) for error in (lsl_errors.TimeoutError, lsl_errors.LostError)
+    for phase in ('open', 'pull', 'clock')
+    if phase != 'clock' or error is lsl_errors.LostError
+])
 def test_installed_util_exception_recovers_and_accepts_subsequent_samples(clock,error_type,phase):
     feed,stop=EegFeed(),threading.Event()
     feed.source='muse'
@@ -19,6 +23,7 @@ def test_installed_util_exception_recovers_and_accepts_subsequent_samples(clock,
     def push(samples,stamps):
         captured.append((samples,stamps))
         original_push(samples,stamps)
+        stop.set()
     feed.push=push
     class Inlet:
         def __init__(self,info,**kwargs):
@@ -33,10 +38,9 @@ def test_installed_util_exception_recovers_and_accepts_subsequent_samples(clock,
                 raise error_type('installed liblsl transient error')
             if phase=='clock' and self.number==1:
                 return [[1,2,3,4,99]],[122.8]
-            stop.set()
             return [[1,2,3,4,99]],[1000.0]
         def time_correction(self,timeout):
-            assert phase=='clock' and self.number==1 and timeout==.5
+            assert phase=='clock' and self.number==1 and timeout==.25
             raise error_type('the operation failed due to a timeout.')
         def close_stream(self):closed.append(self.number)
     # Reproduce the actual installed package: util classes, NO root aliases.
@@ -62,9 +66,14 @@ def test_recoverable_discovery_error_retries_without_opening_duplicate_inlets(cl
     class Inlet:
         def __init__(self,info,**kwargs):opened.append(info.source_id())
         def pull_chunk(self,timeout):
-            stop.set();return [[1,2,3,4]],[1000.0]
+            return [[1,2,3,4]],[1000.0]
         def close_stream(self):pass
     api=SimpleNamespace(util=lsl_errors,resolve_byprop=resolve,StreamInlet=Inlet,local_clock=lambda:123.0)
+    original_push = feed.push
+    def push(samples, stamps):
+        original_push(samples, stamps)
+        stop.set()
+    feed.push = push
     _consume_muse(feed,stop,api)
     assert len(attempts)==2 and opened==['Muse-device'] and feed.samples_received==1
 

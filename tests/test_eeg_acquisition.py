@@ -129,14 +129,16 @@ def test_clock_conversion_is_bounded_and_unix_ignores_lsl_correction(clock, unix
         def __init__(self, info, **kwargs):
             assert kwargs["recover"] is False and kwargs["max_buflen"] == 5
         def pull_chunk(self, timeout):
-            stop.set()
             return [[1, 2, 3, 4, 999]], [1000.0 if unix else 122.8]
         def time_correction(self, timeout):
-            assert not unix and timeout == .5
+            assert not unix and timeout == .25
             return .2
         def close_stream(self): closed.append(True)
     captured = []
-    feed.push = lambda samples, stamps: captured.append((samples, stamps))
+    def push(samples, stamps):
+        captured.append((samples, stamps))
+        stop.set()
+    feed.push = push
     _consume_muse(feed, stop, lsl(Inlet))
     assert captured == [([[1, 2, 3, 4]], [1000.0])]
     assert closed == [True] and feed.device_id is None
@@ -163,7 +165,6 @@ def test_lost_stream_reconnects_to_same_device_and_closes_each_inlet(clock):
         def pull_chunk(self, timeout):
             if self.number == 1:
                 raise LostError("test loss")
-            stop.set()
             return [[1, 2, 3, 4]], [1000.0]
         def close_stream(self): closed.append(self.number)
     pylsl = lsl(Inlet, lambda *a, **k: [Info(), Info("Muse-other")])
@@ -171,6 +172,11 @@ def test_lost_stream_reconnects_to_same_device_and_closes_each_inlet(clock):
     def resolve(*a, **k):
         monkey_streams[0] += 1
         return [Info()] if monkey_streams[0] == 1 else [Info(), Info("Muse-other")]
+    original_push = feed.push
+    def push(samples, stamps):
+        original_push(samples, stamps)
+        stop.set()
+    feed.push = push
     pylsl.resolve_byprop, pylsl.LostError = resolve, LostError
     _consume_muse(feed, stop, pylsl)
     assert opened == ["Muse-device", "Muse-device"] and closed == [1, 2]
@@ -207,9 +213,9 @@ def test_stale_timestamp_chunk_is_not_counted(clock):
     class Inlet:
         def __init__(self, *a, **k): pass
         def pull_chunk(self, timeout):
-            stop.set()
+            clock[0] += 6
             return [[1, 2, 3, 4]], [990.0]
-        def close_stream(self): pass
+        def close_stream(self): stop.set()
     _consume_muse(feed, stop, lsl(Inlet))
     assert feed.samples_received == 0
 
