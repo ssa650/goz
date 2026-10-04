@@ -1,4 +1,5 @@
 """Independent editable clips backed by the existing sequence/job histories."""
+from __future__ import annotations
 from copy import deepcopy
 from typing import TYPE_CHECKING
 from uuid import uuid4, UUID
