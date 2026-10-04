@@ -89,7 +89,8 @@ def create_app(engine=None):
     @asynccontextmanager
     async def lifespan(app):
         if engine is None:
-            directory = Path(os.getenv("GOZ_DATA_DIR", str(ROOT/"data")))
+            directory = Path(os.getenv("GOZ_DATA_DIR", str(ROOT/"data"))).expanduser()
+            directory = (directory if directory.is_absolute() else ROOT/directory).resolve()
             if os.getenv("GOZ_DEMO", "0") == "1":
                 from .demo import DemoAdapter
                 adapter = DemoAdapter(directory/"demo")
@@ -103,6 +104,7 @@ def create_app(engine=None):
         e = app.state.engine
         app.state.sensors = Sensors(e.directory, demo=e.adapter.demo)
         e.generation_guard = app.state.sensors.setup.require_ready
+        e.adaptive_active = lambda: bool(app.state.sensors.session and app.state.sensors.session.status == "running")
         await app.state.sensors.start()
         await app.state.engine.resume()
         yield
@@ -173,6 +175,18 @@ def create_app(engine=None):
             if e.busy() or sensors.session and sensors.session.status == "running":
                 raise FalError("Stop or finish the current generation before recalibrating sensors.", 409)
             await sensors.setup.retry()
+        return sensors.setup.snapshot()
+
+    @app.post("/api/sensors/gaze-check", status_code=202)
+    async def sensor_gaze_check(request: Request):
+        e, sensors = request.app.state.engine, request.app.state.sensors
+        body = await json_body(request)
+        if type(body.get("recenter", False)) is not bool:
+            raise ValueError("Recenter must be a boolean.")
+        async with e.lock:
+            if e.busy() or sensors.session and sensors.session.status == "running":
+                raise FalError("Stop or finish the current generation before checking gaze.", 409)
+            await sensors.setup.check_gaze(recenter=body.get("recenter", False))
         return sensors.setup.snapshot()
 
     @app.delete("/api/sensors/gaze-calibration", status_code=202)

@@ -8,6 +8,7 @@ import sys
 import time
 from pathlib import Path
 from uuid import uuid4
+import shlex
 
 from .fal_adapter import FalError
 
@@ -17,10 +18,13 @@ ROOT = Path(__file__).resolve().parent.parent
 class SensorSetup:
     def __init__(self, sensors, directory, demo=False, spawn=None):
         self.sensors = sensors
-        self.directory = Path(directory).resolve()
-        self.required = not demo and os.getenv("GOZ_REQUIRE_SENSORS", "1") != "0"
-        self.phase = "waiting" if self.required else "demo" if demo else "disabled"
-        self.message = "Preparing sensors…" if self.required else "Demo mode: real sensor calibration is not required." if demo else "Sensor checks disabled by server configuration."
+        data_path = Path(directory).expanduser()
+        self.directory = (data_path if data_path.is_absolute() else ROOT / data_path).resolve()
+        self.profile_id = os.getenv("GOZ_VIEWER_PROFILE", "default").strip() or "default"
+        self.required = not demo and os.getenv("GOZ_REQUIRE_SENSORS", "0") == "1"
+        self.enabled = not demo and (self.required or sensors.gaze_mode == "gazekit")
+        self.phase = "waiting" if self.enabled else "demo" if demo else "disabled"
+        self.message = "Preparing sensors…" if self.enabled else "Demo mode: real sensor calibration is not required." if demo else "Sensors optional: continue with available signals."
         self.error = None
         self.task = None
         self.children = {}
@@ -32,8 +36,15 @@ class SensorSetup:
         self.readers = {}
         self.stopping = False
         self.selected_camera = None
-        self.saved_gaze_path = self.directory / "calibration" / "saved-gaze.json"
+        suffix = "" if self.profile_id == "default" else "-" + hashlib.sha256(self.profile_id.encode()).hexdigest()[:16]
+        self.saved_gaze_path = self.directory / "calibration" / ("saved-gaze" + suffix + ".json")
         self.reusing_gaze = False
+        self.calibration_state = "saved" if self.saved_gaze_path.is_file() else "required"
+        self.calibration_error = None
+        self.muse_task = None
+        self.manual_muse_state = "disconnected"
+        self.manual_muse_error = None
+        self.manual_muse_generation = 0
 
     def saved_gaze(self):
         if not self.saved_gaze_path.exists():
@@ -42,9 +53,10 @@ class SensorSetup:
             saved = json.loads(self.saved_gaze_path.read_text())
             model = (self.directory / saved["model"]).resolve()
             report = saved["report"]
-            if (saved.get("version") != 1 or not model.is_relative_to(self.directory / "calibration")
+            if (saved.get("version") not in (1, 2) or not model.is_relative_to(self.directory / "calibration")
                     or not model.is_file() or report.get("verdict") not in ("STABLE", "USABLE")
                     or not isinstance(report.get("camera"), str) or not report["camera"].isdigit()
+                    or saved.get("profileId", "default") != self.profile_id
                     or hashlib.sha256(model.read_bytes()).hexdigest() != saved["sha256"]):
                 raise ValueError("Invalid saved gaze model")
             return model, report
@@ -52,12 +64,17 @@ class SensorSetup:
             raise ValueError("Saved eye calibration is unavailable or damaged. Remove eye calibration to train a new one.") from None
 
     def save_gaze(self, model, report):
-        saved = dict(version=1, model=str(model.relative_to(self.directory)), report=report,
+        saved = dict(version=2, profileId=self.profile_id, model=str(model.relative_to(self.directory)), report=report,
                      sha256=hashlib.sha256(model.read_bytes()).hexdigest(), savedAt=time.time())
         temporary = self.saved_gaze_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(saved, indent=2))
-        temporary.chmod(0o600)
+        self.saved_gaze_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with temporary.open("w") as output:
+            temporary.chmod(0o600)
+            json.dump(saved, output, indent=2, allow_nan=False)
+            output.flush()
+            os.fsync(output.fileno())
         temporary.replace(self.saved_gaze_path)
+        self.calibration_state = "saved"
 
     def snapshot(self):
         eeg, gaze = self.sensors.eeg, self.sensors.gaze
@@ -74,15 +91,33 @@ class SensorSetup:
                                      and muse_live and muse["calibrated"])
         message = self.message
         if self.required and self.phase == "ready" and not ready:
-            message = ("Muse stream lost. Retry sensor setup to collect a fresh baseline." if not muse["calibrated"]
-                       else "Adjust Muse contacts and sit still: " + muse["qualityError"] if not muse_live
+            message = ("Muse EEG: " + muse["qualityError"] if muse["qualityError"]
+                       else f"Muse baseline incomplete: {muse['cleanSeconds']}/{muse['targetSeconds']} clean seconds." if not muse["calibrated"]
+                       else "Muse samples stopped. Retry sensor setup to collect a fresh baseline." if not muse_live
                        else "Gaze signal lost. Face the camera; retry setup if the camera stopped.")
-        return dict(required=self.required, generationReady=bool(ready), phase=self.phase,
-                    message=message, error=self.error, canRetry=self.required and (self.phase == "failed" or self.phase == "ready" and not ready),
+        return dict(required=self.required, enabled=self.enabled, eegMode=self.sensors.eeg_mode, generationReady=bool(ready), phase=self.phase,
+                    message=message, error=self.error, canRetry=self.enabled and (self.phase == "failed" or self.phase == "ready" and (not gaze_live or self.required and not ready)),
+                    museConnection=dict(state=self.manual_muse_state, error=self.manual_muse_error),
                     camera=dict(source=self.selected_camera),
                     muse=muse, gaze=dict(**gaze.status(), calibrated=self.gaze_calibrated,
                                         valid=gaze_live, report=self.gaze_report,
-                                        savedCalibration=self.saved_gaze_path.is_file(), reusingCalibration=self.reusing_gaze))
+                                        savedCalibration=self.saved_gaze_path.is_file(), reusingCalibration=self.reusing_gaze,
+                                        calibrationState=self.calibration_state, calibrationPath=str(self.saved_gaze_path),
+                                        failureReason=self.calibration_error, profileId=self.profile_id,
+                                        checkCommand=self.check_command(),
+                                        checkGuidance="Stop the backend, then run the check command while following its targets. Add --recenter for a checked alignment correction; restart the backend afterwards. Changing viewer, camera, seating or display requires a fresh check/calibration."))
+
+    def check_command(self):
+        try:
+            saved = self.saved_gaze()
+        except ValueError:
+            return None
+        if not saved:
+            return None
+        model, _ = saved
+        python = os.getenv("GOZ_GAZEKIT_PYTHON") or sys.executable
+        repo = os.getenv("GOZ_GAZEKIT_DIR") or str(ROOT.parent / "gazekit")
+        return "cd " + shlex.quote(str(ROOT)) + " && " + shlex.join([python, "-m", "backend.gaze_worker", "check", "--repo", repo, "--model", str(model), "--profile", self.profile_id])
 
     def require_ready(self):
         state = self.snapshot()
@@ -93,7 +128,7 @@ class SensorSetup:
         self.phase, self.message = phase, message
 
     async def start(self):
-        if not self.required or self.task and not self.task.done():
+        if not self.enabled or self.task and not self.task.done():
             return
         self.task = asyncio.create_task(self.run())
 
@@ -105,7 +140,12 @@ class SensorSetup:
             if child and child.returncode is not None:
                 raise ValueError("Sensor process stopped. " + self.log_tail(child))
             if time.monotonic() > deadline:
-                raise ValueError("Sensor setup timed out. " + self.message)
+                detail = ""
+                if self.phase in ("connecting_muse", "calibrating_muse"):
+                    eeg = self.sensors.eeg.status()
+                    detail = (f" EEG: {eeg['qualityError'] or eeg['connectionState']}. "
+                              f"Baseline: {eeg['cleanSeconds']}/{eeg['targetSeconds']} clean seconds.")
+                raise ValueError("Sensor setup timed out. " + self.message + detail)
             await asyncio.sleep(.25)
 
     def log_tail(self, child):
@@ -137,6 +177,23 @@ class SensorSetup:
                                 self.set_phase("calibrating_gaze", "Camera selected. Follow Gazekit's calibration targets and dismiss its results screen. Your eye calibration will be saved automatically.")
                     except (ValueError, KeyError, TypeError):
                         pass
+                if name == "gaze_calibration" and value.startswith("GOZ_CALIBRATION_SAVED "):
+                    try:
+                        report = json.loads(value[len("GOZ_CALIBRATION_SAVED "):])
+                        if report.get("verdict") in ("STABLE", "USABLE"):
+                            self.gaze_report = report
+                            self.save_gaze(self.attempt_dir / "gaze_model.pkl", report)
+                            self.message = "Eye calibration saved. Dismiss Gazekit's results screen to start tracking."
+                    except (OSError, ValueError, TypeError) as error:
+                        self.calibration_error = f"Could not register saved calibration: {error}"
+                if name == "gaze_calibration" and value.startswith("GOZ_CALIBRATION_REJECTED "):
+                    try:
+                        self.gaze_report = json.loads(value[len("GOZ_CALIBRATION_REJECTED "):])
+                        self.calibration_state = "invalid"
+                        self.calibration_error = f"Fresh validation failed: mean error {self.gaze_report.get('mean_error_px')} screen points. Dismiss the results screen and retry in steadier lighting/seating."
+                        self.message = self.calibration_error
+                    except (ValueError, TypeError):
+                        pass
                 self.logs[name].append(value[:400])
                 self.logs[name] = self.logs[name][-20:]
         self.readers[name] = asyncio.create_task(read())
@@ -148,7 +205,8 @@ class SensorSetup:
             self.gaze_calibrated = False
             self.gaze_report = None
             self.reusing_gaze = False
-            if self.sensors.gaze_mode != "gazekit" or self.sensors.eeg_mode not in ("muse", "mindmonitor"):
+            self.calibration_error = None
+            if self.sensors.gaze_mode != "gazekit" or self.required and self.sensors.eeg_mode not in ("muse", "mindmonitor"):
                 raise ValueError("Live generation requires GOZ_GAZE=gazekit and GOZ_EEG=mindmonitor (or muse). Use GOZ_DEMO=1 for a rehearsal.")
             if self.sensors.gaze_error:
                 raise ValueError(self.sensors.gaze_error)
@@ -170,9 +228,15 @@ class SensorSetup:
                 model, self.gaze_report = saved
                 self.reusing_gaze = True
             else:
+                self.calibration_state = "calibrating"
                 self.set_phase("select_camera", "Gazekit is opening automatically. Select your iPhone Camera in its native window, then follow the calibration targets. Keep the iPhone locked, with its rear cameras facing you. Your eye calibration will be saved for future starts.")
+                requested_camera = os.getenv("GOZ_GAZE_CAMERA", "select")
+                if requested_camera.isdigit():
+                    self.selected_camera = requested_camera
+                    self.set_phase("calibrating_gaze", "Opening the configured camera. Follow Gazekit's targets, keeping camera and seating fixed; dismiss the results screen when finished.")
                 calibration = await self.launch("gaze_calibration", [*worker, "calibrate", "--repo", gaze_repo,
-                                                    "--camera", "select", "--model", model, "--report", report_path], ROOT)
+                                                    "--camera", requested_camera, "--model", model, "--report", report_path,
+                                                    "--profile", self.profile_id], ROOT)
                 try:
                     code = await asyncio.wait_for(calibration.wait(), timeout=900)
                 except TimeoutError:
@@ -190,8 +254,8 @@ class SensorSetup:
             if not saved:
                 self.save_gaze(model, self.gaze_report)
             self.gaze_calibrated = True
-            self.set_phase("starting_gaze", "Using your saved eye calibration and alignment. Waiting for live gaze…" if saved
-                           else "Eye calibration saved. Complete Gazekit's first alignment; this adjustment will also be saved.")
+            self.set_phase("starting_gaze", "Loading the saved model in a fresh process and checking viewer/camera/display compatibility…" if saved
+                           else "Eye calibration saved. Loading the validated model and waiting for live gaze…")
             # Old samples from an unrelated external producer cannot unlock setup.
             self.sensors.gaze.samples.clear()
             self.sensors.gaze.last_rx = 0
@@ -203,9 +267,18 @@ class SensorSetup:
                     camera_args += [option, self.gaze_report[field]]
             stream = await self.launch("gaze", [*worker, "stream", "--repo", gaze_repo, "--camera", camera, *camera_args,
                                       "--model", model, "--setup-id", self.attempt_dir.name,
+                                      "--profile", self.profile_id,
                                       "--port", str(os.getenv("GOZ_GAZE_PORT", "5590"))], ROOT)
             await self.wait_for(lambda: any(s.get("valid") for s in self.sensors.gaze.window(time.time() - 1, time.time())), 90, stream)
-            self.sensors.start_muse_reader()
+            self.calibration_state = "loaded"
+            if self.sensors.eeg_mode == "mindmonitor":
+                self.sensors.start_muse_reader()
+            if not self.required:
+                self.set_phase("ready", "Gaze is ready. Connect Muse when you want EEG observations; playback and gaze work without it.")
+                return
+            if self.sensors.eeg_mode == "muse":
+                self.set_phase("ready", "Gaze is ready. Connect Muse to enable generation; playback and gaze setup remain independent.")
+                return
             if self.sensors.eeg_mode == "mindmonitor":
                 status = self.sensors.eeg.status()
                 self.set_phase("connecting_muse", f"Connect Muse 2 in Mind Monitor on your phone. On the same Wi-Fi, set OSC destination to {status['oscDestination']}, UDP port {status['oscPort']}, and enable OSC Stream Brainwaves (All Values or Average Only). Waiting for 10 readings with at least one good contact…")
@@ -219,11 +292,13 @@ class SensorSetup:
                     argv = [sys.executable, "-u", "-m", "muselsl", "stream", "--backend", "bleak", "--model", "legacy", "--lsltime", "--retries", "2"]
                     for option, env_name in (("--address", "GOZ_MUSE_ADDRESS"), ("--name", "GOZ_MUSE_NAME")):
                         if os.getenv(env_name): argv += [option, os.environ[env_name]]
-                    bridge = await self.launch("muse", argv, ROOT)
+                    bridge = self.children.get("muse")
+                    if bridge is None or bridge.returncode is not None:
+                        bridge = await self.launch("muse", argv, ROOT)
                     await self.wait_for(lambda: bool(self.sensors.eeg.device_id), 90, bridge)
-                self.set_phase("calibrating_muse", "Muse connected. Sit still with eyes open for 60 seconds of clean EEG. Adjust forehead/ear contacts if signal quality is poor.")
+                self.set_phase("calibrating_muse", "Muse LSL outlet found. Waiting for actual samples and 60 seconds of clean EEG. Sit still with eyes open and adjust forehead/ear contacts if signal quality is poor.")
                 self.sensors.eeg.begin_calibration()
-                await self.wait_for(lambda: bool(self.sensors.eeg.calibration), 240, self.children.get("muse"))
+                await self.wait_for(lambda: self.sensors.eeg.status()["calibrated"], 240, self.children.get("muse"))
             (self.attempt_dir / "muse.json").write_text(json.dumps(self.sensors.eeg.calibration, indent=2))
             (self.attempt_dir / "muse.json").chmod(0o600)
             self.set_phase("ready", "Muse and gaze are ready and live. You can generate your video.")
@@ -231,8 +306,80 @@ class SensorSetup:
             raise
         except Exception as error:
             self.error = str(error)[:1000]
+            self.calibration_error = self.error
+            self.calibration_state = "invalid" if self.saved_gaze_path.exists() else "required"
             self.set_phase("failed", "Sensor setup failed. Correct the issue, then retry setup.")
             await self.stop_children(keep_muse=True)
+
+    async def connect_muse(self):
+        """Start Muse discovery only after an explicit user request."""
+        if self.sensors.eeg_mode != "muse":
+            raise FalError("Muse controls require GOZ_EEG=muse.", 409)
+        if self.manual_muse_state in ("connecting", "connected"):
+            return
+        self.manual_muse_generation += 1
+        generation = self.manual_muse_generation
+        self.manual_muse_error = None
+        self.manual_muse_state = "connecting"
+        self.sensors.start_muse_reader()
+        self.muse_task = asyncio.create_task(self._connect_muse(generation))
+
+    async def _connect_muse(self, generation):
+        try:
+            try:
+                await self.wait_for(lambda: bool(self.sensors.eeg.device_id), 4)
+            except ValueError:
+                argv = [sys.executable, "-u", "-m", "muselsl", "stream", "--backend", "bleak", "--model", "legacy", "--lsltime", "--retries", "2"]
+                for option, env_name in (("--address", "GOZ_MUSE_ADDRESS"), ("--name", "GOZ_MUSE_NAME")):
+                    if os.getenv(env_name): argv += [option, os.environ[env_name]]
+                bridge = self.children.get("muse")
+                if bridge is None or bridge.returncode is not None:
+                    bridge = await self.launch("muse", argv, ROOT)
+                await self.wait_for(lambda: bool(self.sensors.eeg.device_id), 90, bridge)
+            if generation != self.manual_muse_generation:
+                return
+            self.sensors.eeg.begin_calibration()
+            await self.wait_for(lambda: self.sensors.eeg.status()["calibrated"], 240, self.children.get("muse"))
+            if generation != self.manual_muse_generation:
+                return
+            if self.attempt_dir:
+                (self.attempt_dir / "muse.json").write_text(json.dumps(self.sensors.eeg.calibration, indent=2))
+                (self.attempt_dir / "muse.json").chmod(0o600)
+            self.set_phase("ready", "Muse and gaze are ready. You can generate your video.")
+            self.manual_muse_state = "connected"
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if generation != self.manual_muse_generation:
+                return
+            self.manual_muse_state = "error"
+            self.manual_muse_error = str(error)[:500]
+            self.sensors.eeg.state = f"Muse connection error: {error}. Gaze-only mode remains available."
+            self.sensors.eeg.connection_error = self.sensors.eeg.state
+
+    async def disconnect_muse(self):
+        """Stop only the bridge process launched and owned by this setup."""
+        self.manual_muse_generation += 1
+        if self.muse_task and not self.muse_task.done():
+            self.muse_task.cancel()
+            await asyncio.gather(self.muse_task, return_exceptions=True)
+        bridge = self.children.get("muse")
+        if bridge is not None and bridge.returncode is None:
+            try: os.killpg(bridge.pid, signal.SIGTERM)
+            except ProcessLookupError: pass
+            try: await asyncio.wait_for(bridge.wait(), 3)
+            except TimeoutError:
+                try: os.killpg(bridge.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                await bridge.wait()
+            reader = self.readers.pop("muse", None)
+            if reader and not reader.done():
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
+            self.children.pop("muse", None)
+        self.sensors.eeg.disconnected()
+        self.manual_muse_state = "disconnected"
+        self.manual_muse_error = None
 
     async def stop_children(self, keep_muse=False):
         targets = {name: child for name, child in self.children.items()
@@ -259,6 +406,9 @@ class SensorSetup:
     async def retry(self):
         if self.task and not self.task.done():
             raise FalError("Sensor setup is already running.", 409)
+        if self.muse_task and not self.muse_task.done():
+            self.muse_task.cancel()
+            await asyncio.gather(self.muse_task, return_exceptions=True)
         bridge = self.children.get("muse")
         if bridge is not None and bridge.returncode is not None:
             self.sensors.eeg.disconnected()
@@ -268,11 +418,53 @@ class SensorSetup:
         self.set_phase("waiting", "Retrying sensor setup…")
         await self.start()
 
+    async def check_gaze(self, recenter=False):
+        """Pause the owned camera stream, validate fresh targets, then reload it."""
+        if self.task and not self.task.done():
+            raise FalError("Sensor setup is already running.", 409)
+        try:
+            saved = self.saved_gaze()
+        except ValueError as error:
+            raise FalError(str(error), 409) from None
+        if not saved:
+            raise FalError("Calibrate this viewer before running the gaze check.", 409)
+        async def perform():
+            model, _ = saved
+            await self.stop_children(keep_muse=True)
+            self.sensors.gaze.samples.clear()
+            self.sensors.gaze.last_rx = 0
+            self.sensors.gaze.expected_setup_id = "checking-" + str(uuid4())
+            self.gaze_calibrated = False
+            self.calibration_state = "checking"
+            self.set_phase("checking_gaze", "Follow the independent gaze-check targets. The previous model/alignment remains saved until this check passes.")
+            try:
+                argv = [os.getenv("GOZ_GAZEKIT_PYTHON") or sys.executable, "-u", "-m", "backend.gaze_worker", "check", "--repo",
+                        os.getenv("GOZ_GAZEKIT_DIR") or str(ROOT.parent / "gazekit"), "--model", model, "--profile", self.profile_id]
+                if recenter: argv.append("--recenter")
+                child = await self.launch("gaze_check", argv, ROOT)
+                code = await asyncio.wait_for(child.wait(), 300)
+                await self.readers["gaze_check"]
+                if code != 0:
+                    raise ValueError(self.log_tail(child))
+                self.save_gaze(model, json.loads(model.with_suffix(".report.json").read_text()))
+                await self.run()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self.error = self.calibration_error = str(error)[:1000]
+                self.calibration_state = "invalid"
+                self.set_phase("failed", "Gaze check failed; previous model preserved. Recalibrate for the current viewer/camera/seating.")
+                await self.stop_children(keep_muse=True)
+        self.task = asyncio.create_task(perform())
+
     async def close(self):
         self.stopping = True
         if self.task and not self.task.done():
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
+        if self.muse_task and not self.muse_task.done():
+            self.muse_task.cancel()
+            await asyncio.gather(self.muse_task, return_exceptions=True)
         await self.stop_children()
 
     async def remove_gaze_calibration(self):
@@ -284,6 +476,8 @@ class SensorSetup:
         self.gaze_calibrated = False
         self.reusing_gaze = False
         self.gaze_report = None
+        self.calibration_state = "required"
+        self.calibration_error = None
         self.sensors.gaze.samples.clear()
         self.sensors.gaze.last_rx = 0
         self.sensors.gaze.expected_setup_id = "removed-" + str(uuid4())

@@ -9,5 +9,6 @@
     "moduleResolution": "Bundler",
     "lib": ["ES2022", "DOM"]
   },
-  "include": ["frontend/app.js", "frontend/sequence-controller.js", "frontend/clip-state.js", "frontend/clip-editor.js", "frontend/sequence-playback.js", "frontend/queue.js"]
+  "include": ["frontend/adaptive-geometry.js",
+    "frontend/adaptive-observation.js", "frontend/app.js", "frontend/sequence-controller.js", "frontend/clip-state.js", "frontend/clip-editor.js", "frontend/sequence-playback.js", "frontend/queue.js"]
 }

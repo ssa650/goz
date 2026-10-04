@@ -81,6 +81,101 @@ def test_gaze_ignores_other_calibration_and_invalid_udp_packets():
     assert len(gaze.samples) == 1
 
 
+def test_gaze_rejects_truthy_strings_in_validity_flags():
+    gaze = GazeFeed()
+    sample = dict(t=time.time(), x=-22, y=400, valid="false", face=True)
+    assert not gaze.packet(sample)
+    assert gaze.packet(dict(sample, valid=True))  # Outside-screen values remain outside.
+    assert gaze.latest()["x"] == -22
+
+
+def test_saved_calibration_paths_are_cwd_independent_and_profile_separated(tmp_path, monkeypatch):
+    from backend.sensor_setup import ROOT
+    monkeypatch.chdir(tmp_path)
+    setup = SensorSetup(sensors(), "data")
+    assert setup.directory == ROOT / "data"
+    monkeypatch.setenv("GOZ_VIEWER_PROFILE", "another viewer")
+    other = SensorSetup(sensors(), "data")
+    assert other.saved_gaze_path != setup.saved_gaze_path
+    assert other.snapshot()["gaze"]["profileId"] == "another viewer"
+
+
+@pytest.mark.asyncio
+async def test_muse_connection_is_user_initiated_and_duplicate_safe(monkeypatch):
+    from backend.adaptive.routes import Sensors
+    monkeypatch.setenv('GOZ_EEG', 'muse')
+    monkeypatch.setenv('GOZ_GAZE', 'sim')
+    sn = Sensors(demo=True)
+    async def no_setup(): pass
+    sn.setup.start = no_setup
+    await sn.start()
+    assert sn.muse_thread is None and sn.eeg.source == 'off' and sn.sim_task is not None
+    await sn.close()
+
+    setup = SensorSetup(sensors(), 'data')
+    gate = asyncio.Event()
+    attempts = []
+    async def pending(generation):
+        attempts.append(generation)
+        await gate.wait()
+    setup._connect_muse = pending
+    await setup.connect_muse()
+    await asyncio.sleep(0)
+    await setup.connect_muse()
+    assert len(attempts) == 1 and setup.manual_muse_state == 'connecting'
+    await setup.disconnect_muse()
+    assert setup.manual_muse_state == 'disconnected'
+    gate.set()
+    setup.manual_muse_state = 'error'
+    gate.clear()
+    await setup.connect_muse()
+    await asyncio.sleep(0)
+    assert len(attempts) == 2 and setup.manual_muse_state == 'connecting'
+    await setup.disconnect_muse()
+
+
+@pytest.mark.asyncio
+async def test_manual_disconnect_does_not_kill_external_bridge(monkeypatch):
+    setup = SensorSetup(sensors(), 'data')
+    killed = []
+    monkeypatch.setattr('backend.sensor_setup.os.killpg', lambda *args: killed.append(args))
+    setup.sensors.eeg.device_id = 'externally-published-muse'
+    await setup.disconnect_muse()
+    assert not killed
+    assert setup.sensors.eeg.device_id is None
+
+
+def test_gaze_metadata_rejects_changed_viewer_display_schema_and_missing_camera(monkeypatch):
+    import backend.gaze_worker as worker
+    monkeypatch.setattr(worker, "model_schema", lambda repo: "features-v5")
+    report = dict(schemaVersion=2, profileId="viewer", modelSchema="features-v5", screen=[1710, 1107], cameraName="FaceTime")
+    worker.validate_compatibility(report, "unused", "viewer", (1710, 1107))
+    for fields, message in [({"profileId":"other"}, "viewer profile"), ({"screen":[1000, 800]}, "geometry changed"),
+                            ({"modelSchema":"old"}, "schema changed"), ({"schemaVersion":1}, "Legacy"),
+                            ({"cameraName":None}, "camera identity")]:
+        with pytest.raises(ValueError, match=message):
+            worker.validate_compatibility(dict(report, **fields), "unused", "viewer", (1710, 1107))
+
+
+@pytest.mark.asyncio
+async def test_calibration_registration_does_not_wait_for_results_screen(tmp_path):
+    model = tmp_path / "calibration" / "attempt" / "gaze_model.pkl"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"local-model")
+    child = Child()
+    child.stdout = asyncio.StreamReader()
+    child.stdout.feed_data(("GOZ_CALIBRATION_SAVED " + json.dumps(dict(verdict="STABLE", camera="0")) + "\n").encode())
+    child.stdout.feed_eof()
+    async def spawn(*args, **kwargs): return child
+    setup = SensorSetup(sensors(), tmp_path, spawn=spawn)
+    setup.attempt_dir = model.parent
+    await setup.launch("gaze_calibration", ["test"], tmp_path)
+    await setup.readers["gaze_calibration"]
+    assert child.returncode is None  # Native results screen still open.
+    assert setup.saved_gaze()[0] == model
+    assert setup.snapshot()["gaze"]["calibrationState"] == "saved"
+
+
 @pytest.mark.parametrize('timestamp', [123.0, 1000.0])
 def test_muse_reader_selects_muse_and_handles_lsl_and_unix_clocks(monkeypatch, timestamp):
     import backend.adaptive.sensors as module
@@ -97,7 +192,7 @@ def test_muse_reader_selects_muse_and_handles_lsl_and_unix_clocks(monkeypatch, t
         def pull_chunk(self, timeout):
             stop.set()
             return [[1, 2, 3, 4, 999]], [timestamp]
-        def time_correction(self): return 0.0
+        def time_correction(self, timeout): return 0.0
         def close_stream(self): captured.append('closed')
     pylsl = SimpleNamespace(resolve_byprop=lambda *a, **k: [Info('Unrelated EEG'), Info('Muse')],
                             StreamInlet=Inlet, local_clock=lambda: 123.0)
@@ -188,6 +283,11 @@ async def test_owned_startup_calibrates_both_then_unblocks_and_cleans_up(tmp_pat
     await setup.start()
     await setup.task
     if passed:
+        if eeg_mode == 'muse':
+            # Gaze setup completes without probing/launching EEG; Muse is an explicit action.
+            assert setup.phase == 'ready' and not setup.snapshot()['generationReady']
+            assert readers == [] and not any('muselsl' in argv for argv in calls)
+            return
         assert setup.snapshot()['generationReady'] and setup.phase == 'ready'
         if eeg_mode == 'muse':
             assert '--backend' in calls[2] and 'bleak' in calls[2] and '--lsltime' in calls[2]
@@ -324,6 +424,21 @@ def test_saved_camera_follows_device_when_indexes_change():
     assert saved_camera(cameras, None, 'iPhone Camera') == '3'
     with pytest.raises(ValueError, match='Reconnect'):
         saved_camera(cameras, 'missing', 'iPhone Camera')
+
+
+def test_loaded_predictor_preserves_outside_screen_coordinates(tmp_path, monkeypatch):
+    """Regression: both Gazekit.predict and stream previously clipped to edges."""
+    from backend.gaze_worker import load_predictor
+    ridge = SimpleNamespace(screen_size=(100, 80), bias=np.zeros(2),
+                            pipe=SimpleNamespace(predict=lambda features: np.array([[-20., 115.]])))
+    module = SimpleNamespace(GazeModel=SimpleNamespace(load=lambda path: ridge), transform=lambda features: features)
+    monkeypatch.setitem(sys.modules, 'gazekit.model', module)
+    predict, loaded = load_predictor(tmp_path / 'model.pkl', (100, 80))
+    assert loaded is ridge
+    assert predict(SimpleNamespace(ok=True, features=np.zeros(14))).tolist() == [-20., 115.]
+    assert predict(SimpleNamespace(ok=False)) is None
+    with pytest.raises(ValueError, match='geometry'):
+        load_predictor(tmp_path / 'model.pkl', (200, 80))
 
 
 def test_alignment_survives_restart_without_opening_targets(tmp_path):

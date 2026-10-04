@@ -2,13 +2,14 @@
 import asyncio
 import hashlib
 import json
+import math
 import os
 import shutil
 import time
 from pathlib import Path
 from uuid import uuid4
 from .config import MODELS, POLL_SECONDS, MAX_CLIPS
-from .frames import download_video, extract_last_frame, video_url
+from .frames import download_video, extract_last_frame, video_url, media_metadata
 from .fal_adapter import FalError
 from .prompts import plan
 from .clip_settings import random_seed, build_h3_request, ReferenceFrame
@@ -18,6 +19,11 @@ from .bundle_sequence import BundleSequenceService
 JOB_TERMINAL = {"completed", "failed", "cancelled"}
 SEQUENCE_TERMINAL = JOB_TERMINAL | {"interrupted"}
 now = lambda: int(time.time()*1000)
+
+
+def timing_ms(value):
+    """Provider seconds only; missing, boolean and malformed values stay unknown."""
+    return round(float(value) * 1000, 3) if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
 
 
 class Engine:
@@ -40,6 +46,7 @@ class Engine:
         self.monitored = set()
         self.stopping = False
         self.generation_guard = lambda: None
+        self.adaptive_active = lambda: False
         for sequence in self.sequences.values():
             if sequence["status"] not in SEQUENCE_TERMINAL:
                 sequence.update(status="interrupted", finishedAt=now(), error="Server restarted. No more clips will be submitted. Check the saved Fal request before starting another run.")
@@ -76,7 +83,7 @@ class Engine:
         return task
 
     def busy(self):
-        return any(j["status"] not in JOB_TERMINAL or j.get("requestUncertain") for j in self.jobs.values()) or any(
+        return self.adaptive_active() or any(j["status"] not in JOB_TERMINAL or j.get("requestUncertain") for j in self.jobs.values()) or any(
             s["status"] not in SEQUENCE_TERMINAL for s in self.sequences.values())
 
     def snapshot(self, sequence):
@@ -98,7 +105,10 @@ class Engine:
         return result
 
     def error(self, error):
-        return self.adapter.redact(str(error))[:1800] or "The request failed."
+        message = self.adapter.redact(str(error))
+        if os.getenv("OPENAI_API_KEY"):
+            message = message.replace(os.environ["OPENAI_API_KEY"], "[redacted]")
+        return message[:1800] or "The request failed."
 
     def update(self, record, **patch):
         record.update(patch)
@@ -173,6 +183,7 @@ class Engine:
             if not self.can_continue(job):
                 self.finish(job, status="cancelled")
                 return job
+            prompt_started = time.perf_counter()
             if job["mode"] in ("frames", "text"):
                 model, payload = build_h3_request(job, mapping)
                 job["model"] = model
@@ -181,11 +192,15 @@ class Engine:
                 payload = build_input(job, mapping)
             # Freeze the exact provider input, including uploaded URLs, before submission.
             job["generationInput"] = payload
-            self.update(job, uploadElapsedMs=now()-job["startedAt"], apiStartedAt=now(), status="submitting")
+            self.update(job, uploadElapsedMs=now()-job["startedAt"],
+                        payloadConstructionMs=round((time.perf_counter()-prompt_started)*1000, 3),
+                        apiStartedAt=now(), status="submitting")
+            submission_started = time.perf_counter()
             submitted = await self.adapter.submit(job["model"], payload)
+            job["submissionMs"] = round((time.perf_counter()-submission_started)*1000, 3)
             if not submitted.get("request_id"):
                 raise FalError("Fal returned no request ID. Check your Fal history.")
-            self.update(job, requestId=submitted["request_id"], status="queued")
+            self.update(job, requestId=submitted["request_id"], submittedAt=now(), status="queued")
             if job.get("cancelRequested"):
                 await self.cancel_job(job)
             await self.monitor(job)
@@ -218,20 +233,47 @@ class Engine:
                     self.update(job, connectionWarning="Status connection interrupted; reconnecting to the same Fal request.")
                     await asyncio.sleep(min(5, self.poll_seconds * 2**min(errors, 4)))
                     continue
+                if not isinstance(status, dict):
+                    job["requestUncertain"] = True
+                    raise FalError("Fal returned malformed queue status; inspect the saved request before retrying.")
                 if status.get("status") in ("CANCELLED", "CANCELED"):
                     self.finish(job, status="cancelled")
                     return
-                self.update(job, status="queued" if status.get("status") == "IN_QUEUE" else "generating",
+                provider_state = status.get("status")
+                if provider_state not in ("IN_QUEUE", "IN_PROGRESS", "COMPLETED"):
+                    job["requestUncertain"] = True
+                    raise FalError("Fal returned an unrecognized queue status; inspect the saved request before retrying.")
+                if provider_state == "IN_PROGRESS" and not job.get("firstProgressObservedAt"):
+                    job["firstProgressObservedAt"] = now()
+                    # Polling observations are upper bounds, not provider queue timestamps.
+                    job["queueObservedMs"] = now() - job.get("submittedAt", job["apiStartedAt"])
+                self.update(job, status="queued" if provider_state == "IN_QUEUE" else "generating",
                             queuePosition=status.get("queue_position"), connectionWarning=None)
-                if status.get("status") == "COMPLETED":
+                if provider_state == "COMPLETED":
                     api_ready = now()-job["apiStartedAt"]
+                    job["providerCompletedObservedAt"] = now()
+                    job["providerObservedElapsedMs"] = now()-job.get("submittedAt", job["apiStartedAt"])
+                    metrics = status.get("metrics") if isinstance(status.get("metrics"), dict) else {}
+                    job["providerMetrics"] = {k: v for k, v in metrics.items() if timing_ms(v) is not None}
+                    job["providerRunnerMs"] = timing_ms(metrics.get("inference_time"))
+                    if status.get("error"):
+                        raise FalError(f"Fal reported a failed request: {status['error']}")
+                    result_started = time.perf_counter()
                     result = await self.adapter.result(job["model"], job["requestId"])
+                    job["resultRetrievalMs"] = round((time.perf_counter()-result_started)*1000, 3)
+                    if not isinstance(result, dict):
+                        raise ValueError("Fal returned a malformed result; expected a video object.")
                     data = result.get("data", result)
+                    if not isinstance(data, dict) or not isinstance(data.get("video"), dict):
+                        raise ValueError("Fal completed without a usable video object.")
                     if not isinstance(data.get("video", {}).get("url"), str):
                         raise ValueError("Fal completed without a usable video URL.")
                     if not self.adapter.demo:
                         video_url(data["video"]["url"])
-                    self.finish(job, status="completed", video=data["video"], timings=data.get("timings"),
+                    timings = data.get("timings") if isinstance(data.get("timings"), dict) else {}
+                    self.finish(job, status="completed", video=data["video"],
+                                timings={k: v for k, v in timings.items() if timing_ms(v) is not None},
+                                providerInferenceMs=timing_ms(timings.get("inference")),
                                 seed=data.get("seed") if type(data.get("seed")) is int else job.get("seed"),
                                 seedSource="provider" if type(data.get("seed")) is int else "submitted" if job.get("seed") is not None else "unknown", expandedPrompt=data.get("expanded_prompt"), apiReadyMs=api_ready)
                     return
@@ -335,6 +377,7 @@ class Engine:
             if path.exists():
                 return path
             temporary = path.with_suffix(".part")
+            download_started = time.perf_counter()
             try:
                 if self.adapter.demo:
                     request_id = job["video"]["url"].removeprefix("demo:")
@@ -343,7 +386,17 @@ class Engine:
                     temporary.chmod(0o600)
                 else:
                     await download_video(job["video"]["url"], temporary)
+                download_ms = round((time.perf_counter()-download_started)*1000, 3)
+                check_started = time.perf_counter()
+                metadata = await asyncio.to_thread(media_metadata, temporary)
+                if not metadata.get("size") or not metadata.get("duration", 0):
+                    raise ValueError("Downloaded provider result has no playable video stream.")
                 os.replace(temporary, path)
+                self.update(job, mediaDownloadMs=download_ms,
+                            mediaValidationMs=round((time.perf_counter()-check_started)*1000, 3),
+                            mediaReadyAt=now(), mediaReadyElapsedMs=now()-job["startedAt"],
+                            actualDuration=metadata["duration"],
+                            hasAudio=bool(metadata.get("audio_codec")))
             except BaseException:
                 temporary.unlink(missing_ok=True)
                 raise

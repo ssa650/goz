@@ -1,13 +1,36 @@
-"""Bounded OpenAI decisions; local, small adjustments to existing prompts."""
+"""Local, bounded adaptation and deterministic provider prompt composition."""
 import json
-import os
+import re
+import time
 from pathlib import Path
 
-import httpx
+from . import eeg_policy
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 GENRES = {"suspense", "action", "humor", "romance", "drama"}
-ACTIONS = ("keep", "focus_character", "faster_pacing", "slower_pacing", "subtle_suspense", "subtle_humor", "clearer_dialogue")
+ACTIONS = ("keep", "focus_character", "faster_pacing", "slower_pacing", "subtle_suspense", "subtle_humor", "clearer_dialogue", "less_dialogue", "more_dialogue")
+
+
+def continuation(story):
+    """Small local story controller for custom clips; saved bundles bypass it."""
+    number = len(story["scenes"])
+    events = (
+        "Establish the premise with a clear shared goal and one intriguing detail in the existing environment.",
+        "Continue the previous action. One character notices that detail and shows it to the others; they react differently.",
+        "The characters investigate the same detail together. Their first attempt has a small comic setback.",
+        "Resolve the setback with a playful visual reveal, then finish with the characters reacting together.",
+    )
+    cast = "; ".join(f"{c['name']}: {c.get('description') or 'retain the reference appearance'}" for c in story["characters"])
+    props = "; ".join(f"{o['name']}: {o.get('description', '')}" for o in story.get("objects", []))
+    previous = story["scenes"][-1]["summary"][-600:] if number else "Opening scene."
+    event = events[min(number, len(events) - 1)]
+    story["current_event"] = event
+    return (f"IMMUTABLE WORLD: {story['premise']}\nCHARACTERS: {cast}\nRECURRING OBJECTS: {props}\n"
+            "Keep reference character designs, clothing, visual style, location and relationships consistent.\n"
+            f"STORY STATE: Scene {number + 1}. Previous scene: {previous}\nNEXT EVENT: {event}\n"
+            "CAMERA: Continue from the supplied final frame with readable staging and natural motion.\n"
+            "DIALOGUE: Use brief natural reactions appropriate to the current event; do not repeat the opening.\n"
+            "AUDIO: Consistent character voices, gentle underwater ambience and synchronized action sounds.")
 
 
 def decision_schema(names):
@@ -22,9 +45,9 @@ def validate_decision(value, names):
     if (not isinstance(value, dict) or set(value) != {"action", "focus", "reason"}
             or value["action"] not in ACTIONS or value["focus"] not in [None, *names]
             or not isinstance(value["reason"], str) or len(value["reason"]) > 300):
-        raise ValueError("OpenAI returned an invalid engagement decision.")
+        raise ValueError("Invalid bounded adaptation decision.")
     if (value["action"] == "focus_character") != (value["focus"] is not None):
-        raise ValueError("OpenAI's character focus does not match its action.")
+        raise ValueError("Character focus does not match its action.")
     # Keep the existing dashboard contract; these fields describe one decision.
     return dict(**value, tension="higher" if value["action"] == "subtle_suspense" else "same",
                 pacing={"faster_pacing": "faster", "slower_pacing": "slower"}.get(value["action"], "same"),
@@ -34,37 +57,64 @@ def validate_decision(value, names):
 
 
 def local_decision(hint, names):
-    """Clearly labelled no-key rehearsal fallback, constrained to one choice."""
+    """One local change, prioritized by valid observed character attention."""
     action, focus = "keep", None
     if hint.get("focus") in names:
         action, focus = "focus_character", hint["focus"]
-    elif hint.get("pacing") == "faster":
-        action = "faster_pacing"
-    elif hint.get("tone") == "humor":
-        action = "subtle_humor"
-    elif hint.get("tension") == "higher":
-        action = "subtle_suspense"
-    elif hint.get("dialogue") == "more":
-        action = "clearer_dialogue"
-    return validate_decision(dict(action=action, focus=focus, reason="; ".join(hint.get("reasons", []))[:300]), names)
+    elif hint.get("dialogue") in ("more", "less"):
+        action = "more_dialogue" if hint["dialogue"] == "more" else "less_dialogue"
+    elif hint.get("pacing") in ("faster", "slower"):
+        action = "faster_pacing" if hint["pacing"] == "faster" else "slower_pacing"
+    eeg = dict(hint.get("eeg_policy") or {})
+    if hint.get("pacing") in ("faster", "slower"):
+        eeg["suppressed_by"] = "gaze_readability_pacing"
+    eeg_primary = action == "keep" and bool(eeg_policy.delivery_cue(eeg))
+    if eeg_primary:
+        action = eeg["action"]
+    choice = validate_decision(dict(action=action, focus=focus, reason="; ".join(hint.get("reasons", []))[:300]), names)
+    choice.update(evidence=hint.get("evidence", {}), policy=hint.get("policy", "local-gaze-v2"))
+    choice["eeg_primary"] = eeg_primary
+    choice["eeg_policy"] = eeg
+    choice["eeg_applied"] = bool(eeg_policy.delivery_cue(eeg, "same" if eeg_primary else choice["pacing"]))
+    eeg["applied"] = choice["eeg_applied"]
+    choice["applied_actions"] = ([action] if action != "keep" else []) + (
+        [eeg["action"]] if choice["eeg_applied"] and not eeg_primary else [])
+    choice["dialogue"] = {"more_dialogue": "more", "less_dialogue": "less"}.get(action, choice["dialogue"])
+    return choice
+
+
+def adjustment_cue(decision):
+    primary = {
+        "keep": "",
+        "focus_character": (
+            f"PRIMARY SHOT: {decision['focus']} receives the main medium close-up for most of the interior of this clip. "
+            f"Keep {decision['focus']}'s face and existing action prominently visible; other characters remain supporting in wider framing. "
+            "Use one simple continuous camera move from the opening to this shot and back to the required ending. "
+            "This shot priority overrides competing camera/framing directions in the script, but does not reassign scripted actions or lines. "
+            "Preserve the story outcome, exact character designs, voices, location and continuity. "
+            "Reference first/last compositions govern only the boundary frames; the primary shot governs the interior."),
+        "faster_pacing": "Slightly quicken the existing gestures and camera movement; preserve scripted actions, dialogue and outcome.",
+        "slower_pacing": "Use slower readable gestures and a steady camera; preserve scripted actions, dialogue and outcome.",
+        "subtle_suspense": "Add a brief anticipatory pause to the existing action without introducing events or changing dialogue.",
+        "subtle_humor": "Emphasize the humor of existing facial reactions without adding events or changing dialogue.",
+        "clearer_dialogue": "Make the scripted spoken lines clear with restrained background sound; retain their wording.",
+        "less_dialogue": "Use only the shortest existing line needed to preserve the story outcome; show other reactions silently. Keep voices and characterization consistent.",
+        "more_dialogue": "Give the existing dialogue a clear foreground delivery and room to finish, with less silent padding. Preserve wording, voices and story outcome; do not add exposition.",
+    }[decision["action"]]
+    eeg = eeg_policy.delivery_cue(decision.get("eeg_policy"),
+                                  "same" if decision.get("eeg_primary") else decision.get("pacing", "same"))
+    return eeg if decision.get("eeg_primary") else " ".join(cue for cue in (primary, eeg) if cue)
 
 
 def adjust_prompt(base, decision):
-    """Append at most one controlled cue. Never truncate or replace the scene."""
-    cue = {
-        "keep": "",
-        "focus_character": f"Gently emphasize {decision['focus']}'s existing reaction with a subtle camera push; preserve all scripted actions and lines.",
-        "faster_pacing": "Slightly quicken the existing gestures and camera movement; preserve every scripted action and spoken line.",
-        "slower_pacing": "Slightly soften the pace of existing gestures and camera movement; preserve every scripted action and spoken line.",
-        "subtle_suspense": "Add a subtle anticipatory pause and restrained ambience to the existing action, without introducing events or changing dialogue.",
-        "subtle_humor": "Gently emphasize the humor of the existing facial reactions, without adding jokes, events, or changing dialogue.",
-        "clearer_dialogue": "Make the existing spoken lines slightly clearer through natural delivery and restrained background sound; retain their exact wording.",
-    }[decision["action"]]
+    """Preserve the script and add an explicit, reviewable camera priority."""
+    cue = adjustment_cue(decision)
     if not cue:
         return base
-    addition = "\n\nSubtle engagement adjustment: " + cue
-    # A full-length user prompt wins over the optional cue.
-    return base + addition if len(base + addition) <= 8000 else base
+    result = base + "\n\nADAPTIVE SCENE DIRECTION (interior shot/delivery priority): " + cue
+    if len(result) > 8000:
+        raise ValueError("The original scene plus its adaptation exceeds 8,000 characters; shorten the source scene. No adaptation was silently dropped.")
+    return result
 
 
 def system_prompt(duration):
@@ -131,54 +181,45 @@ def user_message(story, profile, decision, duration):
 
 
 async def write_scene(story, profile, decision, duration, transport=None):
+    """Bounded choices and prompt composition require no remote model call.
+
+    The optional transport argument is retained for callers, but no viewer data
+    or OpenAI request is sent from this path. Creative plot remains the supplied
+    episode or the existing local continuation controller.
+    """
+    started = time.perf_counter()
     names = [c["name"] for c in story["characters"]]
-    key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not key or not story["scenes"]:
-        return template(story, decision, duration, names), "template"
-    model = os.getenv("OPENAI_MODEL", "gpt-6-luna").strip() or "gpt-6-luna"
-    async with httpx.AsyncClient(timeout=60, transport=transport) as client:
-        response = await client.post(
-            "https://api.openai.com/v1/responses",
-            headers={"Authorization": f"Bearer {key}"},
-            json=dict(model=model, store=False, max_output_tokens=1200, reasoning={"effort": "none"},
-                      text={"format": dict(type="json_schema", name="engagement_decision", strict=True,
-                                          schema=decision_schema(names))},
-                      input=[{"role": "system", "content": system_prompt(duration)},
-                                {"role": "user", "content": user_message(story, profile, decision, duration)}]))
-    if not response.is_success:
-        try:
-            detail = response.json().get("error", {}).get("message", "")
-        except ValueError:
-            detail = ""
-        raise ValueError(f"OpenAI request failed ({response.status_code}). {detail}".replace(key, "[redacted]")[:600])
-    payload = response.json()
-    if payload.get("status") != "completed":
-        raise ValueError("OpenAI decision did not complete. No new Fal generation was submitted.")
-    contents = [c for output in payload.get("output", []) if output.get("type") == "message"
-                for c in output.get("content", [])]
-    if any(c.get("type") == "refusal" for c in contents):
-        raise ValueError("OpenAI declined the engagement decision. No new Fal generation was submitted.")
-    texts = [c.get("text", "") for c in contents if c.get("type") == "output_text"]
-    if len(texts) != 1:
-        raise ValueError("OpenAI returned no usable engagement decision.")
-    choice = validate_decision(json.loads(texts[0]), names)
-    plan = template(story, choice, duration, names)
-    plan["decisionRequestId"] = payload.get("id")
-    return plan, f"openai:{model}"
+    plan = template(story, decision, duration, names)
+    plan["decisionElapsedMs"] = round((time.perf_counter() - started) * 1000, 3)
+    return plan, "local-rules"
 
 
 def template(story, decision, duration, names):
-    # This function assembles a plan locally; the model never supplies Fal text.
-    decision = decision if "action" in decision else local_decision(decision, names)
+    started = time.perf_counter()
+    decision = dict(decision) if "action" in decision else local_decision(decision, names)
     base = story.get("next_prompt", story["premise"])
     if not isinstance(base, str) or not base.strip() or len(base) > 8000:
         raise ValueError("The next scene needs its original prompt (1–8,000 characters).")
     focus = decision.get("focus")
+    if focus and (focus not in names or not re.search(r"(?<!\w)" + re.escape(focus) + r"(?!\w)", base, re.I)):
+        decision = local_decision(dict(reasons=["Observed target is absent from this scripted continuation; preserve its cast and story"],
+                                       eeg_policy=decision.get("eeg_policy")), names)
+        focus = None
+    # Boundary references remain authoritative; focus changes the interior shot,
+    # not the saved opening/ending asset, cast, or episode outcome.
+    spec = dict(primary_character=focus, shot="main medium close-up" if focus else "scripted",
+                central_action="retain scripted action and actor", dialogue=decision.get("dialogue", "same"),
+                pacing=decision.get("pacing", "same"), reference_policy="first/last frame boundaries; adaptive interior shot",
+                frame_constraints=story.get("frame_constraints", {}), story_outcome="preserved",
+                eeg_delivery_action=decision.get("eeg_policy", {}).get("action", "keep") if decision.get("eeg_applied") else "keep")
+    prompt = adjust_prompt(base, decision)
     return dict(
-        scene_title=f"{focus} takes the lead" if focus else "The story continues",
-        summary=base[:600],
+        scene_title=f"{focus} in the main shot" if focus else "The story continues",
+        summary=story.get("next_summary", base[:600]),
         beats=parse_timeline(story.get("next_timeline", ""), names, duration) or
               [dict(t0=0.0, t1=float(duration), description=base[:300], characters=list(names),
                     dialogue=False, speaker=None, tags=[])],
-        base_prompt=base, video_prompt=adjust_prompt(base, decision), decision=decision,
+        base_prompt=base, video_prompt=prompt, decision=decision, scene_spec=spec,
+        prompt_changes=adjustment_cue(decision),
+        promptConstructionMs=round((time.perf_counter() - started) * 1000, 3),
         change_note=("; ".join(decision.get("reasons", [])))[:300])

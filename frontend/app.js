@@ -44,8 +44,8 @@ const {run,config}=controller,completed=run?.clips.filter(c=>c.status==='complet
   generate.disabled=!config?.configured||controller.busy||!controller.generationReady;
   regenerate.disabled=!config?.configured||controller.busy||!run||!controller.generationReady;
   const setup=config?.sensorSetup;
-  element('sensor-setup').hidden=!setup?.required;
-  element('sensor-title').textContent=setup?.generationReady?'Sensors ready':'Sensor setup';
+  element('sensor-setup').hidden=!setup?.required&&!setup?.enabled;
+  element('sensor-title').textContent=setup?.phase==='ready'?'Sensors ready':'Sensor setup';
   element('sensor-message').textContent=setup?.error||setup?.message||'';
   element('sensor-progress').textContent=setup && (setup.muse.source === 'mindmonitor' || setup.phase === 'calibrating_muse')
     ?museProgress(setup.muse):'';

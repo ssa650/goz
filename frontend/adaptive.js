@@ -1,12 +1,31 @@
 import { museProgress } from './muse-status.js';
+import { currentObservation } from './adaptive-observation.js';
+import { trackerValue, trackingSummary } from './adaptive-tracker.js';
+import { PlaybackQueue } from './queue.js';
+import { videoContentRect, screenContentRect, boxesAt } from './adaptive-geometry.js';
 const $ = id => document.getElementById(id);
 const COLORS = ['#e07a5f', '#3d85c6', '#81b29a', '#f2cc8f'];
-const video = $('video'), canvas = $('overlay-canvas'), ctx = canvas.getContext('2d');
+let video = $('video');
+const videos = [video, $('video-next')];
+const canvas = $('overlay-canvas'), ctx = canvas.getContext('2d');
 let state = null, sessionId = null, playingIndex = null, waitingFor = 0, sound = false, lastChanges = '', running = false;
 let providerConfigured = false, submitting = false;
+let clockOffset = 0, tickPending = false, pendingStop = null;
+let endingIndex = null;
+let playbackEpoch = 0, presented = null, lastTickAt = 0, playerMode = 'idle';
+let origin = null, originWindow = '', lastPresentedClip = null;
+const ending = new Set();
+const windowKey = () => [window.screenX, window.screenY, window.innerWidth, window.innerHeight, devicePixelRatio, !!document.fullscreenElement].join(':');
+window.addEventListener('pointermove', e => {
+  // Actual MouseEvent coordinates establish the viewport's screen origin;
+  // this avoids guessing browser title/toolbar/sidebar dimensions.
+  origin = {x:e.screenX-e.clientX, y:e.screenY-e.clientY}; originWindow = windowKey();
+});
 
 async function request(path, options) {
-  const r = await fetch(path, options); const value = await r.json();
+  const controller=new AbortController(), timeout=setTimeout(()=>controller.abort(),8000);
+  let r;try {r=await fetch(path,{...options,signal:controller.signal});}finally {clearTimeout(timeout);}
+  const value = await r.json();
   if (!r.ok) throw new Error(value.error || 'Request failed.');
   return value;
 }
@@ -37,76 +56,135 @@ $('setup').addEventListener('submit', async event => {
   body.append('use_saved_sequence', $('use-sequence').checked ? '1' : '0');
   body.append('premise', $('premise').value);
   body.append('timeline', $('timeline').value);
+  body.append('tracker', trackerValue($('tracker').value));
   body.append('characters', JSON.stringify(characters)); body.append('duration', $('duration').value); body.append('resolution', $('resolution').value);
+  body.append('objects', JSON.stringify($('objects').value.split(',').map(n => n.trim()).filter(Boolean).map(n => ({name:n, description:n}))));
   submitting = true; $('start').disabled = true;
   try { await request('/api/adaptive/sessions', { method: 'POST', body }); }
   catch (e) { error(e.message); }
   finally { submitting = false; $('start').disabled = !providerConfigured || !state?.setup?.generationReady; }
 });
+for (const [id,recenter] of [['gaze-check',false],['gaze-recenter',true]]) $(id).addEventListener('click',async()=>{try {await post('/api/sensors/gaze-check',{recenter});}catch(e){error(e.message);}});
 $('sensor-retry').addEventListener('click', async () => {
   try { await request('/api/sensors/setup', {method:'POST'}); } catch (e) { error(e.message); }
+});
+$('muse-connect').addEventListener('click', async () => {
+  $('muse-connect').disabled = true;
+  try { await post('/api/adaptive/muse/connect', {}); } catch (e) { error(e.message); }
+});
+$('muse-disconnect').addEventListener('click', async () => {
+  $('muse-disconnect').disabled = true;
+  try { await post('/api/adaptive/muse/disconnect', {}); } catch (e) { error(e.message); }
 });
 $('gaze-calibration-remove').addEventListener('click', async () => {
   try { await request('/api/sensors/gaze-calibration', {method:'DELETE'}); } catch (e) { error(e.message); }
 });
-$('stop').addEventListener('click', async () => { try { await post('/api/adaptive/stop', {}); } catch (e) { error(e.message); } });
-$('sound').addEventListener('click', () => { sound = !sound; video.muted = !sound; $('sound').textContent = sound ? 'Mute sound' : 'Enable sound'; });
+$('stop').addEventListener('click', async () => {
+  player.stop(); playingIndex = null; endingIndex = null; ending.clear();
+  try { render({ ...state, session: await post('/api/adaptive/stop', {session_id:sessionId}) }); } catch (e) { error(e.message); }
+});
+$('fullscreen').addEventListener('click', () => {
+  const change = document.fullscreenElement ? document.exitFullscreen() : $('screen').requestFullscreen();
+  change.catch(e => error(e.message));
+});
+$('sound').addEventListener('click', () => { sound = !sound; player.setSound(sound); $('sound').textContent = sound ? 'Mute sound' : 'Enable sound'; });
 
 // -- player -------------------------------------------------------------------
 function contentRect() {
-  const r = video.getBoundingClientRect();
-  if (!video.videoWidth || !r.width) return null;
-  const scale = Math.min(r.width / video.videoWidth, r.height / video.videoHeight);
-  const w = video.videoWidth * scale, h = video.videoHeight * scale;
-  return { left: r.left + (r.width - w) / 2, top: r.top + (r.height - h) / 2, w, h, el: r };
+  return videoContentRect(video.getBoundingClientRect(), video.videoWidth, video.videoHeight, getComputedStyle(video).objectFit);
 }
 function screenRect() {
-  const c = contentRect(); if (!c) return null;
-  const chrome = Math.max(0, window.outerHeight - window.innerHeight);
-  return { x: window.screenX + c.left, y: window.screenY + chrome + c.top, w: c.w, h: c.h };
+  const c = contentRect(); if (!c || (!document.fullscreenElement && originWindow !== windowKey())) return null;
+  const convert = r => origin && originWindow === windowKey()
+    ? {x:origin.x+r.left,y:origin.y+r.top,w:r.w,h:r.h}
+    : screenContentRect(r, {...window,screenX:window.screenX,screenY:window.screenY,outerWidth:window.outerWidth,
+        innerWidth:window.innerWidth,outerHeight:window.outerHeight,innerHeight:window.innerHeight,fullscreen:!!document.fullscreenElement});
+  const r = video.getBoundingClientRect();
+  const left = Math.max(c.left,r.left,0), top = Math.max(c.top,r.top,0);
+  const right = Math.min(c.left+c.w,r.right,innerWidth), bottom = Math.min(c.top+c.h,r.bottom,innerHeight);
+  return {rect:convert(c), visible_rect:convert({left,top,w:Math.max(0,right-left),h:Math.max(0,bottom-top)})};
 }
-function playClip(index) {
-  const clip = state.session.clips[index];
-  playingIndex = index; video.src = clip.url; video.muted = !sound;
-  video.play().catch(() => { $('overlay').hidden = false; $('overlay').textContent = 'Click the video to start playback.'; });
+async function playbackEvent(kind, v) {
+  const clip = state?.session?.clips[v.clipIndex], sid = sessionId;
+  if (!clip) return;
+  try { await post('/api/adaptive/playback-event', {session_id:sid, clip:v.clipIndex, clip_id:clip.id, kind, wall:Date.now()+clockOffset}); }
+  catch { /* Polling retains connection diagnostics. */ }
 }
-video.addEventListener('playing', () => { $('overlay').hidden = true; });
-video.addEventListener('ended', () => {
-  if (playingIndex == null) return;
-  void post('/api/adaptive/ended', { clip: playingIndex }).catch(() => {});
-  waitingFor = playingIndex + 1; playingIndex = null;
+for (const v of videos) {
+  v.addEventListener('ended', () => {
+    if (v !== player.current || !sessionId) return;
+    ending.add(v.clipIndex); void playbackEvent('ended', v); playingIndex = null; presented = null;
+  });
+  v.addEventListener('canplay', () => void playbackEvent('ready', v));
+  v.addEventListener('seeking', () => { if (v === video) { playbackEpoch++; presented=null; void reportTick(false); } });
+  v.addEventListener('pause', () => { if (v === video) void reportTick(false); });
+  v.addEventListener('waiting', () => { if (v === video) { void reportTick(false); void playbackEvent('waiting',v); } });
+  if ('requestVideoFrameCallback' in v) {
+    const frame = (now, meta) => {
+      if (v === player.current) {
+        presented = {time:meta.mediaTime, wall:performance.timeOrigin+meta.expectedDisplayTime+clockOffset, at:performance.now()};
+        void reportTick(true);
+      }
+      v.requestVideoFrameCallback(frame);
+    };
+    v.requestVideoFrameCallback(frame);
+  }
+}
+const player = new PlaybackQueue(videos, event => {
+  playerMode = event.state;
+  if (event.state === 'playing') {
+    video = player.current; playingIndex = event.index; waitingFor = event.index;
+    $('overlay').hidden = true;
+    const key = `${sessionId}:${event.index}`;
+    if (lastPresentedClip !== key) { lastPresentedClip=key; playbackEpoch++; presented=null; void playbackEvent('playing',video); }
+  } else if (event.state === 'gesture') {
+    $('overlay').hidden=false; $('overlay').textContent='Click the video to start playback.';
+  } else if (['buffering','loading','stopped','error','finished','cancelled'].includes(event.state)) {
+    if (!player.current) playingIndex=null;
+    $('overlay').hidden=false;
+    $('overlay').textContent = event.state === 'finished' ? 'Story finished.' : event.state === 'cancelled' ? 'Stopped by viewer.' :
+      event.state === 'error' ? 'Media could not play. Stop and restart to retry.' : event.state === 'stopped' ? 'Generation failed · holding last frame. Stop and restart when the provider is available.' :
+      event.index ? 'BRIDGE · holding the last frame while the next generated scene becomes ready. No new viewer evidence is collected.' : 'Preparing the opening scene…';
+  }
 });
-$('screen').addEventListener('click', () => { if (video.src && video.paused && playingIndex != null) video.play(); });
+$('screen').addEventListener('click', () => { if (player.autoplayBlocked) void player.tryPlay(); });
 function managePlayer(s) {
-  if (playingIndex != null) return;
-  const next = s.clips[waitingFor];
-  if (next && next.status !== 'generating' && next.url) { playClip(waitingFor); return; }
-  $('overlay').hidden = false;
-  $('overlay').textContent = s.status === 'running'
-    ? (waitingFor === 0 ? `Generating the opening scene… (${s.stage})` : `Generating scene ${waitingFor + 1}, adapted to you… (${s.stage})`)
-    : s.status === 'failed' ? `Stopped: ${s.error}` : 'Story finished.';
+  if (s.status === 'stopped') { if (!player.stopped) player.stop(); return; }
+  player.update(s.clips.map(c => c.url && ['ready','playing','watched'].includes(c.status) ? c : null), s.status === 'finished' ? 'completed' : s.status);
 }
-setInterval(() => {
-  if (playingIndex == null || !state?.session) return;
-  void post('/api/adaptive/tick', { clip: playingIndex, video_t: video.currentTime, playing: !video.paused && !video.ended,
-    rect: screenRect(), wall: Date.now() }).catch(() => {});
-}, 100);
+async function reportTick(playing) {
+  if (playingIndex == null || !state?.session || (playing && (tickPending || performance.now()-lastTickAt < 80))) return;
+  const mapping = screenRect() || {rect:null,visible_rect:null};
+  const sid=sessionId, index=playingIndex, clip=state.session.clips[index];
+  const fresh=presented && performance.now()-presented.at < 250;
+  const hasFrames='requestVideoFrameCallback' in video;
+  const active=playing && !video.paused && !video.ended && video.readyState>=3 && (!hasFrames || fresh);
+  const payload={session_id:sid,clip:index,clip_id:clip.id,epoch:playbackEpoch,
+      video_t:fresh && active ? presented.time : video.currentTime,playing:!!active,playback_rate:video.playbackRate,
+      ...mapping,wall:fresh && active ? presented.wall : Date.now()+clockOffset};
+  if (tickPending) { if (!playing && !pendingStop) pendingStop=payload; return; }
+  lastTickAt=performance.now(); await sendCapturedTick(payload);
+}
+async function sendCapturedTick(payload) {
+  tickPending=true;
+  try {await post('/api/adaptive/tick',payload);}
+  catch(e) {$('backend-status').textContent=`Playback sync: ${e.message}`;}
+  finally {tickPending=false;if(pendingStop){const next=pendingStop;pendingStop=null;void sendCapturedTick(next);}}
+}
+setInterval(() => { if (!('requestVideoFrameCallback' in video) || !presented || performance.now()-presented.at > 300) void reportTick(!('requestVideoFrameCallback' in video)); }, 150);
 
 // -- overlay ------------------------------------------------------------------
-function boxesAt(track, t) {
-  if (!track?.length) return {};
-  let best = track[0];
-  for (const f of track) if (Math.abs(f.t - t) < Math.abs(best.t - t)) best = f;
-  return Math.abs(best.t - t) <= 0.27 ? best.boxes : {};
-}
 function draw() {
   const r = canvas.getBoundingClientRect();
-  if (canvas.width !== Math.round(r.width * devicePixelRatio)) { canvas.width = Math.round(r.width * devicePixelRatio); canvas.height = Math.round(r.height * devicePixelRatio); }
+  if (canvas.width !== Math.round(r.width * devicePixelRatio) || canvas.height !== Math.round(r.height * devicePixelRatio)) { canvas.width = Math.round(r.width * devicePixelRatio); canvas.height = Math.round(r.height * devicePixelRatio); }
   ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0); ctx.clearRect(0, 0, r.width, r.height);
   const c = contentRect(), s = state?.session;
   if (c && s && playingIndex != null) {
+    ctx.save(); const vr=video.getBoundingClientRect(); ctx.beginPath(); ctx.rect(vr.left-r.left,vr.top-r.top,vr.width,vr.height);ctx.clip();
     const ox = c.left - r.left, oy = c.top - r.top;
-    const target = state.gaze.point?.target;
+    const currentPoint=state.gaze.point;
+    const matchingPoint=currentObservation(currentPoint,sessionId,s.clips[playingIndex]?.id,(Date.now()+clockOffset)/1000);
+    const target = matchingPoint?.target;
     if ($('show-boxes').checked) {
       for (const [name, b] of Object.entries(boxesAt(s.clips[playingIndex]?.track, video.currentTime))) {
         ctx.strokeStyle = color(name); ctx.lineWidth = name === target ? 4 : 2;
@@ -114,11 +192,12 @@ function draw() {
         ctx.fillStyle = color(name); ctx.font = '600 13px system-ui'; ctx.fillText(name, ox + b[0] * c.w + 6, oy + b[1] * c.h + 17);
       }
     }
-    const g = state.gaze.point;
-    if ($('show-gaze').checked && g && g.on_video) {
+    const g = matchingPoint;
+    if ($('show-gaze').checked && g && g.valid && g.on_video && Date.now()+clockOffset-g.t*1000 < 500) {
       ctx.beginPath(); ctx.arc(ox + g.nx * c.w, oy + g.ny * c.h, 11, 0, 2 * Math.PI);
-      ctx.strokeStyle = g.valid ? '#ffffff' : '#777'; ctx.lineWidth = 3; ctx.stroke();
+      ctx.strokeStyle = g.target ? '#baf5ce' : '#ffffff'; ctx.lineWidth = 3; ctx.stroke();
     }
+    ctx.restore();
   }
   requestAnimationFrame(draw);
 }
@@ -144,53 +223,94 @@ function drawEeg(series) {
 function render(st) {
   state = st; const s = st.session;
   const setup = st.setup;
-  $('sensor-setup').hidden = !setup?.required;
+  $('sensor-setup').hidden = !setup?.required && !setup?.enabled && setup?.eegMode !== 'muse';
   $('sensor-message').textContent = (setup?.error || setup?.message || '') +
     (setup && (setup.muse.source === 'mindmonitor' || setup.phase === 'calibrating_muse') ? ` (${museProgress(setup.muse)})` : '');
+  const museState = setup?.museConnection || {state:'disconnected'};
+  $('muse-connection-status').textContent = museState.state === 'error' ? `Muse connection error: ${museState.error || 'Unknown error'}` :
+    museState.state === 'connecting' ? 'Connecting to Muse 2…' : museState.state === 'connected' ? 'Muse 2 connected.' : 'Muse 2 disconnected. Gaze and playback remain available.';
+  $('muse-connect').hidden = !setup || setup.eegMode !== 'muse';
+  $('muse-connect').textContent = museState.state === 'error' ? 'Retry Muse 2' : 'Connect Muse 2';
+  $('muse-disconnect').hidden = !setup || !['connecting','connected','error'].includes(museState.state);
+  $('muse-connect').disabled = submitting || museState.state === 'connecting' || museState.state === 'connected';
+  $('muse-disconnect').disabled = submitting || museState.state === 'disconnected';
   $('sensor-retry').hidden = !setup?.canRetry; $('sensor-retry').disabled = s?.status === 'running';
-  $('gaze-calibration-status').textContent = setup?.gaze?.savedCalibration
-    ? 'Eye calibration saved · reused on future starts. Remove it to calibrate again.' : '';
+  $('gaze-calibration-status').textContent = `Eye calibration: ${setup?.gaze?.calibrationState || 'required'}${setup?.gaze?.failureReason ? ' · '+setup.gaze.failureReason : ''}`;
+  $('calibration-details').textContent=[setup?.gaze?.calibrationPath,setup?.gaze?.checkCommand,setup?.gaze?.checkGuidance].filter(Boolean).join('\n');
   $('gaze-calibration-remove').hidden = !setup?.gaze?.savedCalibration;
+  for (const id of ['gaze-check','gaze-recenter']) {$(id).hidden=!setup?.gaze?.savedCalibration;$(id).disabled=submitting || s?.status==='running';}
   $('gaze-calibration-remove').disabled = submitting || s?.status === 'running';
   $('start').disabled = submitting || !providerConfigured || !setup?.generationReady;
   const gz = st.gaze, ee = st.eeg;
   pill('gaze-source', gz.error ? 'port busy' : gz.source === 'sim' ? 'SIM' : gz.live ? 'gazekit live' : 'no gaze', gz.source === 'sim' ? 'sim' : gz.live ? 'live' : 'off');
-  pill('eeg-source', ee.source === 'sim' ? 'SIM' : ['muse', 'mindmonitor'].includes(ee.source) ? (ee.live ? 'Muse 2 live' : 'Muse 2 …') : 'off', ee.source === 'sim' ? 'sim' : ee.live ? 'live' : 'off');
-  $('eeg-state').textContent = ee.source === 'mindmonitor' ? `${ee.state} · ${ee.label} · smoothed α/β ${ee.alphaBetaRatio?.toFixed(2) ?? '—'}` : `${ee.state} · β/(α+θ), z vs. calibrated baseline`;
+  pill('eeg-source', ee.source === 'sim' ? 'SIM' : ['muse', 'mindmonitor'].includes(ee.source) ? (ee.connectionState || (ee.live ? 'streaming' : 'disconnected')).replaceAll('_',' ') : 'off', ee.source === 'sim' ? 'sim' : ee.live ? 'live' : 'off');
+  $('eeg-state').textContent = (ee.source === 'mindmonitor' ? `${ee.state} · smoothed α/β ${ee.alphaBetaRatio?.toFixed(2) ?? '—'}` : `${ee.state} · relative β/(α+θ)`) + ` · confidence ${Math.round(100 * (ee.confidence || 0))}%`;
+  $('eeg-quality').textContent = (!ee.live || !(ee.confidence > 0) ? 'EEG unavailable — gaze-only mode · ' : '') + (ee.qualityError || (ee.goodChannels ? `Good channels: ${ee.goodChannels.join(', ')}` : ''));
   $('gaze-hz').textContent = gz.hz ?? '—'; $('blinks').textContent = gz.blinks_per_min ?? '—'; $('yaw').textContent = gz.yaw != null ? Math.round(gz.yaw) : '—';
-  const target = gz.point?.target, tg = $('gaze-target'); tg.replaceChildren();
+  const point=currentObservation(gz.point,sessionId,s?.clips[playingIndex]?.id,(Date.now()+clockOffset)/1000);
+  const target = point?.valid ? point.target : null, tg = $('gaze-target'); tg.replaceChildren();
   if (target) { const sw = el('span', 'swatch'); sw.style.background = color(target); tg.append(sw, target); }
-  else tg.textContent = gz.point ? (gz.point.on_video ? 'background' : 'off screen') : '—';
-  const z = ee.series.at(-1)?.z; $('eeg-z').textContent = z != null ? `${z >= 0 ? '+' : ''}${z.toFixed(2)}${ee.source === 'mindmonitor' ? '' : 'σ'}` : '—'; drawEeg(ee.series);
-  if (!s) { $('stage').textContent = 'Idle.'; return; }
-  if (s.id !== sessionId) { sessionId = s.id; playingIndex = null; waitingFor = 0; lastChanges = ''; video.removeAttribute('src'); video.load(); }
+  else tg.textContent = !point ? (s?.status !== 'running' ? 'No active video frame' : 'Tracking unavailable / stale') : !point.valid ? 'Tracking invalid' : !point.on_video ? 'Outside video' : point.state === 'ambiguous' ? 'Ambiguous target' : point.state === 'unavailable' ? 'Attribution unavailable' : 'Background';
+  $('dwell').textContent = (st.response?.characters?.[target]?.dwell_s || 0).toFixed(1);
+  $('response-strength').textContent = `${Math.round(100 * (st.response?.response_strength || 0))}%`;
+  $('gaze-confidence').textContent = `${Math.round(100 * (st.response?.gaze_confidence || 0))}%`;
+  const z = ee.live && ee.confidence > 0 ? ee.series.at(-1)?.z : null; $('eeg-z').textContent = z != null ? `${z >= 0 ? '+' : ''}${z.toFixed(2)}${ee.source === 'mindmonitor' ? '' : 'σ'}` : '—'; drawEeg(ee.series);
+  if (!s) {
+    if (sessionId) player.reset();
+    sessionId = null; playingIndex = null; endingIndex = null;
+    $('setup').hidden = false; $('stop').disabled = true;
+    $('stage').textContent = 'Idle.';
+    $('tracker').disabled = false;
+    $('tracking-status').textContent = trackingSummary(null,null,0);
+    return;
+  }
+  if (s.id !== sessionId) {
+    sessionId = s.id; playingIndex = null; endingIndex = null; ending.clear(); playbackEpoch++; presented=null; player.reset(); player.setSound(sound);
+    waitingFor = s.clips.findIndex(c => c.status !== 'watched');
+    if (waitingFor < 0) waitingFor = s.clips.length;
+    lastChanges = ''; player.next=waitingFor;
+  }
   running = s.status === 'running'; $('stop').disabled = !running; $('setup').hidden = running;
-  $('stage').textContent = `${s.demo ? 'DEMO · ' : ''}${s.status} · ${s.stage}${s.error ? ` · ${s.error}` : ''}`;
+  $('stage').textContent = `${s.demo ? 'DEMO · ' : st.simulation ? 'SIMULATED SENSORS · LIVE VIDEO · ' : ''}${s.status} · ${s.stage}${s.error ? ` · ${s.error}` : ''}`;
+  $('warnings').textContent = s.warnings?.map(w => `${w.component}: ${w.message}`).join('\n') || '';
+  $('warnings').hidden = !s.warnings?.length;
+  $('story-state').textContent = s.story.current_event || s.story.scenes.at(-1)?.summary || s.story.premise;
   $('profile-clips').textContent = `${s.profile.clips} scene${s.profile.clips === 1 ? '' : 's'} measured`;
-  const lastChange = [...s.clips].reverse().find(c => c.changes?.length)?.changes || [];
+  const lastChange = [...s.clips].reverse().find(c => c.profileChanges?.length)?.profileChanges || [...s.clips].reverse().find(c => c.changes?.length)?.changes || [];
   const changedKeys = new Set(lastChange.map(c => c.key));
-  $('affinity').replaceChildren(el('h4', null, 'Character response'), ...Object.entries(s.profile.characters).map(([n, v]) => bar(n, v, { swatch: color(n), flash: changedKeys.has(`character:${n}`) })));
-  $('prefs').replaceChildren(el('h4', null, 'Preferences'), bar('pacing', s.profile.pacing, { signed: true, flash: changedKeys.has('pacing') }),
+  $('affinity').replaceChildren(el('h4', null, 'Observed attention'), ...Object.entries(s.profile.characters).map(([n, v]) => bar(n, v, { swatch: color(n), flash: changedKeys.has(`character:${n}`) })));
+  $('prefs').replaceChildren(el('h4', null, 'Tentative preferences'), bar('pacing', s.profile.pacing, { signed: true, flash: changedKeys.has('pacing') }),
     bar('dialogue', s.profile.dialogue, { signed: true, flash: changedKeys.has('dialogue') }),
     ...Object.entries(s.profile.genres).filter(([, v]) => v !== 0).map(([g, v]) => bar(g, v, { signed: true, flash: changedKeys.has(`genre:${g}`) })));
-  const key = JSON.stringify(lastChange);
+  const key = JSON.stringify([lastChange,s.profile.clips > 0]);
   if (key !== lastChanges) {
     lastChanges = key;
     $('changes').replaceChildren(...(lastChange.length ? lastChange.map(c => {
       const li = el('li', c.strong ? 'strong' : null);
-      li.append(el('span', null, `${c.key.replace('character:', '')} `), el('span', 'delta', `${c.before.toFixed(2)} → ${c.after.toFixed(2)}`), el('div', 'hint', c.why + (c.strong ? ' · STRONG RESPONSE' : '')));
+      li.append(el('span', null, `${c.key.replace('character:', '')} `), el('span', 'delta', `${c.before.toFixed(2)} → ${c.after.toFixed(2)}`), el('div', 'hint', c.why + (c.strong ? ' · CONSISTENT ATTENTION' : '')));
       return li;
-    }) : [el('li', 'hint', 'Nothing yet: watch the first scene.')]));
+    }) : [el('li', 'hint', s.profile.clips ? 'No preference change: observations have not met the adaptation thresholds.' : 'Nothing yet: watch the first scene.')]));
   }
   const latest = s.clips.at(-1);
+  const current=s.clips[playingIndex ?? s.playing];
+  $('tracker').disabled = running;
+  if (running) $('tracker').value = trackerValue(s.tracker);
+  $('tracking-status').textContent = trackingSummary(s,current,video.currentTime);
+  const currentChange=current?.decision.focus || (current?.decision.pacing !== 'same' && current?.decision.pacing ? `${current.decision.pacing} pacing` : 'balanced');
+  $('current-decision').textContent=current ? `${running ? 'Playing' : 'Last played'} scene ${current.index+1} · decision ${current.decisionId || 'opening'} · ${currentChange}` : 'No clip playing';
+  $('queue-state').textContent=`${playerMode} · ${s.clips.filter(c=>c.status==='ready').length} media ready · future queue limit 1`;
+  $('latency').textContent=s.latency?.samples ? `Readiness ${s.latency.readinessS.map(t=>t.toFixed(1)+'s').join(', ')} (n=${s.latency.samples}); adaptation freezes at ${Math.min(3.5,current?.duration ?? s.duration).toFixed(1)}s of playback. Full-clip tracking runs independently.` : 'Waiting for measured readiness.';
+  $('mapping-state').textContent=originWindow===windowKey() ? 'Screen mapping anchored by pointer · use 100% browser zoom; fullscreen recommended for gaze checks.' : 'Move pointer over the player to anchor its screen position. Use 100% browser zoom.';
   if (latest) {
     const d = latest.decision;
     $('decision').replaceChildren(el('span', `chip${d.focus ? ' on' : ''}`, `focus: ${d.focus || 'balanced'}`), el('span', `chip${d.tension !== 'same' ? ' on' : ''}`, `tension: ${d.tension}`),
       el('span', `chip${d.dialogue !== 'same' ? ' on' : ''}`, `dialogue: ${d.dialogue}`), el('span', `chip${d.pacing !== 'same' ? ' on' : ''}`, `pacing: ${d.pacing}`),
       el('span', `chip${d.tone ? ' on' : ''}`, `tone: ${d.tone || 'same'}`), el('span', `chip${d.event ? ' on' : ''}`, `new event: ${d.event ? 'yes' : 'no'}`));
     $('reasons').replaceChildren(...d.reasons.map(r => el('li', null, r)));
-    $('change-note').textContent = latest.plan.change_note; $('writer').textContent = latest.writer;
-    $('next-title').textContent = `Scene ${latest.index + 1}: ${latest.plan.scene_title}`; $('next-prompt').textContent = latest.plan.video_prompt;
+    $('change-note').textContent = latest.fallbackReason || latest.plan.change_note; $('writer').textContent = latest.fallback ? 'HELD FRAME · FAILED' : latest.writer;
+    $('next-title').textContent = `Scene ${latest.index + 1} · decision ${latest.decisionId?.slice(0,8)}: ${latest.plan.scene_title}`;
+    $('prompt-changes').textContent=JSON.stringify(latest.plan.prompt_changes || [],null,2);
+    $('request-payload').textContent=JSON.stringify(latest.generationInput || {status:'request not submitted / still running'},null,2); $('next-prompt').textContent = latest.plan.video_prompt;
   }
   $('scenes').replaceChildren(...s.clips.map(c => {
     const d = el('div', `scene${c.index === playingIndex ? ' current' : ''}`);
@@ -200,19 +320,28 @@ function render(st) {
   managePlayer(s);
 }
 async function poll() {
-  try { render(await request('/api/adaptive/state')); $('backend-status').textContent = 'Python backend · connected'; }
+  try {
+    const before = Date.now(), value = await request('/api/adaptive/state');
+    clockOffset = value.serverNow * 1000 - (before + Date.now()) / 2;
+    if (value.session?.id === sessionId) for (const index of [...ending]) {
+      await post('/api/adaptive/ended', {session_id:sessionId,clip:index}); ending.delete(index);
+    }
+    render(value); $('backend-status').textContent = 'Python backend · connected';
+  }
   catch (e) { $('backend-status').textContent = `Backend: ${e.message}`; }
   setTimeout(poll, 200);
 }
 async function init() {
-  addCharacter(); addCharacter();
+  addCharacter('SpongeBob', 'yellow rectangular sponge wearing a white shirt and brown square pants');
+  addCharacter('Patrick', 'pink starfish wearing green shorts with purple flowers');
+  $('premise').value = 'In Bikini Bottom, SpongeBob wants to discover what Patrick keeps inside his secret box.';
   try {
     const config = await request('/api/config');
     providerConfigured = config.configured;
     $('duration').replaceChildren(...config.durations.map(n => new Option(String(n), String(n)))); $('duration').value = '10';
     syncSequenceSettings();
     $('cost-note').textContent = config.demo ? 'DEMO mode: synthetic clips, no Fal calls.' : config.configured
-      ? 'Each scene is a paid Fal generation (and an OpenAI call if OPENAI_API_KEY is set).' : 'Fal key missing: set FAL_KEY in .env and restart.';
+      ? 'Each scene is a paid Fal generation. Decisions run locally. Scene frames and character references go to the configured visual services; webcam images stay local.' : 'Fal key missing: set FAL_KEY in .env and restart.';
   } catch (e) { error(e.message); }
   $('start').disabled = !providerConfigured || !state?.setup?.generationReady;
   void poll();

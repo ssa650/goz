@@ -1,0 +1,305 @@
+[
+  {
+    "id": "00-15",
+    "endpoint": "fal-ai/florence-2-large/dense-region-caption",
+    "captured_date": "2026-10-03",
+    "duration_s": 2.9797493340000756,
+    "response": {
+      "results": {
+        "bboxes": [
+          {
+            "x": 1677.5100445747375,
+            "y": 1.0730000138282776,
+            "w": 1456.9199967384338,
+            "h": 1165.2779662196454,
+            "label": "blue flower drawing on blue background"
+          },
+          {
+            "x": 442.8900057077408,
+            "y": 1.0730000138282776,
+            "w": 796.8599671125412,
+            "h": 759.6839814690444,
+            "label": "green flower-like pattern on blue and green background"
+          },
+          {
+            "x": 2587.230019569397,
+            "y": 1166.3509662334736,
+            "w": 577.9799652099609,
+            "h": 474.26611328125,
+            "label": "SpongeBob SquarePants dancing"
+          },
+          {
+            "x": 2754.810104370117,
+            "y": 1202.832974947416,
+            "w": 198.36002826690674,
+            "h": 210.30800217848537,
+            "label": "human face"
+          }
+        ]
+      }
+    },
+    "source": "presets/secret-box/frames/00-15.jpg",
+    "expected": [
+      "SpongeBob"
+    ]
+  },
+  {
+    "id": "00-30",
+    "endpoint": "fal-ai/florence-2-large/dense-region-caption",
+    "captured_date": "2026-10-03",
+    "duration_s": 1.2198501660000147,
+    "response": {
+      "results": {
+        "bboxes": [
+          {
+            "x": 702.8100228309631,
+            "y": 398.083008986253,
+            "w": 913.1399989128113,
+            "h": 1744.698006263146,
+            "label": "SpongeBob SquarePants Patrick Star surprised expression"
+          },
+          {
+            "x": 1831.4100337028503,
+            "y": 1097.6790419358474,
+            "w": 937.0798945426941,
+            "h": 1045.1019733135515,
+            "label": "Spongebob Squarepants cartoon character with box"
+          },
+          {
+            "x": 1940.8499836921692,
+            "y": 1224.292964054988,
+            "w": 492.480046749115,
+            "h": 491.43407733623803,
+            "label": "human face"
+          }
+        ]
+      }
+    },
+    "source": "presets/secret-box/frames/00-30.jpg",
+    "expected": [
+      "Patrick",
+      "SpongeBob"
+    ]
+  },
+  {
+    "id": "01-45",
+    "endpoint": "fal-ai/florence-2-large/dense-region-caption",
+    "captured_date": "2026-10-03",
+    "duration_s": 0.8013325829999758,
+    "response": {
+      "results": {
+        "bboxes": [
+          {
+            "x": 1595.4300141334534,
+            "y": 342.28698965219354,
+            "w": 1207.2598814964294,
+            "h": 1800.4940255972053,
+            "label": "SpongeBob SquarePants Patrick Star holding box"
+          },
+          {
+            "x": 586.5300250053406,
+            "y": 1039.737044114333,
+            "w": 1176.479938030243,
+            "h": 1103.043971135066,
+            "label": "Squidward Spongebob Squarepants cartoon character"
+          },
+          {
+            "x": 815.6699967384338,
+            "y": 1074.0730403019832,
+            "w": 762.6600337028503,
+            "h": 821.917964054988,
+            "label": "human face"
+          }
+        ]
+      }
+    },
+    "source": "presets/secret-box/frames/01-45.jpg",
+    "expected": [
+      "Patrick",
+      "SpongeBob"
+    ]
+  },
+  {
+    "id": "background",
+    "endpoint": "fal-ai/florence-2-large/dense-region-caption",
+    "captured_date": "2026-10-03",
+    "duration_s": 0.9529165419999117,
+    "response": {
+      "results": {
+        "bboxes": [
+          {
+            "x": 464.2560119628906,
+            "y": 0.29600000381469727,
+            "w": 303.3600158691406,
+            "h": 430.38399267196655,
+            "label": "blue flower drawing on blue background"
+          },
+          {
+            "x": 1.1519999504089355,
+            "y": 0.29600000381469727,
+            "w": 278.0159993171692,
+            "h": 299.5519919395447,
+            "label": "green flower drawing"
+          },
+          {
+            "x": 187.00799560546875,
+            "y": 401.6719970703125,
+            "w": 419.3280029296875,
+            "h": 189.44000244140625,
+            "label": "cartoon illustration of brown sphere with blue background and yellow arrow pointing upwards"
+          },
+          {
+            "x": 173.95199584960938,
+            "y": 297.4800109863281,
+            "w": 211.20001220703125,
+            "h": 166.35198974609375,
+            "label": "cartoon character with blue and yellow tentacles and yellow arrows"
+          }
+        ]
+      }
+    },
+    "source": "presets/secret-box/frames/00-15.jpg",
+    "crop_fraction": [
+      0.15,
+      0,
+      0.72,
+      0.7
+    ],
+    "thumbnail": [
+      768,
+      768
+    ],
+    "expected": []
+  },
+  {
+    "id": "heldout-01-00",
+    "endpoint": "fal-ai/florence-2-large/dense-region-caption",
+    "captured_date": "2026-10-03",
+    "duration_s": 1.3010633750000125,
+    "response": {
+      "results": {
+        "bboxes": [
+          {
+            "x": 425.85601806640625,
+            "y": 89.89299774169922,
+            "w": 228.09600830078125,
+            "h": 328.24198150634766,
+            "label": "SpongeBob SquarePants Patrick Star with cardboard box"
+          },
+          {
+            "x": 244.60800170898438,
+            "y": 194.48699951171875,
+            "w": 192.0,
+            "h": 211.59799194335938,
+            "label": "Spongebob Squarepants angry expression"
+          },
+          {
+            "x": 431.23199462890625,
+            "y": 91.82099914550781,
+            "w": 152.83203125,
+            "h": 251.60398864746094,
+            "label": "human face"
+          }
+        ]
+      }
+    },
+    "source": "presets/secret-box/frames/01-00.jpg",
+    "thumbnail": [
+      768,
+      768
+    ],
+    "expected": [
+      "Patrick",
+      "SpongeBob"
+    ]
+  },
+  {
+    "id": "heldout-02-00",
+    "endpoint": "fal-ai/florence-2-large/dense-region-caption",
+    "captured_date": "2026-10-03",
+    "duration_s": 2.7538923340000565,
+    "response": {
+      "results": {
+        "bboxes": [
+          {
+            "x": 423.552001953125,
+            "y": 0.2409999966621399,
+            "w": 236.54400634765625,
+            "h": 167.73600500822067,
+            "label": "blue flower drawing on blue background"
+          },
+          {
+            "x": 129.4080047607422,
+            "y": 0.2409999966621399,
+            "w": 159.74400329589844,
+            "h": 144.1179935336113,
+            "label": "green flower-like pattern on blue and green background"
+          },
+          {
+            "x": 143.23199462890625,
+            "y": 148.69699096679688,
+            "w": 125.18402099609375,
+            "h": 103.14801025390625,
+            "label": "blue flower-shaped neon sign"
+          },
+          {
+            "x": 302.97601318359375,
+            "y": 271.60699462890625,
+            "w": 96.0,
+            "h": 113.26998901367188,
+            "label": "SpongeBob SquarePants Spongebob Squarepants cartoon character"
+          },
+          {
+            "x": 574.0800170898438,
+            "y": 115.43899536132812,
+            "w": 115.968017578125,
+            "h": 98.3280029296875,
+            "label": "blue flower logo"
+          },
+          {
+            "x": 315.2640075683594,
+            "y": 276.427001953125,
+            "w": 73.72799682617188,
+            "h": 63.141998291015625,
+            "label": "human face"
+          }
+        ]
+      }
+    },
+    "source": "presets/secret-box/frames/02-00.jpg",
+    "thumbnail": [
+      768,
+      768
+    ],
+    "expected": [
+      "SpongeBob"
+    ],
+    "note": "Patrick is visible reclining behind/near the box but Florence misses him; this fixture documents a false negative, not complete recall."
+  },
+  {
+    "id": "patrick-only",
+    "endpoint": "fal-ai/florence-2-large/dense-region-caption",
+    "captured_date": "2026-10-03",
+    "duration_s": 0.913401833999842,
+    "response": {
+      "results": {
+        "bboxes": []
+      }
+    },
+    "source": "presets/secret-box/frames/00-30.jpg",
+    "crop_pixels": [
+      702,
+      398,
+      1615,
+      2142
+    ],
+    "thumbnail": [
+      512,
+      512
+    ],
+    "expected": [
+      "Patrick"
+    ],
+    "note": "Florence missed a clear Patrick-only crop; local reference geometry recovers this familiar pose."
+  }
+]

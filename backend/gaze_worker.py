@@ -8,9 +8,178 @@ import sys
 import urllib.request
 import socket
 import subprocess
-from types import SimpleNamespace
+import time
+import hashlib
+import importlib.metadata
 
 LANDMARKER_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+CALIBRATION_SCHEMA = 2
+
+
+def atomic_json(path, value):
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w") as output:
+        os.chmod(temporary, 0o600)
+        json.dump(value, output, indent=2, allow_nan=False)
+        output.flush()
+        os.fsync(output.fileno())
+    temporary.replace(path)
+
+
+def model_schema(repo):
+    """A changed feature extractor or regression format requires a new check."""
+    digest = hashlib.sha256()
+    for name in ("model.py", "tracker.py"):
+        digest.update((Path(repo) / "gazekit" / name).read_bytes())
+    digest.update(importlib.metadata.version("scikit-learn").encode())
+    return digest.hexdigest()
+
+
+def validate_compatibility(report, repo, profile, screen):
+    if report.get("schemaVersion") != CALIBRATION_SCHEMA:
+        raise ValueError("Legacy calibration has no verified viewer/camera/schema metadata. Preserve it and run a fresh calibration/check for this viewer.")
+    if report.get("profileId") != profile:
+        raise ValueError("Saved calibration belongs to another viewer profile. Select the matching GOZ_VIEWER_PROFILE or calibrate this viewer.")
+    if report.get("modelSchema") != model_schema(repo):
+        raise ValueError("Gazekit feature/model schema changed. Recalibrate before using this saved model.")
+    if list(report.get("screen", [])) != list(screen):
+        raise ValueError(f"Display geometry changed: saved {report.get('screen')}, current {list(screen)} screen points. Restore the display or recalibrate.")
+    if not report.get("cameraDeviceId") and not report.get("cameraName"):
+        raise ValueError("Saved calibration has no camera identity. Recalibrate with the intended camera.")
+
+
+def alignment_values(model):
+    path = model.parent / "gaze_alignment.json"
+    if not path.exists():
+        return (1., 0., 1., 0.)
+    try:
+        values = json.loads(path.read_text())["coefficients"]
+        if len(values) != 4 or any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
+            raise ValueError("Invalid coefficients")
+        return tuple(values)
+    except (OSError, ValueError, KeyError, TypeError):
+        raise ValueError("Saved gaze alignment is damaged. Run the supported alignment check or recalibrate.") from None
+
+
+def load_predictor(model, screen):
+    from gazekit.model import GazeModel, transform
+    ridge = GazeModel.load(model)
+    if tuple(ridge.screen_size) != tuple(screen):
+        raise ValueError("Saved model display geometry does not match its metadata/current display.")
+    # Gazekit clips predictions to screen edges. Preserve actual predictions:
+    # outside-screen gaze must never be reassigned to a character at the edge.
+    def predict(observation):
+        if not observation.ok:
+            return None
+        point = ridge.pipe.predict(transform(observation.features))[0] + ridge.bias
+        return point if all(math.isfinite(float(v)) for v in point) else None
+    return predict, ridge
+
+
+def stream_gaze(args, model, landmarker, screen):
+    """Use Gazekit's tracker/filter with explicit capture time and no clamping."""
+    import cv2
+    from gazekit.camera import open_camera, read_mirrored
+    from gazekit.tracker import FaceTracker
+    from gazekit.filters import GazeSmoother
+    from gazekit.live import BlinkGate
+    predict, _ = load_predictor(model, screen)
+    ax, bx, ay, by = alignment_values(model)
+    cap = open_camera(int(args.camera))
+    tracker = FaceTracker(str(landmarker))
+    smoother, gate = GazeSmoother(), BlinkGate()
+    started = last_frame = time.monotonic()
+    sent = valid = 0
+    last_xy = (screen[0] / 2, screen[1] / 2)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            while not args.seconds or time.monotonic() - started < args.seconds:
+                frame = read_mirrored(cap)
+                captured = time.time()  # Camera-read completion, before inference.
+                if frame is None:
+                    if time.monotonic() - last_frame > 10:
+                        raise ValueError("Camera opened but delivered no frames for 10 seconds. Reconnect Continuity Camera or check macOS Camera permission.")
+                    time.sleep(.01)
+                    continue
+                last_frame = time.monotonic()
+                obs = tracker.process(frame)
+                frozen = gate.update(obs)
+                point = None if frozen else predict(obs)
+                if point is not None:
+                    last_xy = smoother.apply(ax * float(point[0]) + bx, ay * float(point[1]) + by, last_frame)
+                sample = dict(t=captured, capturedAt=captured, sentAt=time.time(),
+                              captureClock="unix-seconds", captureTiming="camera-read-complete",
+                              coordinateSpace="screen-points", screenOrigin=[0, 0],
+                              x=round(last_xy[0], 2), y=round(last_xy[1], 2), sw=screen[0], sh=screen[1],
+                              valid=point is not None, face=bool(obs.ok), blink=bool(obs.ok and frozen),
+                              yaw=float(obs.yaw), pitch=float(obs.pitch), setupId=args.setup_id,
+                              profileId=args.profile)
+                sender.sendto(json.dumps(sample, allow_nan=False).encode(), ("127.0.0.1", args.port))
+                sent += 1
+                valid += point is not None
+    finally:
+        tracker.close()
+        cap.release()
+        cv2.destroyAllWindows()
+    print("GOZ_STREAM " + json.dumps(dict(samples=sent, valid=valid, elapsed=time.monotonic()-started)), flush=True)
+
+
+def check_alignment(args, model, landmarker, screen):
+    """Fresh probe targets are never training data; optional 3-target recenter."""
+    import cv2
+    from gazekit import ui
+    from gazekit.camera import open_camera
+    from gazekit.tracker import FaceTracker
+    from gazekit.calibrate import validate, MARGINAL_FRAC
+    from gazekit.live import _quick_align
+    predict, ridge = load_predictor(model, screen)
+    cap, tracker = open_camera(int(args.camera)), FaceTracker(str(landmarker))
+    win = ui.FullscreenWindow("goz-gaze-check", screen)
+    coefficients = alignment_values(model)
+    try:
+        if args.recenter:
+            coefficients = _quick_align(win, cap, tracker, predict)
+        ax, bx, ay, by = coefficients
+        from gazekit.model import transform
+        class Aligned:
+            def predict(self, features):
+                p = ridge.pipe.predict(transform(features))[0] + ridge.bias
+                return (ax * float(p[0]) + bx, ay * float(p[1]) + by)
+        error, points, _, _ = validate(win, cap, tracker, Aligned(), seed=None)
+        passed = len(points) >= 4 and math.isfinite(error) and error / math.hypot(*screen) <= MARGINAL_FRAC
+        report = dict(passed=passed, meanErrorPx=error if math.isfinite(error) else None,
+                      validation=points, heldOut=True, checkedAt=time.time(), recentered=args.recenter)
+        atomic_json(model.parent / "gaze_check.json", report)
+        if not passed:
+            raise ValueError("Fresh gaze check failed. Previous alignment/model preserved; recalibrate in the current seating/camera position.")
+        if args.recenter:
+            atomic_json(model.parent / "gaze_alignment.json", {"coefficients": list(coefficients), "validatedAt": time.time()})
+        metadata_path = model.with_suffix(".report.json")
+        metadata = json.loads(metadata_path.read_text())
+        original_path = model.with_suffix(".initial-report.json")
+        if not original_path.exists():
+            atomic_json(original_path, metadata)
+        fraction = error / math.hypot(*screen)
+        metadata.update(verdict="STABLE" if fraction <= .045 else "USABLE", validation=points,
+                        mean_error_px=round(error, 1), mean_error_frac_diag=round(fraction, 4),
+                        validationHeldOut=True, checkedAt=report["checkedAt"], aligned=args.recenter)
+        atomic_json(metadata_path, metadata)
+        # A successful check can recover a rejected/orphaned managed attempt.
+        # Registration uses the same manifest format as SensorSetup, and never
+        # deletes the earlier model or initial validation report.
+        if model.parent.parent.name == "calibration":
+            directory = model.parent.parent.parent
+            suffix = "" if args.profile == "default" else "-" + hashlib.sha256(args.profile.encode()).hexdigest()[:16]
+            atomic_json(model.parent.parent / ("saved-gaze" + suffix + ".json"),
+                        dict(version=2, profileId=args.profile, model=str(model.relative_to(directory)),
+                             report=metadata, sha256=hashlib.sha256(model.read_bytes()).hexdigest(), savedAt=time.time()))
+        print("GOZ_CHECK " + json.dumps(report), flush=True)
+    finally:
+        tracker.close()
+        cap.release()
+        win.close()
+        cv2.destroyAllWindows()
 
 
 def connected_cameras(camera_module):
@@ -126,7 +295,7 @@ def configure_alignment(stream, model, reuse):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("calibrate", "stream"))
+    parser.add_argument("command", choices=("calibrate", "stream", "check", "inspect"))
     parser.add_argument("--repo", required=True)
     parser.add_argument("--camera", default="select")
     parser.add_argument("--model", required=True)
@@ -136,22 +305,37 @@ def main():
     parser.add_argument("--camera-device-id")
     parser.add_argument("--camera-name")
     parser.add_argument("--reuse-calibration", action="store_true")
+    parser.add_argument("--profile", default=os.getenv("GOZ_VIEWER_PROFILE", "default"))
+    parser.add_argument("--seconds", type=float, default=0)
+    parser.add_argument("--recenter", action="store_true", help="Check a new alignment on independent probe targets before saving it")
     args = parser.parse_args()
     repo, model = Path(args.repo).resolve(), Path(args.model).resolve()
     sys.path.insert(0, str(repo))
     # Relative Gazekit assets/config always resolve to its checkout; calibration
     # recordings and trained models stay inside this GOZ attempt's data folder.
     os.chdir(repo)
-    if args.command == "stream" and (args.camera_device_id or args.camera_name):
+    from gazekit.screen import screen_size
+    screen = screen_size()
+    if args.command != "calibrate":
+        metadata = json.loads(model.with_suffix(".report.json").read_text())
+        validate_compatibility(metadata, repo, args.profile, screen)
+        if args.command == "stream" and metadata.get("verdict") not in ("STABLE", "USABLE"):
+            raise ValueError("This model failed gaze validation. Run a passing fresh check or recalibrate before streaming it into the adaptive story.")
+        args.camera_device_id = args.camera_device_id or metadata.get("cameraDeviceId")
+        args.camera_name = args.camera_name or metadata.get("cameraName")
+        if args.command == "inspect":
+            _, ridge = load_predictor(model, screen)
+            print("GOZ_MODEL_LOADED " + json.dumps(dict(screen=list(ridge.screen_size), profileId=args.profile, schemaVersion=CALIBRATION_SCHEMA)), flush=True)
+            return
+    if args.command in ("stream", "check") and (args.camera_device_id or args.camera_name):
         from gazekit import camera as camera_module
         args.camera = saved_camera(connected_cameras(camera_module), args.camera_device_id, args.camera_name)
     if args.camera == "select":
         import cv2
         from gazekit import ui, camera as camera_module
-        from gazekit.screen import screen_size
         args.camera = choose_camera(ui, cv2, camera_module, screen_size)
         print("GOZ_CAMERA " + json.dumps({"camera": args.camera}), flush=True)
-    elif args.command == "stream":
+    elif args.camera.isdigit():
         print("GOZ_CAMERA " + json.dumps({"camera": args.camera}), flush=True)
     landmarker = model.parent.parent / "face_landmarker.task"
     if not landmarker.is_file():
@@ -173,29 +357,50 @@ def main():
     from gazekit import dataset
     configure_camera(camera, model, dataset)
     if args.command == "calibrate":
-        from gazekit.calibrate import run
+        import gazekit.calibrate as calibration
         from gazekit import camera as camera_module
         camera_info = next((c for c in connected_cameras(camera_module) if str(c["index"]) == args.camera), {})
-        report = run(camera_index=camera, model_out=str(model), dataset_root=str(model.parent / "dataset"), landmarker=str(landmarker))
+        metadata = dict(camera=args.camera, cameraName=camera_info.get("name"), cameraDeviceId=camera_info.get("deviceId"),
+                        profileId=args.profile, schemaVersion=CALIBRATION_SCHEMA, modelSchema=model_schema(repo),
+                        coordinateSpace="screen-points", validationHeldOut=True,
+                        cameraConfiguration=dict(mirrored=True, requestedSize=[1920, 1080]), backend="ridge")
+        original_validate = calibration.validate
+        def held_out_validate(*values, **kwargs):
+            error, points, _, _ = original_validate(*values, **kwargs)
+            if len(points) < 4:
+                raise ValueError("Gaze validation needs at least four fresh targets; too few usable observations were captured. Retry with steady lighting and face position.")
+            # Gazekit otherwise folds these probes into its final fitted model.
+            return error, points, None, None
+        calibration.validate = held_out_validate
+        original_save = calibration.GazeModel.save
+        def save_atomically(instance, path, report=None):
+            report = dict(report or {}, **metadata)
+            temporary = Path(path).with_name("gaze_model-pending.pkl")
+            original_save(instance, temporary, report)
+            temporary.chmod(0o600)
+            with temporary.open("rb") as saved_file:
+                os.fsync(saved_file.fileno())
+            temporary.replace(path)
+            temporary.with_suffix(".report.json").unlink(missing_ok=True)
+            atomic_json(Path(path).with_suffix(".report.json"), report)
+            if report.get("verdict") in ("STABLE", "USABLE"):
+                atomic_json(args.report, report)
+                # Register before Gazekit's blocking results screen. Closing the
+                # app after successful training must not lose the saved model.
+                print("GOZ_CALIBRATION_SAVED " + json.dumps(report), flush=True)
+            else:
+                print("GOZ_CALIBRATION_REJECTED " + json.dumps(report), flush=True)
+        calibration.GazeModel.save = save_atomically
+        report = calibration.run(camera_index=camera, model_out=str(model), dataset_root=str(model.parent / "dataset"), landmarker=str(landmarker))
         if not report or report.get("verdict") not in ("STABLE", "USABLE") or not model.is_file():
             raise ValueError("Gazekit calibration was cancelled or did not pass validation.")
-        report.update(camera=args.camera, cameraName=camera_info.get("name"), cameraDeviceId=camera_info.get("deviceId"))
-        Path(args.report).write_text(json.dumps(report, indent=2))
-        Path(args.report).chmod(0o600)
+        report.update(metadata)
+        atomic_json(args.report, report)
     else:
-        import gazekit.stream as stream
-        # Additive UDP metadata binds samples to this validated calibration.
-        # Adapt only this module's sender; Gazekit's camera sockets are unchanged.
-        class TaggedSocket:
-            def __init__(self, *values): self.sock = socket.socket(*values)
-            def sendto(self, data, destination):
-                sample = json.loads(data)
-                sample["setupId"] = args.setup_id
-                return self.sock.sendto(json.dumps(sample).encode(), destination)
-            def close(self): self.sock.close()
-        stream.socket = SimpleNamespace(socket=TaggedSocket, AF_INET=socket.AF_INET, SOCK_DGRAM=socket.SOCK_DGRAM)
-        align = configure_alignment(stream, model, args.reuse_calibration)
-        stream.run(camera_index=camera, model_path=str(model), port=args.port, align=align, landmarker=str(landmarker))
+        if args.command == "check":
+            check_alignment(args, model, landmarker, screen)
+        else:
+            stream_gaze(args, model, landmarker, screen)
 
 
 if __name__ == "__main__":

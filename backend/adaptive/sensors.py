@@ -8,6 +8,7 @@ Both have explicit simulators for rehearsal; the dashboard labels them SIM.
 import asyncio
 import json
 import math
+import os
 import random
 import threading
 import time
@@ -21,13 +22,15 @@ EEG_WINDOW_S = 2.0
 EEG_STEP_S = 0.25
 BASELINE_S = 60.0
 ARTIFACT_UV = 150.0
+EEG_FRESH_S = 3.0
+EEG_CHANNELS = ("TP9", "AF7", "AF8", "TP10")
 BANDS = {"theta": (4, 8), "alpha": (8, 13), "beta": (13, 30)}
 
 
 class GazeFeed:
     """Ring buffer of gaze samples; filled by UDP or the simulator."""
 
-    def __init__(self, keep_s=120):
+    def __init__(self, keep_s=180):
         self.samples = deque(maxlen=keep_s * 40)
         self.source, self.transport = "waiting", None
         self.last_rx = 0.0
@@ -37,6 +40,13 @@ class GazeFeed:
         if (not isinstance(sample, dict) or any(type(sample.get(k)) not in (float, int)
                 or not math.isfinite(sample[k]) for k in ("t", "x", "y"))
                 or self.expected_setup_id and sample.get("setupId") != self.expected_setup_id):
+            return False
+        if any(key in sample and type(sample[key]) is not bool for key in ("valid", "face", "blink")):
+            return False
+        if any(k in sample and (type(sample[k]) not in (float, int) or not math.isfinite(sample[k]))
+               for k in ("yaw", "pitch", "confidence")):
+            return False
+        if abs(sample["t"] - time.time()) > 5 or self.samples and sample["t"] <= self.samples[-1]["t"]:
             return False
         self.add(sample)
         return True
@@ -56,7 +66,11 @@ class GazeFeed:
     def status(self):
         live = time.time() - self.last_rx < 2
         rate = len(self.window(time.time() - 2, time.time())) / 2
-        return dict(source=self.source, live=live, hz=round(rate, 1))
+        sample = self.latest()
+        return dict(source=self.source, live=live, hz=round(rate, 1),
+                    trackingState="unavailable" if not self.samples else "stale" if sample is None else
+                    "valid" if sample.get("valid") and sample.get("face", True) and not sample.get("blink", False) else "invalid",
+                    coordinateSpace="screen-points", captureClock="unix-seconds")
 
     async def listen(self, port=GAZE_PORT):
         feed = self
@@ -102,37 +116,48 @@ class EegFeed:
         self.calibration_seconds = 60.0
         self.calibration_started = None
         self.quality_error = "Waiting for Muse EEG."
+        self.connection_error = None
+        self.last_sample_at = None
+        self.samples_received = 0
+        self.channel_quality = {}
+
+    def _clear_baseline(self):
+        self.raw.clear()
+        self.series.clear()
+        self.last_eval = 0.0
+        self.calibration = None
+        self.calibration_samples = []
+        self.channel_quality = {}
 
     def begin_calibration(self, seconds=60.0):
         with self.lock:
-            self.calibration = None
-            self.calibration_samples = []
+            self._clear_baseline()
             self.calibration_seconds = seconds
             self.calibration_started = time.time()
-            self.raw.clear()
-            self.series.clear()
+            self.quality_error = "Collecting a fresh 2-second EEG window."
 
     def connected(self, identity):
         with self.lock:
             self.device_id = identity
-            self.raw.clear()
-            self.calibration = None
-            self.calibration_samples = []
+            self.connection_error = None
+            self._clear_baseline()
+            self.last_sample_at = None
+            self.calibration_started = time.time()
+            self.quality_error = "Muse LSL outlet found; waiting for actual EEG samples."
 
     def reset_calibration(self):
         with self.lock:
-            self.raw.clear()
-            self.calibration = None
-            self.calibration_samples = []
+            self._clear_baseline()
             self.calibration_started = None
+            self.quality_error = "EEG baseline reset; waiting for fresh samples."
 
     def disconnected(self):
         with self.lock:
             self.device_id = None
-            self.raw.clear()
-            self.calibration = None
-            self.calibration_samples = []
+            self._clear_baseline()
+            self.last_sample_at = None
             self.calibration_started = None
+            self.quality_error = "Muse EEG stream disconnected; waiting to reconnect."
 
     def push(self, samples, stamps):
         with self.lock:
@@ -140,13 +165,23 @@ class EegFeed:
                 if len(s) < 4 or not np.isfinite(s[:4]).all() or not math.isfinite(t):
                     self.quality_error = "Invalid EEG samples."
                     continue
+                t = float(t)
                 if self.raw and t <= self.raw[-1][0]:
                     continue
-                if self.raw and t - self.raw[-1][0] > 1:
-                    self.raw.clear()
-                    self.calibration = None
-                    self.calibration_samples = []
-                self.raw.append((t, s))
+                if self.last_sample_at is not None and t <= self.last_sample_at:
+                    continue
+                if self.last_sample_at is not None and t - self.last_sample_at > 1:
+                    self._clear_baseline()
+                    self.calibration_started = t
+                    self.quality_error = "EEG sample gap; collecting a fresh baseline."
+                if self.device_id and self.calibration is None and self.calibration_started is None:
+                    self.calibration_started = t
+                self.last_sample_at = t
+                self.samples_received += 1
+                self.connection_error = None
+                if self.source == "muse":
+                    self.state = "Muse EEG samples arriving"
+                self.raw.append((t, s[:4]))
                 if t - self.last_eval >= EEG_STEP_S:
                     self.last_eval = t
                     self._evaluate(t)
@@ -161,6 +196,9 @@ class EegFeed:
         frequencies = np.fft.rfftfreq(n, 1 / EEG_RATE)
         line_mask = ((frequencies >= 49) & (frequencies <= 51)) | ((frequencies >= 59) & (frequencies <= 61))
         line_fraction = spectrum[line_mask].sum(axis=0) / np.maximum(spectrum[frequencies >= 1].sum(axis=0), 1e-9)
+        self.channel_quality = {name: dict(peakToPeakUV=round(float(spread[i]), 2),
+            stdUV=round(float(variation[i]), 2), peakAbsUV=round(float(np.abs(window[:, i]).max()), 2),
+            lineNoiseFraction=round(float(line_fraction[i]), 3)) for i, name in enumerate(EEG_CHANNELS)}
         problems = []
         if not 1.8 <= t - self.raw[-n][0] <= 2.2: problems.append("EEG packets missing or irregular")
         if spread.max() > ARTIFACT_UV: problems.append("movement or poor contact")
@@ -190,7 +228,9 @@ class EegFeed:
             z = (engagement - median) / mad
         else:
             z = 0.0
-        self.series.append((t, engagement, float(np.clip(z, -5, 5)), artifact))
+        # Before a real-device baseline is ready, these rows are not response evidence.
+        self.series.append((t, engagement, float(np.clip(z, -5, 5)),
+                            artifact or self.source == "muse" and self.calibration is None))
 
     def window(self, t0, t1):
         with self.lock:
@@ -201,11 +241,34 @@ class EegFeed:
             return self.series[-1] if self.series else None
 
     def status(self):
-        recent = self.window(time.time() - 3, time.time())
-        return dict(source=self.source, state=self.state, live=bool(recent), deviceId=self.device_id,
-                    calibrated=bool(self.calibration), qualityError=self.quality_error,
+        now = time.time()
+        with self.lock:
+            sample_age = None if self.last_sample_at is None else now - self.last_sample_at
+            live = bool(sample_age is not None and -0.5 <= sample_age < EEG_FRESH_S)
+            if sample_age is not None and sample_age >= EEG_FRESH_S:
+                self._clear_baseline()
+                self.calibration_started = None
+                self.quality_error = "EEG samples stopped; a fresh clean baseline is required after reconnection."
+            recent = [p for p in self.series if now - EEG_FRESH_S <= p[0] <= now + 0.5]
+            usable = bool(live and recent and not recent[-1][3] and not self.quality_error
+                          and (self.calibration or self.source == "sim"))
+            confidence = sum(not row[3] for row in recent) / len(recent) if usable else 0.0
+            state = ("simulated" if self.source == "sim" else "error" if self.connection_error else
+                     "poor_signal" if live and self.channel_quality and self.quality_error else "streaming" if live else
+                     "stale" if sample_age is not None else "connecting" if self.device_id or self.source == "muse" else "disconnected")
+            sampling = ("ready" if usable else "poor_signal" if state == "poor_signal" else
+                        "calibrating" if live and recent else "warming_up" if live else
+                        "stale" if sample_age is not None else "waiting_for_samples")
+            return dict(source=self.source, state=self.connection_error or self.state, live=live, deviceId=self.device_id,
+                    confidence=round(confidence, 3),
+                    connectionState=state, modeLabel="EEG physiological observations available" if confidence else "EEG unavailable — gaze-only mode",
+                    interpretation="Physiological variation; cause and valence unknown",
+                    calibrated=bool(self.calibration) and live, qualityError=self.quality_error,
                     cleanSeconds=round(min(len(self.calibration_samples) * EEG_STEP_S, self.calibration_seconds), 1),
-                    targetSeconds=self.calibration_seconds)
+                    targetSeconds=self.calibration_seconds, outletAvailable=bool(self.device_id),
+                    samplingState=sampling, samplesReceived=self.samples_received,
+                    lastSampleAt=self.last_sample_at, sampleAgeSeconds=None if sample_age is None else round(sample_age, 3),
+                    channelQuality=dict(self.channel_quality))
 
 
 def run_muse(feed, stop):
@@ -217,94 +280,137 @@ def run_muse(feed, stop):
     except Exception as error:
         feed.disconnected()
         feed.state = f"Muse connection error: {error}"
+        feed.connection_error = feed.state
 
 
 def _consume_muse(feed, stop, pylsl):
-    import os
     address = os.getenv("GOZ_MUSE_ADDRESS", "").strip()
     pinned = "Muse" + address if address else None
+    # Current pylsl exposes these RuntimeError subclasses in util, not at root.
+    # Keep root support for older versions; never catch all RuntimeError here.
+    providers = (pylsl, getattr(pylsl, "util", None))
+    recoverable = (TimeoutError, OSError) + tuple(
+        error for provider in providers for name in ("LostError", "TimeoutError")
+        if isinstance(error := getattr(provider, name, None), type))
     while not stop.is_set():
         feed.state = "searching for `muselsl stream`"
-        streams = [s for s in pylsl.resolve_byprop("type", "EEG", timeout=3)
-                   if s.name() == "Muse" and s.channel_count() == 5 and s.nominal_srate() == EEG_RATE
-                   and (pinned is None or s.source_id() == pinned)]
+        try:
+            streams = [s for s in pylsl.resolve_byprop("type", "EEG", timeout=1)
+                       if s.name() == "Muse" and s.channel_count() == 5 and s.nominal_srate() == EEG_RATE
+                       and (pinned is None or s.source_id() == pinned)]
+        except recoverable as error:
+            feed.disconnected()
+            feed.state = f"Muse discovery interrupted: {error}; reconnecting"
+            if not stop.is_set():
+                stop.wait(0.25)
+            continue
+        if stop.is_set():
+            break
         if not streams:
+            feed.quality_error = "No Muse LSL EEG outlet. Start the direct Muse bridge or retry sensor setup."
             continue
         if len(streams) > 1:
             raise ValueError("Multiple Muse streams found. Set GOZ_MUSE_ADDRESS to select your Muse 2.")
         pinned = streams[0].source_id()
-        feed.connected(pinned)
-        inlet = pylsl.StreamInlet(streams[0], max_chunklen=12)
-        feed.state = f"connected · {streams[0].name()}"
-        offset = time.time() - pylsl.local_clock()
-        idle = time.time()
-        while not stop.is_set():
-            chunk, stamps = inlet.pull_chunk(timeout=0.5)
-            if stamps:
-                idle = time.time()
-                correction = inlet.time_correction()
-                # Owned bridges use --lsltime; external MuseLSL bridges can use Unix time.
-                stamp_offset = 0 if abs(stamps[-1] - time.time()) < 60 else offset
-                feed.push([c[:4] for c in chunk], [s + correction + stamp_offset for s in stamps])
-            elif time.time() - idle > 5:
-                feed.state = "stream lost"
-                break
-        inlet.close_stream()
-        feed.disconnected()
+        inlet = None
+        try:
+            inlet = pylsl.StreamInlet(streams[0], max_buflen=5, max_chunklen=12, recover=False)
+            feed.connected(pinned)
+            feed.state = "Muse LSL outlet advertised; waiting for EEG samples"
+            idle = time.time()
+            while not stop.is_set():
+                chunk, stamps = inlet.pull_chunk(timeout=0.5)
+                if stamps:
+                    now = time.time()
+                    # Clock correction applies only to LSL-clock timestamps. Unix-clock
+                    # external bridges are already in the application's wall-clock domain.
+                    if abs(stamps[-1] - now) < 60:
+                        converted = stamps
+                    else:
+                        correction = inlet.time_correction(timeout=0.5)
+                        now = time.time()
+                        offset = now - pylsl.local_clock()
+                        converted = [s + correction + offset for s in stamps]
+                    if len(chunk) != len(converted) or any(not math.isfinite(s) or abs(s - now) > EEG_FRESH_S for s in converted):
+                        feed.quality_error = "Stale or invalid Muse sample timestamps; waiting for fresh EEG."
+                    else:
+                        before = getattr(feed, "samples_received", None)
+                        feed.push([c[:4] for c in chunk], converted)
+                        if before is None or feed.samples_received > before:
+                            idle = now
+                if time.time() - idle > 5:
+                    feed.state = "Muse LSL outlet has stopped delivering fresh EEG samples"
+                    break
+        except recoverable as error:
+            feed.state = f"Muse stream interrupted: {error}; reconnecting"
+        finally:
+            try:
+                if inlet is not None:
+                    inlet.close_stream()
+            finally:
+                feed.disconnected()
+        # Avoid busy reconnection to an advertised outlet that no longer sends data.
+        if not stop.is_set():
+            stop.wait(0.25)
 
 
 class Simulator:
     """Rehearsal signals: gaze drifts between characters, lingering on the
     favourite; EEG engagement rises ~0.6 s after gaze lands on it."""
 
-    def __init__(self, session, gaze, eeg, favourite_index=1, bias=0.7):
+    def __init__(self, session, gaze, eeg, favourite_index=1, bias=0.7, seed=None):
         self.session, self.gaze, self.eeg = session, gaze, eeg
         self.favourite_index, self.bias = favourite_index, bias
         self.target, self.until, self.phase = None, 0.0, 0.0
+        self.seed = seed if seed is not None else os.getenv("GOZ_SIM_SEED")
+        self.random = random.Random(self.seed)
+        self.noise = np.random.default_rng(None if self.seed is None else int.from_bytes(str(self.seed).encode(), "little") % (2**32))
 
     def _pick(self, boxes):
-        if not boxes or random.random() < 0.12:
+        if not boxes or self.random.random() < 0.12:
             return None
         names = list(boxes)
         fav = names[self.favourite_index] if self.favourite_index < len(names) else None
-        return fav if fav and random.random() < self.bias else random.choice(names)
+        return fav if fav and self.random.random() < self.bias else self.random.choice(names)
 
     async def run(self, simulate_gaze, simulate_eeg):
         if simulate_gaze:
             self.gaze.source = "sim"
         if simulate_eeg:
             self.eeg.source, self.eeg.state = "sim", "simulated"
-        on_fav_since, last_eeg = None, 0.0
+        on_fav_since, last_eeg = None, time.time() - 0.25
         while True:
             now = time.time()
             boxes, rect = self.session.live_boxes()
             if simulate_gaze and rect:
                 if now > self.until or (self.target and self.target not in boxes):
-                    self.target, self.until = self._pick(boxes), now + random.uniform(0.8, 2.5)
+                    self.target, self.until = self._pick(boxes), now + self.random.uniform(0.8, 2.5)
                 if self.target in boxes:
                     b = boxes[self.target]
                     nx, ny = (b[0] + b[2]) / 2, b[1] + 0.3 * (b[3] - b[1])
                 else:
-                    nx, ny = random.uniform(0.1, 0.9), random.uniform(0.1, 0.9)
-                nx += random.gauss(0, 0.02)
-                ny += random.gauss(0, 0.02)
-                blink = random.random() < 0.01
+                    nx, ny = self.random.uniform(0.1, 0.9), self.random.uniform(0.1, 0.9)
+                nx += self.random.gauss(0, 0.02)
+                ny += self.random.gauss(0, 0.02)
+                blink = self.random.random() < 0.01
                 self.gaze.add(dict(t=now, x=rect["x"] + nx * rect["w"], y=rect["y"] + ny * rect["h"],
-                                   valid=not blink, blink=blink, yaw=random.gauss(0, 3),
-                                   pitch=random.gauss(0, 3), face=True))
+                                   valid=not blink, blink=blink, yaw=self.random.gauss(0, 3),
+                                   pitch=self.random.gauss(0, 3), face=True))
             names = list(boxes)
             fav = names[self.favourite_index] if self.favourite_index < len(names) else None
             looking = fav is not None and self.session.live_target() == fav
             on_fav_since = (on_fav_since or now) if looking else None
             if simulate_eeg and now - last_eeg >= 0.25:
-                last_eeg = now
+                if now - last_eeg > 3:
+                    last_eeg = now - 0.25
+                last_eeg += 0.25
                 boost = 1.6 if on_fav_since and now - on_fav_since > 0.6 else 0.0
                 self.phase += 0.25
                 t = np.arange(int(EEG_RATE * 0.25)) / EEG_RATE + self.phase
                 beta = (1.0 + boost) * np.sin(2 * math.pi * 20 * t)
                 alpha = 2.0 * np.sin(2 * math.pi * 10 * t)
                 theta = 1.5 * np.sin(2 * math.pi * 6 * t)
-                chans = np.stack([beta + alpha + theta + np.random.normal(0, 0.6, len(t)) for _ in range(4)], axis=1) * 10
-                stamps = list(now - 0.25 + np.arange(len(t)) / EEG_RATE)
+                chans = np.stack([beta + alpha + theta + self.noise.normal(0, 0.6, len(t)) for _ in range(4)], axis=1) * 10
+                stamps = list(last_eeg - 0.25 + np.arange(len(t)) / EEG_RATE)
                 self.eeg.push(chans.tolist(), stamps)
             await asyncio.sleep(1 / 30 if simulate_gaze else 0.25)

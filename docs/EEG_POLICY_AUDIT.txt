@@ -1,0 +1,83 @@
+EEG delivery policy: source audit and integration record
+
+Reference inspected: https://github.com/StiopaPopa/fable
+Immutable commit: 336348f24dcf6c76caa1864d70edd5cedfefea1e
+Audit date: 2026-10-04 UTC (2026-10-03 PDT)
+Sources: README.MD, OSC_focus_relax_smoother.py, backend/eeg.py,
+backend/main.py; complete GitHub recursive tree (truncated=false), repo metadata.
+Files were read only. No repository scripts, package installs or API clients ran.
+
+Licensing: GitHub repository metadata reports license=null. The complete tree
+contains dependency licenses under node_modules and backend/env, but no
+first-party license/permission file. No license notice was found in the audited
+first-party sources or README. Public access does not grant code-reuse rights.
+This implementation copies no Fable code or classifier thresholds; attribution
+records architectural inspiration, not a claim of permission. Other sources not
+inspected could contain a notice; no compatible first-party grant was established.
+
+Actual Fable decision architecture
+- OSC alpha/beta powers -> alpha/beta ratio -> EMA with weight .2 -> categorical
+  FOCUSING (<1.4), RELAXING (>2.0), otherwise NEUTRAL.
+- Standalone script and backend/eeg.py: 10-update warmup, at least one good
+  horseshoe/contact channel; print/plot classification, no story integration.
+- backend/main.py: alpha events classify; most-common label over previous 30s
+  (minimum five events) feeds generate_next_segment. Missing data also returns
+  NEUTRAL, whose prompt requests fresh discoveries. Focus requests details or
+  challenges/tension; relax requests ease/wonder. It preserves prior story text,
+  then queues TTS and launches video in background threads. First interval15s,
+  subsequent intervals30s. README's generalized description is not validation.
+- Actual main backend has no contact gate in its band handler, no ten-update
+  warmup, subject calibration, freshness checks, clipping/artifact rejection or
+  validated-label evidence. Alpha-triggered classification can reuse beta. Its
+  len(args)==2 handler does not accept normal mapped four-channel len5 updates.
+  No validation accuracy, sensitivity, specificity or generalization follows.
+
+Independent GÖZ implementation
+- Reuses EEGFeed.window rows (epoch timestamp, positive feature, baseline index,
+  artifact boolean) and status quality; no acquisition, OSC or raw signal copy.
+- Muse: existing 256Hz, 2s-window beta/(alpha+theta), 250ms hop, personalized
+  median/MAD calibration from60clean seconds. Uses baseline index, never Fable's
+  incomparable alpha/beta thresholds. Mind Monitor: existing smoothed beta/alpha
+  baseline index, with raw artifact coverage + fresh paired-band/contact metadata
+  required. Its ten-update calibration remains its own, less robust feed method;
+  policy does not claim equivalence to Muse's60s calibration.
+- fusion.analyze optional keyword-only eeg_quality=dict, eeg_window=(start,end).
+  Missing metadata fails closed. Existing descriptive fields remain compatible.
+- Requires live/calibrated, confidence>=.6, no qualityError, fresh streaming state.
+  Muse raw sample age must be<3s. Feature rows must fall in the frozen window,
+  and Muse's entire2s acquisition window must fit inside it. Clipped |index|>=5,
+  nonfinite/nonpositive values and artifacts are excluded. Invalid rows or gaps
+  >.5s reset support. Latest clean feature must be<=.75s from window end.
+- Last clean run >=1s and >=60% of eligible window duration; >=5 distinct250ms
+  time buckets prevent event bursts from creating duration. Bucket medians and
+  >=80% agreement choose above/below baseline, with enter index1.0 and retain.5
+  hysteresis. These are controller design choices without scientific validation.
+  Current adequate evidence is always required; unknown resets retained state.
+- Above baseline tries slightly quicker existing gestures; below baseline tries
+  slightly slower gestures. Near baseline/mixed/unknown adds no EEG instruction.
+  These mappings are experimental feedback trials, not inferences about focus,
+  relaxation, liking, emotional valence, or which actor caused the signal.
+- Gaze chooses character framing independently; EEG never changes learned
+  character/dialogue/pacing/genre preference weights. Gaze readability pacing
+  overrides any EEG cue. At most one EEG delivery cue is appended, with no
+  cumulative intensity changes, and no new plot events or dialogue wording.
+- Existing first/last reference frames, duration, model, seed, resolution and
+  provider options remain unchanged. The full base prompt is preserved; overflow
+  raises the existing explicit8000character error instead of dropping a cue.
+- No wait for more evidence, detection or physiology is introduced. The3.5s
+  playback deadline can use up to1.5s of Muse features fully inside that window
+  if calibration was completed beforehand; otherwise it remains gaze-only.
+- analysis/decision.eeg_policy records source, feature, experimental flag, state,
+  action, reason, median index, valid support, eligibility/applied and suppression.
+  Final decision has eeg_applied/applied_actions; scene_spec.eeg_delivery_action
+  reports actual application. The current UI can display main action/reasons;
+  richer EEG panel rendering is a separate integration task, not edited here.
+
+Verification scope
+Offline deterministic request and lifecycle tests, including opposite validated
+states, missing/invalid/stale/clipped/artifact/neutral/no-quality/no-window cases,
+hysteresis, no gaze availability, conflicting readability cue, Mind Monitor raw
+artifact gates, full-window scope and prompt length. Paired provider payloads
+must differ only in prompt, with identical gaze, reference frames and settings.
+These show software decisions, not physiological validity or rendered-video
+compliance. No hardware, paid generation, training, commits or restarts performed.

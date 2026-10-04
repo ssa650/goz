@@ -55,21 +55,22 @@ def test_identity_tracking_uses_staging_then_seeds():
     assert tracks.target_at({"Ana": A_BOX, "Bea": B_BOX}, 0.5, 0.05) is None
 
 
-def test_mvp_strong_response_to_b_makes_next_scene_focus_b():
+def test_mvp_comparative_gaze_makes_next_scene_focus_b():
     ticks, track, gaze, eeg = watch(favourite="Bea")
     timeline = fusion.label(gaze, ticks, track)
     analysis = fusion.analyze(timeline, eeg, track, ["Ana", "Bea"])
     bea, ana = analysis["characters"]["Bea"], analysis["characters"]["Ana"]
-    assert bea["strong"] and not ana["strong"]
+    assert not bea["strong"] and not ana["strong"]
+    assert bea["response"] == bea["attention"]  # EEG is not preference evidence.
     assert bea["attention"] > 0.6 and bea["eeg_response"] > 0.5 > ana["eeg_response"]
     profile, changes = profiles.update(profiles.new_profile(["Ana", "Bea"]), analysis)
     assert profile["characters"]["Bea"] > profile["characters"]["Ana"]
-    assert any(c["key"] == "character:Bea" and c["strong"] for c in changes)
+    assert any(c["key"] == "character:Bea" and not c["strong"] for c in changes)
     decision = profiles.decide(profile, analysis)
-    assert decision["focus"] == "Bea" and "strong" in decision["reasons"][0]
-    plan = director.template(dict(premise="P.", characters=[dict(name="Ana"), dict(name="Bea")], scenes=[]),
+    assert decision["focus"] == "Bea" and "Observed attention" in decision["reasons"][0]
+    plan = director.template(dict(premise="Ana and Bea open the box.", characters=[dict(name="Ana"), dict(name="Bea")], scenes=[]),
                              decision, 10, ["Ana", "Bea"])
-    assert plan["video_prompt"].startswith("P.") and "Gently emphasize Bea" in plan["video_prompt"]
+    assert plan["video_prompt"].startswith("Ana and Bea") and "PRIMARY SHOT: Bea" in plan["video_prompt"]
 
 
 def test_timeline_parsing_marks_speakers_and_tags():
@@ -80,7 +81,7 @@ def test_timeline_parsing_marks_speakers_and_tags():
     assert beats[0]["tags"] == ["humor"] and beats[2]["characters"] == ["Patrick"] and beats[2]["t1"] == 10
 
 
-def test_eeg_rise_while_a_character_speaks_counts_as_strong():
+def test_eeg_rise_while_a_character_speaks_remains_a_separate_observation():
     ticks, track, gaze, _ = watch(favourite="Bea")
     t0 = ticks[0]["wall"]
     eeg = [(t0 + i * 0.25, 1.0, 1.4 if 4.3 <= i * 0.25 <= 8.3 else -0.6, False) for i in range(40)]
@@ -89,31 +90,30 @@ def test_eeg_rise_while_a_character_speaks_counts_as_strong():
                        dict(t0=8, t1=10, speaker=None, dialogue=False, tags=[])])
     analysis = fusion.analyze(fusion.label(gaze, ticks, track), eeg, track, ["Ana", "Bea"], plan)
     assert analysis["characters"]["Bea"]["speaking_response"] > 0.5 > analysis["characters"]["Ana"]["speaking_response"]
-    assert analysis["characters"]["Bea"]["strong"]
+    assert not analysis["characters"]["Bea"]["strong"]
     profile, changes = profiles.update(profiles.new_profile(["Ana", "Bea"]), analysis)
-    assert "while Bea spoke" in next(c["why"] for c in changes if c["key"] == "character:Bea")
+    assert "shared visibility" in next(c["why"] for c in changes if c["key"] == "character:Bea")
+    without_eeg, _ = profiles.update(profiles.new_profile(["Ana", "Bea"]), fusion.analyze(fusion.label(gaze, ticks, track), [], track, ["Ana", "Bea"], plan))
+    assert profile["characters"] == without_eeg["characters"]
 
 
 @pytest.mark.asyncio
-async def test_fal_character_detection_labels_boxes_by_character(tmp_path):
+async def test_fal_character_detection_does_not_force_cast_from_descriptions(tmp_path):
     from backend.frames import ffmpeg
     video = tmp_path/"clip.mp4"
-    await ffmpeg("-f", "lavfi", "-i", "color=c=yellow:s=320x180:r=10", "-t", "1.5", "-pix_fmt", "yuv420p", video)
+    await ffmpeg("-f", "lavfi", "-i", "testsrc=size=320x180:rate=10", "-t", "1.5", "-pix_fmt", "yuv420p", video)
     asked = []
 
     def handler(request):
         body = json.loads(request.content)
-        asked.append(body["text_input"])
-        assert body["image_url"].startswith("data:image/jpeg;base64,")
-        if body["text_input"] == "green octopus":
-            return httpx.Response(200, json={"results": {"bboxes": [{"x": 300, "y": 30, "w": 150, "h": 200, "label": "o"}]}})
-        return httpx.Response(200, json={"results": {"bboxes": [{"x": 0, "y": 0, "w": 512, "h": 288, "label": "all"}]}})
+        asked.append(body)
+        assert set(body) == {"image_url"}
+        return httpx.Response(200, json={"results": {"bboxes": [{"x": 0, "y": 0, "w": 70, "h": 90, "label": "colored test pattern"}]}})
 
     chars = [dict(name="Squidward", description="green octopus"), dict(name="SpongeBob", description="yellow sponge")]
-    track = await tracks.detect_characters(video, chars, "k", transport=httpx.MockTransport(handler))
-    assert len(track) == 3 and set(asked) == {"green octopus", "yellow sponge"}
-    assert set(track[0]["boxes"]) == {"Squidward"}
-    assert track[0]["boxes"]["Squidward"] == [round(300 / 512, 4), round(30 / 288, 4), round(450 / 512, 4), round(230 / 288, 4)]
+    track = await tracks.detect_characters(video, chars, "k", transport=httpx.MockTransport(handler), fps=2)
+    assert len(track) == 3 and len(asked) == 3
+    assert all(not frame["boxes"] and frame["regions"][0]["identity_status"] == "unknown" for frame in track)
 
 
 def test_gaze_outside_playback_or_while_blinking_is_ignored():
@@ -141,51 +141,32 @@ def test_eeg_engagement_z_rises_with_beta():
 
 
 @pytest.mark.asyncio
-async def test_director_openai_request_and_validation(monkeypatch):
+async def test_director_local_rule_does_not_call_remote_model(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    seen = {}
-
     def handler(request):
-        assert str(request.url) == "https://api.openai.com/v1/responses"
-        seen.update(json.loads(request.content))
-        content = json.dumps(dict(action="focus_character", focus="Bea", reason="Higher measured attention to Bea."))
-        return httpx.Response(200, json=dict(id="resp-decision", status="completed", output=[
-            dict(type="message", content=[dict(type="output_text", text=content)])]))
-
+        raise AssertionError("A bounded gaze decision must not add a remote model call")
     story = dict(premise="P.", characters=[dict(name="Ana"), dict(name="Bea")], scenes=[dict(summary="Opening")],
-                 next_prompt="Ana and Bea open the box. Bea says: 'Look!'",
-                 viewer_analysis={"look_away_frac": 0.1})
+                 next_prompt="Ana and Bea open the box. Bea says: 'Look!'")
     plan, writer = await director.write_scene(story, profiles.new_profile(["Ana", "Bea"]), dict(focus="Bea"), 10,
                                               transport=httpx.MockTransport(handler))
-    assert writer == "openai:gpt-6-luna" and seen["model"] == "gpt-6-luna"
-    fmt = seen["text"]["format"]
-    assert fmt["type"] == "json_schema" and fmt["strict"] is True
-    assert fmt["schema"]["additionalProperties"] is False
-    assert set(fmt["schema"]["properties"]) == set(fmt["schema"]["required"]) == {"action", "focus", "reason"}
-    assert seen["store"] is False and "temperature" not in seen
-    assert json.loads(seen["input"][1]["content"])["viewer_analysis"] == story["viewer_analysis"]
+    assert writer == "local-rules"
     assert plan["base_prompt"] == story["next_prompt"]
     assert plan["video_prompt"].startswith(story["next_prompt"] + "\n\n")
-    assert plan["decision"]["focus"] == "Bea" and plan["decisionRequestId"] == "resp-decision"
+    assert plan["decision"]["focus"] == "Bea"
+    assert plan["scene_spec"]["primary_character"] == "Bea"
+    assert plan["decisionElapsedMs"] >= 0
+    assert "decisionRequestId" not in plan
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("output", [
-    dict(status="incomplete", output=[]),
-    dict(status="completed", output=[dict(type="message", content=[dict(type="refusal", refusal="Declined")])]),
-    dict(status="completed", output=[]),
-    dict(status="completed", output=[dict(type="message", content=[dict(type="output_text", text=json.dumps(
-        dict(action="invent_new_scene", focus=None, reason="Unsupported")))])]),
-    dict(status="completed", output=[dict(type="message", content=[dict(type="output_text", text=json.dumps(
-        dict(action="focus_character", focus="Unknown", reason="Unsupported")))])]),
-    dict(status="completed", output=[dict(type="message", content=[dict(type="output_text", text=json.dumps(
-        dict(action="keep", focus=None, reason="ok", video_prompt="Replace the story")))])]),
+@pytest.mark.parametrize("decision", [
+    dict(action="invent_new_scene", focus=None, reason="Unsupported"),
+    dict(action="focus_character", focus="Unknown", reason="Unsupported"),
+    dict(action="keep", focus="Bea", reason="Invalid pairing"),
+    dict(action="keep", focus=None, reason="ok", video_prompt="Replace the story"),
 ])
-async def test_unusable_openai_decisions_fail_before_generation(monkeypatch, output):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    story = dict(premise="P.", characters=[dict(name="Ana"), dict(name="Bea")], scenes=[dict(summary="Opening")])
+def test_invalid_bounded_decisions_are_rejected(decision):
     with pytest.raises(ValueError):
-        await director.write_scene(story, {}, {}, 10, transport=httpx.MockTransport(lambda request: httpx.Response(200, json=output)))
+        director.validate_decision(decision, ["Ana", "Bea"])
 
 
 def test_adjustments_preserve_the_full_script_and_limit_size():
@@ -195,8 +176,12 @@ def test_adjustments_preserve_the_full_script_and_limit_size():
         decision = director.validate_decision(dict(action=action, focus="Bea" if action == "focus_character" else None,
                                                    reason="Measured response"), ["Ana", "Bea"])
         prompt = director.adjust_prompt(base, decision)
-        assert prompt.startswith(base) and len(prompt) - len(base) < 250
-        assert director.adjust_prompt("x" * 8000, decision) == "x" * 8000
+        assert prompt.startswith(base) and len(prompt) <= 8000
+        if action == "keep":
+            assert director.adjust_prompt("x" * 8000, decision) == "x" * 8000
+        else:
+            with pytest.raises(ValueError, match="No adaptation was silently dropped"):
+                director.adjust_prompt("x" * 8000, decision)
     assert director.adjust_prompt(base, director.local_decision({}, ["Ana", "Bea"])) == base
 
 
@@ -206,8 +191,7 @@ async def test_end_to_end_demo_loop_adapts_to_simulated_viewer(tmp_path, monkeyp
     monkeypatch.setenv("GOZ_EEG", "sim")
     monkeypatch.setenv("GOZ_SIM_FAVORITE", "1")
     monkeypatch.setenv("GOZ_SIM_BIAS", "0.95")
-    import backend.adaptive.session as session_module
-    monkeypatch.setattr(session_module, "ANALYZE_AT", 0.9)
+    monkeypatch.setenv("GOZ_SIM_SEED", "acceptance")
     engine = Engine(DemoAdapter(tmp_path/"demo"), tmp_path, poll_seconds=.01)
     app = create_app(engine)
     async with app.router.lifespan_context(app):
@@ -227,12 +211,12 @@ async def test_end_to_end_demo_loop_adapts_to_simulated_viewer(tmp_path, monkeyp
             start = time.time()
             for i in range(60):
                 video_t = time.time() - start
-                await c.post("/api/adaptive/tick", json=dict(clip=0, video_t=video_t, playing=True, rect=rect,
+                await c.post("/api/adaptive/tick", json=dict(session_id=r.json()["id"], clip=0, video_t=video_t, playing=True, rect=rect,
                                                              wall=time.time() * 1000))
                 await asyncio.sleep(.085)
                 if len((await c.get("/api/adaptive/state")).json()["session"]["clips"]) > 1:
                     break
-            await c.post("/api/adaptive/ended", json=dict(clip=0))
+            await c.post("/api/adaptive/ended", json=dict(session_id=r.json()["id"], clip=0))
             for _ in range(300):
                 state = (await c.get("/api/adaptive/state")).json()
                 clips = state["session"]["clips"]
@@ -255,8 +239,7 @@ async def test_predefined_opening_clip_is_scene_one(tmp_path, monkeypatch):
     monkeypatch.setenv("GOZ_GAZE", "sim")
     monkeypatch.setenv("GOZ_EEG", "sim")
     monkeypatch.setenv("GOZ_SIM_BIAS", "0.95")
-    import backend.adaptive.session as session_module
-    monkeypatch.setattr(session_module, "ANALYZE_AT", 0.9)
+    monkeypatch.setenv("GOZ_SIM_SEED", "acceptance")
     clip = tmp_path/"episode.mp4"
     await ffmpeg("-f", "lavfi", "-i", "color=c=yellow:s=320x180:r=24", "-t", "4", "-pix_fmt", "yuv420p", clip)
     engine = Engine(DemoAdapter(tmp_path/"demo"), tmp_path, poll_seconds=.01)
@@ -281,7 +264,7 @@ async def test_predefined_opening_clip_is_scene_one(tmp_path, monkeypatch):
             assert not engine.jobs, "the opening clip must not be generated"
             rect, start = dict(x=0, y=0, w=640, h=360), time.time()
             while time.time() - start < 3.8:
-                await c.post("/api/adaptive/tick", json=dict(clip=0, video_t=time.time() - start, playing=True,
+                await c.post("/api/adaptive/tick", json=dict(session_id=r.json()["id"], clip=0, video_t=time.time() - start, playing=True,
                                                              rect=rect, wall=time.time() * 1000))
                 await asyncio.sleep(.08)
             for _ in range(300):
@@ -316,17 +299,12 @@ async def test_adaptive_decision_preserves_ordered_bundle_payloads(tmp_path, mon
         async def track(*args): return []
         engine.media_path = media_path
         session.track = track
-        real_write_scene = director.write_scene
         monkeypatch.setenv('OPENAI_API_KEY', 'sk-test')
-        def decision_response(request):
-            context = json.loads(json.loads(request.content)['input'][1]['content'])
-            assert context['next_prompt'] == originals[len(session.clips)]['prompt']
-            return httpx.Response(200, json=dict(id='resp-test', status='completed', output=[dict(type='message', content=[
-                dict(type='output_text', text=json.dumps(dict(action='subtle_humor', focus=None, reason='Measured response to humor.')))])]))
-        async def write_scene(story, profile, hint, duration):
-            return await real_write_scene(story, profile, hint, duration, transport=httpx.MockTransport(decision_response))
-        monkeypatch.setattr(director, 'write_scene', write_scene)
         for i in range(4):
+            if session.clips:
+                # This payload-order unit test consumes each clip before asking
+                # for another; a separate queue test covers admission rejection.
+                session.clips[-1]['status'] = 'watched'
             await session.make_scene({}, None, None, [])
             assert session.status == 'running', session.error
             clip = session.clips[i]
@@ -341,9 +319,9 @@ async def test_adaptive_decision_preserves_ordered_bundle_payloads(tmp_path, mon
             assert payload.get('image_url') == (engine.reference(original['firstFrame'])['providerUrl'] if original['firstFrame'] else None)
             assert payload.get('end_image_url') == (engine.reference(original['endFrame'])['providerUrl'] if original['endFrame'] else None)
             if i == 0:
-                assert payload['prompt'] == original['prompt'] and job['decisionModel'] == 'template'
+                assert payload['prompt'] == original['prompt'] and job['decisionModel'] == 'local-rules'
             else:
-                assert job['decisionModel'] == 'openai:gpt-6-luna' and job['decisionRequestId'] == 'resp-test'
-                assert job['engagementDecision']['action'] == 'subtle_humor'
+                assert job['decisionModel'] == 'local-rules' and job.get('decisionRequestId') is None
+                assert job['engagementDecision']['action'] == 'keep'
         assert [c['bundle']['id'] for c in session.clips] == [c['id'] for c in originals]
         assert [c['prompt'] for c in originals] == [f'Scene {i+1}' for i in range(4)]

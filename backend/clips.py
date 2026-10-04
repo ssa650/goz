@@ -254,6 +254,8 @@ class ClipService:
             existing = next((j for j in e.jobs.values() if j.get("clipId") == clip_id and j.get("clientToken") == token), None)
             if existing:
                 return e.public_job(existing)
+            if e.adaptive_active():
+                raise FalError("Stop the adaptive story before generating individual clips.", 409)
             e.generation_guard()
             if not e.adapter.configured():
                 raise FalError("Add your Fal API key first.", 503)

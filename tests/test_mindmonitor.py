@@ -14,7 +14,7 @@ def send_pair(feed, sender="127.0.0.1", alpha=None, beta=None):
     feed.receive(sender, "/muse/elements/beta_absolute", *(beta or [0, 0, 0, 0]))
 
 
-def test_one_good_sensor_excludes_bad_channels_and_uses_fable_thresholds(monkeypatch):
+def test_one_good_sensor_excludes_bad_channels_and_reports_physiology(monkeypatch):
     clock = [100.0]
     monkeypatch.setattr("backend.adaptive.mindmonitor.time.time", lambda: clock[0])
     feed = MindMonitorFeed()
@@ -25,8 +25,9 @@ def test_one_good_sensor_excludes_bad_channels_and_uses_fable_thresholds(monkeyp
     status = feed.status()
     assert status["calibrated"] and status["live"]
     assert status["goodChannels"] == ["AF7"]
-    assert status["label"] == "Focusing" and status["alphaBetaRatio"] == 1
-    assert feed.latest()[2] > 1 and status["targetSamples"] == 10
+    assert status["label"] == "Beta/alpha near baseline" and status["alphaBetaRatio"] == 1
+    assert feed.latest()[2] == 0 and status["targetSamples"] == 10
+    assert status["interpretation"] == "Physiological variation; cause and valence unknown"
     # Contact quality changing on excluded sensors must not erase warmup.
     feed.receive("phone", "/muse/elements/horseshoe", 2, 1, 3, 4)
     assert feed.status()["calibrated"]
@@ -51,7 +52,7 @@ def test_contact_loss_and_recovery_require_new_paired_waves(monkeypatch):
     for _ in range(10):
         clock[0] += .1
         send_pair(feed, alpha=[.5], beta=[0])
-    assert feed.status()["label"] == "Relaxing"
+    assert feed.status()["label"] == "Beta/alpha near baseline"
     assert feed.status()["calibrated"]
     count = len(feed.series)
     for _ in range(20):
@@ -125,3 +126,47 @@ def test_busy_udp_port_reports_actionable_error(monkeypatch):
         run_mindmonitor(feed, threading.Event())
         assert "Muse connection error: Mind Monitor OSC:" in feed.status()["qualityError"]
         assert not feed.status()["live"]
+
+
+def test_artifact_clears_physiological_window_and_requires_fresh_warmup(monkeypatch):
+    clock = [100.]
+    monkeypatch.setattr("backend.adaptive.mindmonitor.time.time", lambda: clock[0])
+    feed = MindMonitorFeed()
+    feed.receive("phone", "/muse/elements/horseshoe", 1, 1, 1, 1)
+    for _ in range(10):
+        clock[0] += .1
+        send_pair(feed, "phone")
+    assert feed.status()["calibrated"]
+    feed.receive("phone", "/muse/elements/jaw_clench", 1)
+    assert not feed.status()["calibrated"] and not feed.series
+    assert feed.status()["connectionState"] == "poor_signal"
+    assert feed.status()["modeLabel"] == "EEG unavailable — gaze-only mode"
+    clock[0] += 2.1
+    feed.receive("phone", "/muse/elements/horseshoe", 1, 1, 1, 1)
+    send_pair(feed, "phone")
+    assert not feed.status()["calibrated"]
+
+
+def test_stale_phone_can_reconnect_without_mixing_active_streams(monkeypatch):
+    clock = [100.]
+    monkeypatch.setattr("backend.adaptive.mindmonitor.time.time", lambda: clock[0])
+    feed = MindMonitorFeed()
+    feed.receive("old-phone", "/muse/elements/horseshoe", 1, 1, 1, 1)
+    feed.receive("other-phone", "/muse/elements/horseshoe", 1, 1, 1, 1)
+    assert feed.peer == "old-phone"
+    clock[0] += 4
+    feed.receive("new-phone", "/muse/elements/horseshoe", 1, 1, 1, 1)
+    assert feed.peer == "new-phone"
+    assert not feed.status()["calibrated"]
+
+
+def test_large_raw_artifact_suppresses_observations(monkeypatch):
+    clock = [100.]
+    monkeypatch.setattr("backend.adaptive.mindmonitor.time.time", lambda: clock[0])
+    feed = MindMonitorFeed()
+    feed.receive("phone", "/muse/elements/horseshoe", 1, 1, 1, 1)
+    feed.receive("phone", "/muse/eeg", 1000., 1., 1., 1.)
+    clock[0] += .1
+    send_pair(feed, "phone")
+    assert not feed.series
+    assert "artifact" in feed.status()["qualityError"]

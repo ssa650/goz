@@ -14,7 +14,7 @@ from starlette.datastructures import UploadFile
 
 from .sensors import EegFeed, GazeFeed, Simulator, run_muse, GAZE_PORT
 from .mindmonitor import MindMonitorFeed, run_mindmonitor
-from .session import AdaptiveSession
+from .session import AdaptiveSession, MAX_SCENES
 from ..sensor_setup import SensorSetup
 
 MAX_CHARACTERS = 4
@@ -30,10 +30,15 @@ class Sensors:
         self.gaze_mode = os.getenv("GOZ_GAZE", "gazekit")
         self.gaze_error = None
         self.muse_thread = None
+        self.muse_reader_stop = None
         self.setup = SensorSetup(self, directory or "data", demo)
 
     def start_muse_reader(self):
-        if self.eeg_mode in ("muse", "mindmonitor") and (not self.muse_thread or not self.muse_thread.is_alive()):
+        if self.eeg_mode == "muse" and (not self.muse_thread or not self.muse_thread.is_alive()):
+            self.muse_reader_stop = threading.Event()
+            self.muse_thread = threading.Thread(target=run_muse, args=(self.eeg, self.muse_reader_stop), daemon=True)
+            self.muse_thread.start()
+        elif self.eeg_mode == "mindmonitor" and (not self.muse_thread or not self.muse_thread.is_alive()):
             reader = run_mindmonitor if self.eeg_mode == "mindmonitor" else run_muse
             self.muse_thread = threading.Thread(target=reader, args=(self.eeg, self.stop_event), daemon=True)
             self.muse_thread.start()
@@ -45,7 +50,7 @@ class Sensors:
                 self.gaze.source = "waiting for `gazekit stream`"
             except OSError as error:
                 self.gaze_error = f"UDP port busy: {error}"
-        if not self.setup.required or self.eeg_mode == "mindmonitor":
+        if self.eeg_mode == "mindmonitor":
             self.start_muse_reader()
         simulate_gaze, simulate_eeg = self.gaze_mode == "sim", self.eeg_mode == "sim"
         if simulate_gaze or simulate_eeg:
@@ -63,10 +68,28 @@ class Sensors:
             self.sim_task = asyncio.create_task(Simulator(Live(), self.gaze, self.eeg, favourite, bias).run(simulate_gaze, simulate_eeg))
         await self.setup.start()
 
+    async def connect_muse(self):
+        if self.eeg_mode != "muse":
+            raise ValueError("Manual Muse connection is available when GOZ_EEG=muse.")
+        await self.setup.connect_muse()
+
+    async def disconnect_muse(self):
+        if self.eeg_mode == "muse":
+            await self.setup.disconnect_muse()
+            if self.muse_reader_stop:
+                self.muse_reader_stop.set()
+            if self.muse_thread:
+                await asyncio.to_thread(self.muse_thread.join, 2)
+                self.muse_thread = None
+
     async def close(self):
         self.stop_event.set()
+        if self.session:
+            self.session.stop()
         await self.setup.close()
         self.gaze.close()
+        if self.muse_reader_stop:
+            self.muse_reader_stop.set()
         if self.sim_task:
             self.sim_task.cancel()
             await asyncio.gather(self.sim_task, return_exceptions=True)
@@ -107,6 +130,16 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
                           for c in characters]
             if len({c["name"] for c in characters}) != len(characters):
                 raise ValueError("Character names must be unique.")
+            objects = json.loads(str(form.get("objects", "[]")))
+            if (not isinstance(objects, list) or len(objects) > 2 or any(not isinstance(o, dict)
+                    or not isinstance(o.get("name"), str) or not o["name"].strip() for o in objects)):
+                raise ValueError("Use at most two named story objects.")
+            objects = [dict(name=o["name"].strip()[:40], description=str(o.get("description", ""))[:200]) for o in objects]
+            names = [c["name"] for c in characters + objects]
+            if len(set(names)) != len(names):
+                raise ValueError("Character and object names must be unique.")
+            from .tracks import tracking_provider
+            tracker = tracking_provider(str(form["tracker"]) if "tracker" in form else None)
             timeline = str(form.get("timeline", ""))[:20000]
             use_sequence = str(form.get("use_saved_sequence", "0")) == "1"
             bundles = None
@@ -133,6 +166,8 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
                 opening_video = uploads/f"{uuid4()}.mp4"
                 opening_video.write_bytes(data)
                 opening_video.chmod(0o600)
+            available_limit = min(MAX_SCENES, len(bundles)) if bundles else MAX_SCENES
+            scene_limit = int(number(int(str(form.get("scene_limit", available_limit))), 1, available_limit))
             async with e.lock:
                 if not e.adapter.configured():
                     raise ValueError("Add your Fal key first.")
@@ -141,7 +176,8 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
                 sn.session = AdaptiveSession(e, sn.gaze, sn.eeg, e.directory, premise, characters,
                                              duration_value(form.get("duration", 10)),
                                              resolution_value(form.get("resolution", "480P")),
-                                             frames[0] if frames else None, opening_video, timeline, bundles)
+                                             frames[0] if frames else None, opening_video, timeline, bundles, objects, tracker=tracker)
+                sn.session.max_scenes = scene_limit
                 await sn.session.start()
             return sn.session.public()
         finally:
@@ -157,23 +193,72 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
     @app.post("/api/adaptive/tick")
     async def tick(request: Request):
         body = await json_body(request)
+        if body.get("session_id") != session(request).id:
+            raise ValueError("Playback belongs to an older session. Reload the page.")
         rect = body.get("rect")
         if rect is not None:
             rect = {k: number(rect.get(k), -1e5, 1e5) for k in ("x", "y", "w", "h")}
+        visible = body.get("visible_rect")
+        if visible is not None:
+            visible = {k: number(visible.get(k), -1e5, 1e5) for k in ("x", "y", "w", "h")}
+        if type(body.get("playing")) is not bool:
+            raise ValueError("Playing must be a boolean.")
         session(request).tick(int(number(body.get("clip"), 0, 100)), number(body.get("video_t"), 0, 600),
-                              bool(body.get("playing")), rect, number(body.get("wall"), 0, 1e13) / 1000)
+                              body["playing"], rect, number(body.get("wall"), 0, 1e13) / 1000,
+                              clip_id=body.get("clip_id"), epoch=int(number(body.get("epoch", 0), 0, 1e10)),
+                              playback_rate=number(body.get("playback_rate", 1), .1, 4), visible_rect=visible)
         return {"ok": True}
 
     @app.post("/api/adaptive/ended")
     async def ended(request: Request):
-        session(request).ended(int(number((await json_body(request)).get("clip"), 0, 100)))
+        body = await json_body(request)
+        if body.get("session_id") != session(request).id:
+            raise ValueError("Playback belongs to an older session. Reload the page.")
+        session(request).ended(int(number(body.get("clip"), 0, 100)))
         return {"ok": True}
 
     @app.post("/api/adaptive/stop")
     async def stop(request: Request):
         s = session(request)
+        body = await json_body(request)
+        if body.get("session_id") != s.id:
+            raise ValueError("Stop belongs to an older session.")
         s.stop()
         return s.public()
+
+    @app.post("/api/adaptive/playback-event")
+    async def playback_event(request: Request):
+        body = await json_body(request)
+        s = session(request)
+        if body.get("session_id") != s.id or s.status == "stopped":
+            raise ValueError("Playback event belongs to an inactive session.")
+        index = int(number(body.get("clip"), 0, 100))
+        if index >= len(s.clips) or body.get("clip_id") != s.clips[index]["id"]:
+            raise ValueError("Playback clip identity mismatch.")
+        kind = body.get("kind")
+        if kind not in ("ready", "playing", "ended", "waiting", "error"):
+            raise ValueError("Invalid playback event.")
+        wall = number(body.get("wall"), 0, 1e13)/1000
+        if abs(wall-time.time()) > 5:
+            raise ValueError("Playback event clock is stale.")
+        clip = s.clips[index]
+        fields = dict(clip=index, clipId=clip["id"], decisionId=clip.get("decisionId"), wall=wall)
+        if kind == "playing" and not clip.get("firstPresentedAt"):
+            clip["firstPresentedAt"] = wall
+            prev = s.clips[index-1] if index else None
+            clip["transitionMs"] = max(0, (wall-prev["endedAt"])*1000) if prev and prev.get("endedAt") else None
+            fields["transitionMs"] = clip["transitionMs"]
+            window = clip.get("observationWindow")
+            clip["feedbackDelayS"] = wall-window["end"] if window else None
+        elif kind == "ended":
+            clip["endedAt"] = min(clip.get("endedAt", wall), wall)
+            if index+1 < len(s.clips):
+                successor = s.clips[index+1]
+                if successor.get("firstPresentedAt"):
+                    successor["transitionMs"] = max(0, (successor["firstPresentedAt"]-clip["endedAt"])*1000)
+            s.ended(index)
+        s.log("browser_"+kind, **fields)
+        return {"ok": True}
 
     @app.get("/api/adaptive/state")
     async def state(request: Request):
@@ -184,11 +269,32 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
         recent = sn.gaze.window(now - 30, now)
         blinks = sum(1 for a, b in zip(recent, recent[1:]) if b.get("blink") and not a.get("blink"))
         latest = sn.gaze.latest()
+        response = None
+        if s and s.current_clip():
+            clip = s.current_clip()
+            # Limit dashboard work to recent data; final analysis uses the full scene.
+            t0 = max(now - 15, clip.get("playStartedAt", now))
+            from . import fusion
+            timeline = fusion.label(sn.gaze.window(t0, now), clip["ticks"][-160:], clip.get("track", []))
+            response = fusion.analyze(timeline, sn.eeg.window(t0, now), clip.get("track", []), s.target_names,
+                                      eeg_confidence=sn.eeg.status().get("confidence", 0))
         return dict(
             session=s.public() if s else None,
+            response=response,
             setup=sn.setup.snapshot(),
             gaze=dict(**sn.gaze.status(), error=sn.gaze_error, point=s.live_gaze() if s else None,
                       blinks_per_min=round(2 * blinks, 1) if recent else None,
                       yaw=latest.get("yaw") if latest else None, pitch=latest.get("pitch") if latest else None),
             eeg=dict(**sn.eeg.status(), series=eeg[-120:]),
+            simulation=sn.gaze_mode == "sim" or sn.eeg_mode == "sim",
             serverNow=now)
+
+    @app.post("/api/adaptive/muse/connect")
+    async def connect_muse(request: Request):
+        await sensors(request).connect_muse()
+        return sensors(request).setup.snapshot()
+
+    @app.post("/api/adaptive/muse/disconnect")
+    async def disconnect_muse(request: Request):
+        await sensors(request).disconnect_muse()
+        return sensors(request).setup.snapshot()

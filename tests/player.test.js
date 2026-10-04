@@ -140,3 +140,22 @@ test('next decoded video is visible before play is requested, including after a 
   queue.update([{url:'/first'},{url:'/second'}],'completed');await flush();
   assert.equal(states.at(-1),'playing');assert.equal(queue.current.hidden,false);assert.equal(first.hidden,true);
 });
+
+test('sustained slow production holds ending frames and uses only two media buffers', async()=>{
+  const videos=[new Video(),new Video()],events=[];
+  const q=new PlaybackQueue(videos,e=>events.push(e));
+  const clips=[];
+  for(let index=0;index<4;index++) {
+    clips.push({url:`/slow-${index}`});
+    q.update(clips,'running');await flush();
+    assert.equal(q.current.src,`/slow-${index}`);
+    const shown=q.current;
+    shown.events.ended();
+    assert.equal(events.at(-1).state,'buffering');
+    assert.equal(q.displayed,shown);
+    assert.equal(q.current,null);assert.equal(q.pending,null);
+    for(let i=0;i<100;i++)q.update(clips,'running');
+    assert.equal(q.displayed,shown);assert.equal(videos.length,2);
+  }
+  q.update(clips,'completed');assert.equal(events.at(-1).state,'finished');
+});

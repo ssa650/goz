@@ -1,13 +1,14 @@
-"""Fable-style Mind Monitor OSC: good contacts, alpha/beta, EMA (0.2).
+"""Mind Monitor OSC: contact-gated alpha/beta observations, EMA (0.2).
 
 Protocol/example: https://github.com/Enigma644/MindMonitorPython
-Thresholds: https://github.com/StiopaPopa/fable/blob/main/backend/eeg.py
-This is a heuristic focus index, not a personal calibration or probability.
+This physiological ratio is not an enjoyment, attention or focus measurement.
 """
 import math
 import os
 import socket
 import time
+from collections import deque
+import statistics
 
 from .sensors import EegFeed
 
@@ -33,6 +34,10 @@ class MindMonitorFeed(EegFeed):
         self.port = int(os.getenv("GOZ_MINDMONITOR_PORT", "5000"))
         self.destination = destination_ip()
         self.peer = os.getenv("GOZ_MINDMONITOR_PHONE_IP", "").strip() or None
+        self.pinned_peer = self.peer
+        self.last_rx = 0.0
+        self.packets_received = 0
+        self.raw_samples_received = 0
         self.contacts = [4] * 4
         self.contact_at = 0.0
         self.bands = {}
@@ -40,6 +45,10 @@ class MindMonitorFeed(EegFeed):
         self.active_channels = ()
         self.ema = None
         self.readings = 0
+        self.baseline = []
+        self.raw_recent = deque(maxlen=64)
+        self.raw_at = 0.0
+        self.artifact_until = 0.0
         self.label = "Waiting"
         self.quality_error = "Waiting for Mind Monitor OSC; connect Muse in the phone app and enable streaming."
 
@@ -48,9 +57,11 @@ class MindMonitorFeed(EegFeed):
         self.used_at = 0.0
         self.ema = None
         self.readings = 0
+        self.baseline = []
         self.calibration = None
         self.active_channels = ()
         self.label = "Waiting"
+        self.series.clear()
 
     def reset_calibration(self):
         with self.lock:
@@ -61,6 +72,13 @@ class MindMonitorFeed(EegFeed):
     def receive(self, sender, address, *values):
         now = time.time()
         with self.lock:
+            if self.peer and not self.pinned_peer and now - self.last_rx > FRESH_S:
+                self.peer = None  # Permit a phone to reconnect after a DHCP change.
+                self._reset()
+                self.device_id = None
+                self.contacts, self.contact_at = [4] * 4, 0.0
+                self.raw_recent.clear()
+                self.raw_at, self.artifact_until = 0.0, 0.0
             if self.peer and sender != self.peer:
                 return
             if address == "/muse/elements/horseshoe":
@@ -72,7 +90,33 @@ class MindMonitorFeed(EegFeed):
                 self.device_id = "MindMonitor@" + sender
                 self.contacts = list(values)
                 self.contact_at = now
-                self.state = "Mind Monitor connected"
+                self.state = "Mind Monitor contact packets received; waiting for fresh brainwaves"
+            elif address == "/muse/eeg":
+                if len(values) < 4 or any(type(v) not in (int, float) or not math.isfinite(v) for v in values[:4]):
+                    return
+                self.raw_at = now
+                self.last_rx = now
+                self.packets_received += 1
+                self.raw_samples_received += 1
+                self.raw_recent.append(values[:4])
+                good = [i for i, contact in enumerate(self.contacts) if contact == 1]
+                bad = any(abs(values[i]) >= 950 for i in good)
+                if len(self.raw_recent) >= 16:
+                    bad = bad or any(max(row[i] for row in self.raw_recent) - min(row[i] for row in self.raw_recent) > 150 for i in good)
+                if bad:
+                    self.artifact_until = now + 2
+                if now < self.artifact_until:
+                    self._reset()
+                    self.quality_error = "EEG artifact: clipped signal or movement. Hold still and adjust contacts."
+                return
+            elif address in ("/muse/elements/blink", "/muse/elements/jaw_clench"):
+                if values and values[0] == 1:
+                    self.last_rx = now
+                    self.packets_received += 1
+                    self.artifact_until = now + 2
+                    self._reset()
+                    self.quality_error = "Blink/jaw movement artifact; waiting for a clean EEG window."
+                return
             elif address in ("/muse/elements/alpha_absolute", "/muse/elements/beta_absolute"):
                 if len(values) not in (1, 4):
                     self.quality_error = "Set OSC Stream Brainwaves to All Values or Average Only in Mind Monitor."
@@ -83,12 +127,17 @@ class MindMonitorFeed(EegFeed):
                 self.bands[address.split("/")[-1]] = (now, values)
             else:
                 return
+            self.last_rx = now
+            self.packets_received += 1
             self._evaluate_osc(now)
 
     def _evaluate_osc(self, now):
         if self.state.startswith("Muse connection error:"):
             self.calibration = None
             self.quality_error = self.state
+            return
+        if now < self.artifact_until:
+            self.quality_error = "EEG artifact: clipped signal or movement. Hold still and adjust contacts."
             return
         if now - self.contact_at > FRESH_S:
             self._reset()
@@ -128,6 +177,8 @@ class MindMonitorFeed(EegFeed):
         channels = tuple(CHANNELS[i] for i in good)
         if channels != self.active_channels:
             self.ema, self.readings, self.calibration = None, 0, None
+            self.baseline = []
+            self.series.clear()
             self.active_channels = channels
         self.quality_error = ""
         # Require a new pair, rather than reusing an old beta with new alpha.
@@ -137,25 +188,45 @@ class MindMonitorFeed(EegFeed):
         ratio = 10 ** (a - b)
         self.ema = ratio if self.ema is None else 0.2 * ratio + 0.8 * self.ema
         self.readings += 1
-        self.label = "Focusing" if self.ema < 1.4 else "Relaxing" if self.ema > 2 else "Neutral"
-        # Map Fable's thresholds to +1 (focus) and -1 (relax) for fusion.
-        index = max(-5.0, min(5.0, (1.7 - self.ema) / 0.3))
-        self.series.append((now, 1 / max(self.ema, 1e-12), index, False))
+        log_ratio = -math.log10(max(self.ema, 1e-12))
+        self.label = "Physiological ratio warming up"
+        if self.calibration is None:
+            self.baseline.append(log_ratio)
         if self.readings >= 10 and self.calibration is None:
-            self.calibration = dict(method="fable-alpha-beta-ema", deviceId=self.device_id,
-                                    focusBelow=1.4, relaxAbove=2.0, emaAlpha=0.2,
+            median = statistics.median(self.baseline)
+            scale = max(.1, 1.4826 * statistics.median(abs(value-median) for value in self.baseline))
+            self.calibration = dict(method="alpha-beta-relative-baseline", deviceId=self.device_id,
+                                    median=median, scale=scale, emaAlpha=0.2,
                                     channels=list(channels), readyAt=now)
+        index = 0.0 if not self.calibration else max(-5., min(5., (log_ratio-self.calibration["median"])/self.calibration["scale"]))
+        if self.calibration:
+            self.label = "Beta/alpha above baseline" if index > 1 else "Beta/alpha below baseline" if index < -1 else "Beta/alpha near baseline"
+        self.state = "Mind Monitor streaming physiological observations"
+        self.series.append((now, 1 / max(self.ema, 1e-12), index, self.calibration is None))
 
     def status(self):
         now = time.time()
         with self.lock:
             self._evaluate_osc(now)
             live = bool(self.series and now - self.series[-1][0] < FRESH_S and not self.quality_error)
+            fresh_packets = self.last_rx > 0 and now - self.last_rx < FRESH_S
+            state = ("error" if self.state.startswith("Muse connection error:") else "streaming" if live else
+                     "poor_signal" if fresh_packets and self.quality_error else "connecting" if fresh_packets else
+                     "stale" if self.device_id else "disconnected")
             return dict(source=self.source, state=self.state, live=live, deviceId=self.device_id,
+                        confidence=round(len(self.active_channels) / 4, 3) if live and self.calibration else 0.0,
                         calibrated=bool(self.calibration) and live, qualityError=self.quality_error,
                         cleanSeconds=0, targetSeconds=0, startupSamples=min(self.readings, 10), targetSamples=10,
                         contacts=dict(zip(CHANNELS, self.contacts)), goodChannels=list(self.active_channels),
-                        alphaBetaRatio=self.ema, label=self.label, method="fable-alpha-beta-ema",
+                        alphaBetaRatio=self.ema, label=self.label, method="alpha-beta-relative-baseline",
+                        connectionState=state, modeLabel="EEG physiological observations available" if live and self.calibration else "EEG unavailable — gaze-only mode",
+                        timestampSource="OSC arrival time (capture clock unavailable)",
+                        artifactCoverage="raw clipping/movement and contacts" if now-self.raw_at < FRESH_S else "contacts only; enable raw EEG OSC for artifact checks",
+                        interpretation="Physiological variation; cause and valence unknown",
+                        packetsReceived=self.packets_received, rawSamplesReceived=self.raw_samples_received,
+                        contactAgeSeconds=round(now-self.contact_at, 3) if self.contact_at else None,
+                        alphaAgeSeconds=round(now-self.bands['alpha_absolute'][0], 3) if 'alpha_absolute' in self.bands else None,
+                        betaAgeSeconds=round(now-self.bands['beta_absolute'][0], 3) if 'beta_absolute' in self.bands else None,
                         oscDestination=self.destination, oscPort=self.port)
 
 
@@ -166,8 +237,9 @@ def run_mindmonitor(feed, stop):
     dispatcher = Dispatcher()
     def handler(client, address, *values):
         feed.receive(client[0], address, *values)
-    for name in ("horseshoe", "alpha_absolute", "beta_absolute"):
+    for name in ("horseshoe", "alpha_absolute", "beta_absolute", "blink", "jaw_clench"):
         dispatcher.map("/muse/elements/" + name, handler, needs_reply_address=True)
+    dispatcher.map("/muse/eeg", handler, needs_reply_address=True)
     try:
         with BlockingOSCUDPServer(("0.0.0.0", feed.port), dispatcher) as server:
             server.timeout = 0.25
