@@ -107,6 +107,10 @@ class UniqueCleanTime:
         self.end = max(end, self.end) if self.end is not None else end
         return self.seconds
 
+    def pause(self):
+        """Keep accepted duration; require a fresh full window before more credit."""
+        self.end = None
+
 
 def muse_metadata(info, identity):
     """Validate full inlet XML. Test adapters without XML state their assumption."""

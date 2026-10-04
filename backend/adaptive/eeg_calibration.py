@@ -16,6 +16,7 @@ def calibration_status(quality):
     measured = q.get('cleanSeconds')
     clean = max(0., min(TARGET_SECONDS, measured)) if eeg_policy.finite(measured) else 0.
     result = dict(supported=q.get('source') == 'muse', ready=False,
+        calibrationRetained=False, signalReady=False,
         state='unavailable', cleanSeconds=clean, targetSeconds=TARGET_SECONDS,
         remainingCleanSeconds=TARGET_SECONDS-clean, progress=clean/TARGET_SECONDS,
         instructions=INSTRUCTIONS, protocol='eyes-open-screen-viewing-60-clean-seconds-v1',
@@ -23,12 +24,23 @@ def calibration_status(quality):
         interpretation='Experimental physiological baseline; not a liking, focus or emotion classifier',
         startAction='start_or_recalibrate', resetPolicy='Explicit action for a different wearer or viewing setup; stable setup can reuse a valid baseline across generation runs',
         wearerChangeDetection='Unavailable; the user must identify wearer or setup changes')
+    result['retentionPolicy'] = (
+        'Keep the same wearer baseline and calibrated channels through brief poor signal or packet gaps. '
+        'Use only fresh compatible clean EEG for cues; playback and acquisition continue. '
+        'Explicit recalibration, reconnect, source or feature setup changes, and 3 seconds of raw-sample silence require a fresh baseline.')
     if not result['supported']:
         result.update(state='unsupported', reason='60-second guided calibration supports direct Muse EEG. Continue with gaze-only for this source.')
         return result
     baseline = q.get('calibration') if isinstance(q.get('calibration'), dict) else {}
-    if clean >= TARGET_SECONDS and compatibility_key(q) and eeg_policy.quality_failure(q) is None:
-        result.update(ready=True, state='ready', reason='A genuine 60-clean-second baseline is ready for this device and channel set.')
+    identity = compatibility_key(q)
+    retained = bool(clean >= TARGET_SECONDS and identity and q.get('live') is True
+        and q.get('calibrationRetained', q.get('calibrated')) is True
+        and eeg_policy.finite(q.get('sampleAgeSeconds')) and -.5 <= q['sampleAgeSeconds'] < 3)
+    result['calibrationRetained'] = retained
+    if retained and eeg_policy.quality_failure(q) is None:
+        result.update(ready=True, signalReady=True, state='ready', reason='A genuine 60-clean-second baseline is ready for this device and channel set.')
+    elif retained:
+        result.update(state='signal_weak', reason='Calibration saved; waiting for fresh clean signal on the calibrated channels. Playback and EEG streaming continue; EEG cues are unavailable for now.')
     elif q.get('live') is True and not q.get('qualityError') and clean < TARGET_SECONDS:
         result.update(state='collecting', reason='Collecting unique clean EEG time. Keep the same eyes-open viewing setup.')
     else:

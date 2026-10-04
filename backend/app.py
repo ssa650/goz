@@ -63,8 +63,8 @@ async def json_body(request):
     return value
 
 
-async def multipart(request, allowed, max_files=13):
-    form = await request.form(max_files=max_files, max_fields=8, max_part_size=MAX_PROMPT_BYTES)
+async def multipart(request, allowed, max_files=13, max_fields=8):
+    form = await request.form(max_files=max_files, max_fields=max_fields, max_part_size=MAX_PROMPT_BYTES)
     for name, value in form.multi_items():
         if isinstance(value, UploadFile) and name not in allowed:
             await form.close()

@@ -27,8 +27,14 @@ window.addEventListener('pointermove', e => {
 async function request(path, options) {
   const controller=new AbortController(), timeout=setTimeout(()=>controller.abort(),8000);
   let r;try {r=await fetch(path,{...options,signal:controller.signal});}finally {clearTimeout(timeout);}
-  const value = await r.json();
-  if (!r.ok) throw new Error(value.error || 'Request failed.');
+  const text = await r.text();
+  let value;
+  try { value = JSON.parse(text); }
+  catch {
+    if (!r.ok) throw new Error(text.trim() || `Request failed (${r.status}).`);
+    throw new Error('The server returned an invalid response.');
+  }
+  if (!r.ok) throw new Error(value?.error || value?.detail || `Request failed (${r.status}).`);
   return value;
 }
 const post = (path, body) => request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -270,9 +276,9 @@ function render(st) {
   const eegCalibration = setup?.eegCalibration;
   $('eeg-calibration-progress').value = eegCalibration?.cleanSeconds || 0;
   $('eeg-calibration-status').textContent = eegCalibration ?
-    `${eegCalibration.gazeOnly ? 'Gaze-only selected · ' : ''}${eegCalibration.ready ? 'EEG baseline ready' : eegCalibration.state} · ${eegCalibration.cleanSeconds.toFixed(1)} / 60 unique clean seconds · ${eegCalibration.reason}` : 'EEG calibration status unavailable.';
+    `${eegCalibration.gazeOnly ? 'Gaze-only selected · ' : ''}${eegCalibration.ready ? 'EEG baseline ready' : eegCalibration.calibrationRetained ? 'Calibration saved; signal weak' : eegCalibration.state} · ${eegCalibration.cleanSeconds.toFixed(1)} / 60 unique clean seconds · ${eegCalibration.reason}` : 'EEG calibration status unavailable.';
   $('eeg-calibration-start').hidden = !eegCalibration?.supported;
-  $('eeg-calibration-start').textContent = eegCalibration?.ready ? 'Recalibrate for a different wearer or setup' : 'Start / restart 60-second EEG calibration';
+  $('eeg-calibration-start').textContent = eegCalibration?.calibrationRetained ? 'Recalibrate for a different wearer or setup' : 'Start / restart 60-second EEG calibration';
   $('eeg-calibration-start').disabled = eegCalibrationPending || submitting || s?.status === 'running' || !setup?.muse?.live;
   $('eeg-gaze-only').disabled = eegCalibrationPending || submitting || s?.status === 'running' || !!eegCalibration?.gazeOnly;
   $('gaze-calibration-status').textContent = `Eye calibration: ${setup?.gaze?.calibrationState || 'required'}${setup?.gaze?.failureReason ? ' · '+setup.gaze.failureReason : ''}`;
@@ -285,7 +291,7 @@ function render(st) {
   pill('gaze-source', gz.error ? 'port busy' : gz.source === 'sim' ? 'SIM' : gz.live ? 'gazekit live' : 'no gaze', gz.source === 'sim' ? 'sim' : gz.live ? 'live' : 'off');
   pill('eeg-source', ee.source === 'sim' ? 'SIM' : ['muse', 'mindmonitor'].includes(ee.source) ? (ee.connectionState || (ee.live ? 'streaming' : 'disconnected')).replaceAll('_',' ') : 'off', ee.source === 'sim' ? 'sim' : ee.live ? 'live' : 'off');
   $('eeg-state').textContent = (ee.source === 'mindmonitor' ? `${ee.state} · smoothed α/β ${ee.alphaBetaRatio?.toFixed(2) ?? '—'}` : `${ee.state} · relative β/(α+θ)`) + ` · signal quality ${Math.round(100 * (ee.confidence || 0))}%`;
-  $('eeg-quality').textContent = (!ee.live || !(ee.confidence > 0) ? 'EEG unavailable — gaze-only mode · ' : '') + (ee.qualityError || (ee.selectedChannels?.length ? `Clean channels: ${ee.selectedChannels.join(', ')}${ee.qualityWarning ? ' · '+ee.qualityWarning : ''}` : ee.goodChannels ? `Good channels: ${ee.goodChannels.join(', ')}` : ''));
+  $('eeg-quality').textContent = (ee.calibrationRetained && !ee.signalReady ? 'Calibration saved; EEG cues unavailable · ' : !ee.live || !(ee.confidence > 0) ? 'EEG unavailable — gaze-only mode · ' : '') + (ee.qualityError || (ee.selectedChannels?.length ? `Calibrated channels: ${ee.selectedChannels.join(', ')}${ee.qualityWarning ? ' · '+ee.qualityWarning : ''}` : ee.goodChannels ? `Good channels: ${ee.goodChannels.join(', ')}` : ''));
   $('gaze-hz').textContent = gz.hz ?? '—'; $('blinks').textContent = gz.blinks_per_min ?? '—'; $('yaw').textContent = gz.yaw != null ? Math.round(gz.yaw) : '—';
   const point=currentObservation(gz.point,sessionId,s?.clips[playingIndex]?.id,(Date.now()+clockOffset)/1000);
   const target = point?.valid ? point.target : null, tg = $('gaze-target'); tg.replaceChildren();

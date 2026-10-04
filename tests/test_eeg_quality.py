@@ -85,7 +85,8 @@ def test_clean_channel_selection_reduces_confidence_or_rejects(clock, bad_count,
     replay(feed, clock, 7, bad)
     status = feed.status()
     assert status["confidence"] == confidence
-    assert len(status["selectedChannels"]) == 4 - bad_count
+    assert len(status["availableChannels"]) == 4 - bad_count
+    assert len(status["selectedChannels"]) == (4 - bad_count if bad_count <= 2 else 0)
     assert status["channelQuality"]["TP9"]["railFraction"] == 1
     assert "raw_clip" in status["channelQuality"]["TP9"]["rejectReasons"]
     assert bool(feed.calibration) == (bad_count <= 2)
@@ -94,26 +95,31 @@ def test_clean_channel_selection_reduces_confidence_or_rejects(clock, bad_count,
         assert set(feed.calibration["channels"]) == set(status["selectedChannels"])
 
 
-def test_channel_change_discards_baseline_and_old_usable_response(clock):
+def test_contact_loss_retains_baseline_and_locks_calibrated_channels(clock):
     feed = muse(3)
     replay(feed, clock, 7)
+    baseline = feed.calibration
+    seconds = feed.clean_time.seconds
     assert feed.calibration and any(not row[3] for row in feed.series)
     def bad(x, ts):
         x[:, 0] = 999.51171875
         return x
     replay(feed, clock, 1, bad)
     status = feed.status()
-    assert not feed.calibration and status["cleanSeconds"] < 3
-    assert status["confidence"] == 0 and all(row[3] for row in feed.series)
-    assert status["selectedChannels"] == ["AF7", "AF8", "TP10"]
+    assert feed.calibration is baseline and feed.clean_time.seconds == seconds
+    assert status["calibrationRetained"] and not status["signalReady"]
+    assert status["confidence"] == 0 and feed.latest()[3]
+    assert status["selectedChannels"] == ["TP9", "AF7", "AF8", "TP10"]
+    assert status["availableChannels"] == ["AF7", "AF8", "TP10"]
     replay(feed, clock, 4, bad)
-    assert feed.calibration["channels"] == ["AF7", "AF8", "TP10"]
+    assert feed.calibration is baseline and feed.latest()[3]
     for _ in range(24):  # allow causal filter transients to settle honestly
         replay(feed, clock, .25)
-        if len(feed.selected_channels) == 4:
+        if feed.status()['signalReady']:
             break
     assert len(feed.selected_channels) == 4
-    assert not feed.calibration and all(row[3] for row in feed.series)
+    assert feed.calibration is baseline and feed.status()['signalReady']
+    assert not feed.latest()[3]
 
 
 @pytest.mark.parametrize("value", [0, 999.51171875, -1000])
@@ -158,18 +164,20 @@ def test_conflicting_duplicate_and_mismatched_chunk_fail_closed(clock):
     assert feed.status()["confidence"] == 0
 
 
-def test_single_dropped_sample_invalidates_duration_filter_and_response(clock):
+def test_single_dropped_sample_retains_baseline_but_invalidates_current_response(clock):
     feed = muse()
     replay(feed, clock, 4)
     assert feed.calibration
+    baseline = feed.calibration
     clock[0] += 1 / EEG_RATE
     replay(feed, clock, .25)
     status = feed.status()
-    assert not feed.calibration and not feed.series and status["confidence"] == 0
+    assert feed.calibration is baseline and not feed.series and status["confidence"] == 0
+    assert status['calibrationRetained'] and not status['signalReady']
     assert "sample_gap" in status["rejectReasons"]
     assert status["effectiveHistorySeconds"] == .25
     replay(feed, clock, 4)
-    assert feed.calibration
+    assert feed.calibration is baseline and feed.status()['signalReady']
 
 
 def test_stateful_filter_is_invariant_to_chunk_boundaries_and_has_no_lookahead():

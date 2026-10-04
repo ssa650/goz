@@ -91,12 +91,16 @@ class SensorSetup:
         bridge = self.children.get("muse")
         muse_live = (muse["live"] and bool(latest and not latest[3]) and not muse["qualityError"]
                      and (bridge is None or bridge.returncode is None))
+        retained_muse = (muse["live"] and guided["calibrationRetained"]
+                         and (bridge is None or bridge.returncode is None))
         stream = self.children.get("gaze")
         gaze_alive = stream is not None and stream.returncode is None
         ready = not self.required or (self.phase == "ready" and self.gaze_calibrated and gaze_live and gaze_alive
-                                     and (gaze_only or muse_live and muse["calibrated"]
+                                     and (gaze_only or retained_muse or muse_live and muse["calibrated"]
                                           and (muse.get("source") != "muse" or guided["ready"])))
         message = "Gaze-only selected; EEG pacing is disabled for new runs." if gaze_only else self.message
+        if not gaze_only and retained_muse and not guided['signalReady']:
+            message = "EEG calibration saved; signal weak. Story playback and gaze tracking continue; EEG cues resume with fresh clean signal."
         if self.required and self.phase == "ready" and not ready:
             message = ("Gaze signal lost. Face the camera; retry gaze setup if needed." if gaze_only
                        else "Muse EEG: " + muse["qualityError"] if muse["qualityError"]

@@ -18,6 +18,7 @@ import numpy as np
 
 from .eeg_quality import (CausalEegFilter, MIN_CHANNELS, REASONS, MAX_INTERVAL_S,
                           UniqueCleanTime, channel_diagnostics, muse_metadata)
+from .eeg_policy import MIN_CONFIDENCE
 
 GAZE_PORT = 5590
 EEG_RATE = 256
@@ -131,6 +132,8 @@ class EegFeed:
         self.filter = CausalEegFilter()
         self.clean_time = UniqueCleanTime()
         self.selected_channels = ()
+        self.available_channels = ()
+        self.calibration_identity = None
         self.channel_calibration_samples = []
         self.feature_history = deque(maxlen=self.series.maxlen)
         self.reject_reasons = []
@@ -148,17 +151,40 @@ class EegFeed:
         self.calibration_samples = []
         self.channel_calibration_samples = []
         self.clean_time = UniqueCleanTime()
+        self.selected_channels = ()
+        self.calibration_identity = None
 
-    def _clear_baseline(self):
-        self._reset_feature_baseline()
+    def _clear_current_evidence(self):
+        """A packet gap breaks causal evidence, not the wearer's reference."""
+        self.series.clear()
+        self.feature_history.clear()
+        self.clean_time.pause()
         self.filtered.clear()
         self.filter.reset()
-        self.selected_channels = ()
+        self.available_channels = ()
         self.reject_reasons = []
         self.invalid_until = float("-inf")
         self.raw.clear()
         self.last_eval = 0.0
         self.channel_quality = {}
+
+    def _clear_baseline(self):
+        self._reset_feature_baseline()
+        self._clear_current_evidence()
+
+    def _identity(self):
+        """Contact quality is transient; source, decoding and feature setup are not."""
+        m = self.stream_metadata
+        return (self.source, self.device_id, m.get("sourceId"), m.get("sampleRate"),
+                m.get("units"), tuple(m.get("channelLabels", ())),
+                tuple(m.get("excludedLabels", ())), m.get("valid"),
+                EEG_RATE, EEG_WINDOW_S, ARTIFACT_UV, self.calibration_seconds)
+
+    def _check_identity(self):
+        if self.calibration_identity is not None and self.calibration_identity != self._identity():
+            self._clear_baseline()
+            self.calibration_started = None
+            self.quality_error = "EEG source or calibration setup changed; a fresh baseline is required."
 
     def begin_calibration(self, seconds=60.0):
         with self.lock:
@@ -196,6 +222,7 @@ class EegFeed:
 
     def push(self, samples, stamps):
         with self.lock:
+            self._check_identity()
             if len(samples) != len(stamps):
                 self.input_diagnostics["mismatchedChunks"] += 1
                 self.quality_error = "Mismatched EEG samples and timestamps."
@@ -229,10 +256,16 @@ class EegFeed:
                     self.input_diagnostics["gapCount"] += 1
                     self.input_diagnostics["missingSamples"] += max(1, round(interval * EEG_RATE) - 1)
                     self.input_diagnostics["lastGapSeconds"] = round(interval - 1 / EEG_RATE, 6)
-                    # A dropped packet breaks causal state and all duration evidence.
-                    self._clear_baseline()
-                    self.calibration_started = t
-                    self.quality_error = "EEG sample gap; collecting a fresh baseline."
+                    # Brief packet loss requires fresh causal support. True raw
+                    # silence retains the existing reconnect invalidation policy,
+                    # even if nobody polled status during the interruption.
+                    if interval >= EEG_FRESH_S:
+                        self._clear_baseline()
+                        self.calibration_started = t
+                        self.quality_error = "EEG samples stopped; collecting a fresh baseline."
+                    else:
+                        self._clear_current_evidence()
+                        self.quality_error = "EEG sample gap; waiting for a fresh clean window."
                     self.reject_reasons = ["sample_gap"]
                 if self.device_id and self.calibration is None and self.calibration_started is None:
                     self.calibration_started = t
@@ -256,15 +289,18 @@ class EegFeed:
         filtered = np.array(list(self.filtered)[-n:], dtype=float)
         stamps = np.array([tt for tt, _ in rows])
         self.channel_quality = channel_diagnostics(window, filtered, stamps, ARTIFACT_UV)
-        selected = tuple(i for i, name in enumerate(EEG_CHANNELS) if self.channel_quality[name]["usable"])
-        if selected != self.selected_channels:
-            # A new spatial mixture must never use the old mixture's baseline.
-            self._reset_feature_baseline()
-            self.selected_channels = selected
-            self.calibration_started = t if self.device_id else self.calibration_started
+        available = tuple(i for i, name in enumerate(EEG_CHANNELS) if self.channel_quality[name]["usable"])
+        self.available_channels = available
+        # Lock the reference's channel mixture on the first accepted window.
+        # Contact loss must not substitute a new mixture or erase calibration.
+        selected = self.selected_channels or available
         reasons = []
-        if len(selected) < MIN_CHANNELS:
-            reasons = list(dict.fromkeys(reason for q in self.channel_quality.values() for reason in q["rejectReasons"]))
+        missing = [i for i in selected if i not in available]
+        if missing or len(available) < MIN_CHANNELS:
+            rejected = missing or range(len(EEG_CHANNELS))
+            reasons = list(dict.fromkeys(reason for i in rejected
+                for reason in self.channel_quality[EEG_CHANNELS[i]]["rejectReasons"]))
+        if len(available) < MIN_CHANNELS:
             reasons.append("insufficient_channels")
         if t < self.invalid_until: reasons.append("invalid_input")
         if self.metadata_error: reasons.append("metadata")
@@ -274,7 +310,12 @@ class EegFeed:
         # Unusable rows retain a finite placeholder only for tuple compatibility;
         # artifact=True excludes them from every consumer and from the baseline.
         engagement, z = 0.0, 0.0
-        if not artifact:
+        if artifact:
+            self.clean_time.pause()
+        else:
+            if not self.selected_channels:
+                self.selected_channels = selected
+                self.calibration_identity = self._identity()
             ratios = [band_powers(filtered[:, i:i+1]) for i in selected]
             values = np.array([bp["beta"] / max(bp["alpha"] + bp["theta"], 1e-9) for bp in ratios])
             engagement = float(np.median(values))
@@ -316,6 +357,7 @@ class EegFeed:
     def status(self):
         now = time.time()
         with self.lock:
+            self._check_identity()
             sample_age = None if self.last_sample_at is None else now - self.last_sample_at
             live = bool(sample_age is not None and -0.5 <= sample_age < EEG_FRESH_S)
             if sample_age is not None and sample_age >= EEG_FRESH_S:
@@ -330,6 +372,7 @@ class EegFeed:
                      "poor_signal" if live and self.channel_quality and self.quality_error else "streaming" if live else
                      "stale" if sample_age is not None else "connecting" if self.device_id or self.source == "muse" else "disconnected")
             sampling = ("ready" if usable else "poor_signal" if state == "poor_signal" else
+                        "recovering" if live and self.calibration else
                         "calibrating" if live and recent else "warming_up" if live else
                         "stale" if sample_age is not None else "waiting_for_samples")
             return dict(source=self.source, state=self.connection_error or self.state, live=live, deviceId=self.device_id,
@@ -337,6 +380,7 @@ class EegFeed:
                     connectionState=state, modeLabel="EEG physiological observations available" if confidence else "EEG unavailable — gaze-only mode",
                     interpretation="Exploratory beta/(alpha+theta); not a validated emotion measure; cause and valence unknown",
                     calibrated=bool(self.calibration) and live, qualityError=self.quality_error,
+                    calibrationRetained=bool(self.calibration), signalReady=bool(usable and confidence >= MIN_CONFIDENCE),
                     cleanSeconds=round(min(self.clean_time.seconds, self.calibration_seconds), 3),
                     targetSeconds=self.calibration_seconds, outletAvailable=bool(self.device_id),
                     samplingState=sampling, samplesReceived=self.samples_received,
@@ -344,9 +388,10 @@ class EegFeed:
                     lastSampleAt=self.last_sample_at, sampleAgeSeconds=None if sample_age is None else round(sample_age, 3),
                     channelQuality=dict(self.channel_quality), rejectReasons=list(self.reject_reasons),
                     selectedChannels=[EEG_CHANNELS[i] for i in self.selected_channels],
+                    availableChannels=[EEG_CHANNELS[i] for i in self.available_channels],
                     qualityWarning=(f"{len(self.selected_channels)} of 4 clean channels; reduced confidence" if usable and len(self.selected_channels) < 4 else ""),
-                    channelConfidenceCeiling=round(len(self.selected_channels) / 4, 3),
-                    excludedChannels=[name for i, name in enumerate(EEG_CHANNELS) if i not in self.selected_channels],
+                    channelConfidenceCeiling=round(len(set(self.selected_channels) & set(self.available_channels)) / 4, 3),
+                    excludedChannels=[name for i, name in enumerate(EEG_CHANNELS) if i not in self.available_channels],
                     streamMetadata=dict(self.stream_metadata), inputDiagnostics=dict(self.input_diagnostics),
                     featureWindowSeconds=EEG_WINDOW_S,
                     effectiveHistorySeconds=round(min(EEG_WINDOW_S, self.raw[-1][0] - self.raw[0][0] + 1 / EEG_RATE), 6) if self.raw else 0.0,

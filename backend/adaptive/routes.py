@@ -23,6 +23,10 @@ from ..sensor_setup import SensorSetup
 
 MAX_CHARACTERS = 4
 MAX_OPENING_BYTES = 100 * 1024 * 1024
+# The setup form has 10 text fields; allow the optional scene limit and EEG alias
+# with bounded headroom. Only the two supported opening file fields are allowed.
+MAX_SESSION_FIELDS = 16
+MAX_SESSION_FILES = 2
 
 
 class Sensors:
@@ -193,7 +197,8 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
     async def start(request: Request):
         e, sn = request.app.state.engine, sensors(request)
         sn.setup.require_ready()
-        form = await multipart(request, {"start", "opening"})
+        form = await multipart(request, {"start", "opening"},
+                               max_files=MAX_SESSION_FILES, max_fields=MAX_SESSION_FIELDS)
         try:
             premise = str(form.get("premise", "")).strip()
             if not premise or len(premise) > 2000:
