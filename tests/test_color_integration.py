@@ -62,7 +62,7 @@ async def test_color_pending_worker_does_not_delay_freeze_generation_or_end(tmp_
     s.start_detection(clip,'unused',None,None,15);await entered.wait()
     task=s.detection_by_clip[clip['id']]
     monkeypatch.setattr(s,'start_detection',lambda *a:None)
-    tick(s,clock,0);tick(s,clock,3.5);frozen=deepcopy(clip['frozenEvidence'])
+    tick(s,clock,0);tick(s,clock,5.0);frozen=deepcopy(clip['frozenEvidence'])
     await asyncio.wait_for(s.task,.5)
     assert len(submitted)==1 and not task.done()
     started=time.perf_counter();s.ended(0);assert time.perf_counter()-started<.1

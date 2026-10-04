@@ -33,8 +33,78 @@ func jsonLine(_ value: Any) {
 }
 
 final class Frames: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    // One pending frame plus one pipe write in flight. Never block AVFoundation
+    // on the pipe or enqueue an unbounded history of video buffers.
+    private let lock = NSLock()
+    private let available = DispatchSemaphore(value: 0)
+    private var pending: (Data, [String: Any])?
+    private var sequence: UInt64 = 0
+    private var delivered: UInt64 = 0
+    private var dropped: UInt64 = 0
+    private var replaced: UInt64 = 0
+    private var writeMs: Double = 0
+    private var lastCallbackAt: Double = 0
+    private var writingSince: Double = 0
+
+    override init() {
+        super.init()
+        DispatchQueue(label: "goz.camera.pipe").async { self.writeFrames() }
+    }
+
+    private func writeFrames() {
+        while true {
+            available.wait()
+            lock.lock()
+            guard let (pixels, values) = pending else { lock.unlock(); continue }
+            pending = nil
+            var metadata = values
+            metadata["nativeDelivered"] = delivered
+            metadata["nativeDropped"] = dropped
+            metadata["nativeReplaced"] = replaced
+            metadata["previousWriteMs"] = writeMs
+            writingSince = ProcessInfo.processInfo.systemUptime
+            lock.unlock()
+            guard let json = try? JSONSerialization.data(withJSONObject: metadata) else { continue }
+            var packet = Data()
+            var length = UInt32(json.count).littleEndian
+            withUnsafeBytes(of: &length) { packet.append(contentsOf: $0) }
+            packet.append(json)
+            packet.append(pixels)
+            let start = ProcessInfo.processInfo.systemUptime
+            FileHandle.standardOutput.write(packet)
+            lock.lock()
+            writeMs = (ProcessInfo.processInfo.systemUptime - start) * 1000
+            writingSince = 0
+            lock.unlock()
+        }
+    }
+
+    func diagnostics() -> [String: Any] {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock(); defer { lock.unlock() }
+        return ["nativeDelivered": delivered, "nativeDropped": dropped,
+            "nativeReplaced": replaced, "nativePending": pending == nil ? 0 : 1,
+            "nativeCallbackAgeS": lastCallbackAt == 0 ? -1 : now-lastCallbackAt,
+            "nativeWriteAgeS": writingSince == 0 ? 0 : now-writingSince,
+            "previousWriteMs": writeMs, "nativeHeartbeatAt": Date().timeIntervalSince1970]
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didDrop sample: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        lock.lock(); dropped += 1; lastCallbackAt = ProcessInfo.processInfo.systemUptime; lock.unlock()
+    }
+
     func captureOutput(_ output: AVCaptureOutput, didOutput sample: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
+        let deliveredMono = ProcessInfo.processInfo.systemUptime
+        lock.lock(); lastCallbackAt = deliveredMono; lock.unlock()
+        let deliveredAt = Date().timeIntervalSince1970
+        let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
+        let hostNow = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
+        // AVFoundation video PTS is on the host clock. Preserve acquisition
+        // time rather than retimestamping an old pipe frame as fresh.
+        let age = hostNow - pts
+        guard age.isFinite && age >= -0.1 else { return }
         guard let buffer = CMSampleBufferGetImageBuffer(sample) else { return }
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
@@ -42,16 +112,20 @@ final class Frames: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
         let stride = CVPixelBufferGetBytesPerRow(buffer)
         var data = Data()
-        // Packed BGRA rows; fixed 12-byte little-endian header.
-        for value in [UInt32(width), UInt32(height), UInt32(width * height * 4)] {
-            var little = value.littleEndian
-            withUnsafeBytes(of: &little) { data.append(contentsOf: $0) }
-        }
         for row in 0..<height {
             data.append(base.advanced(by: row * stride).assumingMemoryBound(to: UInt8.self),
                         count: width * 4)
         }
-        FileHandle.standardOutput.write(data)
+        lock.lock()
+        sequence += 1; delivered += 1
+        let signal = pending == nil
+        if !signal { replaced += 1 }
+        pending = (data, ["width": width, "height": height, "length": data.count,
+            "sequence": sequence, "nativePTS": pts,
+            "capturedAt": deliveredAt - age, "capturedMonotonic": deliveredMono - age,
+            "deliveredAt": deliveredAt, "deliveredMonotonic": deliveredMono])
+        lock.unlock()
+        if signal { available.signal() }
     }
 }
 
@@ -108,8 +182,20 @@ session.startRunning()
 guard session.isRunning else { fail("Selected camera failed to start. Reconnect it and retry.") }
 var opened = identity(input.device)
 opened["verified"] = true
+opened["frameProtocol"] = 2
 jsonLine(opened)
 queue.resume()
+// Separate low-volume diagnostic channel continues even if the pixel pipe is
+// blocked. It distinguishes a live callback from capture silence in a stall.
+let heartbeat = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "goz.camera.diagnostics"))
+heartbeat.schedule(deadline: .now(), repeating: .seconds(2))
+heartbeat.setEventHandler {
+    if let data = try? JSONSerialization.data(withJSONObject: frames.diagnostics()) {
+        FileHandle.standardError.write(Data("GOZ_NATIVE_DIAGNOSTICS ".utf8) + data + Data([10]))
+    }
+}
+heartbeat.resume()
 // Closing the parent's stdin ends only this owned capture session.
 _ = FileHandle.standardInput.readDataToEndOfFile()
+heartbeat.cancel()
 session.stopRunning()

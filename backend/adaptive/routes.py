@@ -42,14 +42,30 @@ class Sensors:
         self.setup = SensorSetup(self, directory or "data", demo)
 
     def start_muse_reader(self):
+        if (self.eeg_mode == "muse" and self.muse_thread and self.muse_thread.is_alive()
+                and self.muse_reader_stop and self.muse_reader_stop.is_set()):
+            raise ValueError("Previous Muse reader has not stopped; cannot start a duplicate reader.")
         if self.eeg_mode == "muse" and (not self.muse_thread or not self.muse_thread.is_alive()):
+            with self.eeg.lock:
+                self.eeg.connection_error = None
             self.muse_reader_stop = threading.Event()
             self.muse_thread = threading.Thread(target=run_muse, args=(self.eeg, self.muse_reader_stop), daemon=True)
             self.muse_thread.start()
+
         elif self.eeg_mode == "mindmonitor" and (not self.muse_thread or not self.muse_thread.is_alive()):
-            reader = run_mindmonitor if self.eeg_mode == "mindmonitor" else run_muse
-            self.muse_thread = threading.Thread(target=reader, args=(self.eeg, self.stop_event), daemon=True)
+            self.muse_thread = threading.Thread(target=run_mindmonitor, args=(self.eeg, self.stop_event), daemon=True)
             self.muse_thread.start()
+
+    async def stop_muse_reader(self):
+        if self.eeg_mode != "muse":
+            return True
+        if self.muse_reader_stop:
+            self.muse_reader_stop.set()
+        if self.muse_thread:
+            await asyncio.to_thread(self.muse_thread.join, 2)
+            if self.muse_thread.is_alive():
+                return False  # Retain ownership; a native hang cannot be force-recovered.
+        return True
 
     async def start(self):
         if self.gaze_mode == "gazekit":
@@ -84,11 +100,6 @@ class Sensors:
     async def disconnect_muse(self):
         if self.eeg_mode == "muse":
             await self.setup.disconnect_muse()
-            if self.muse_reader_stop:
-                self.muse_reader_stop.set()
-            if self.muse_thread:
-                await asyncio.to_thread(self.muse_thread.join, 2)
-                self.muse_thread = None
 
     async def close(self):
         self.stop_event.set()
@@ -306,6 +317,10 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
         metadata = clip.get("streamMetadata")
         if clip.get("playbackDelivery") != "stream" or not job or job["status"] != "completed" or not metadata:
             raise ValueError("Completed stream is unavailable.")
+        # Subsequent ranges can use the validated copy without another
+        # provider connection. Already active transfers retain their owner.
+        if clip.get("localMediaStatus") == "validated" and clip.get("path"):
+            return FileResponse(clip["path"],media_type="video/mp4")
         total = metadata["bytes"]
         byte_range = request.headers.get("range")
         start,end = progressive_media.range_bounds(byte_range,total)
@@ -320,7 +335,7 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
             read = 0
             try:
                 async with asyncio.timeout(120):
-                    async for chunk in response.aiter_bytes(chunk_size=65536):
+                    async for chunk in response.aiter_bytes(chunk_size=8192):
                         if s.status == "stopped": return
                         read += len(chunk)
                         if read > end-start+1:
@@ -357,17 +372,44 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
                 raise ValueError("Mapping validity must be a boolean.")
             mapping = dict(valid=mapping["valid"], **{k: str(mapping[k])[:120] if mapping.get(k) is not None else None
                 for k in ("method", "coordinateSpace", "reason")})
-            for key in ("scale", "devicePixelRatio", "screenWidth", "screenHeight"):
+            for key in ("scale", "devicePixelRatio", "screenWidth", "screenHeight", "viewportWidth", "viewportHeight",
+                        "viewportOffsetX", "viewportOffsetY", "viewportScale", "windowX", "windowY", "revision", "samples"):
                 value = body["mapping"].get(key)
-                mapping[key] = number(value, 0, 1e5) if value is not None else None
+                mapping[key] = number(value, -1e5 if key in ("viewportOffsetX","viewportOffsetY","windowX","windowY") else 0, 1e5) if value is not None else None
+            for key in ("fullscreen","gazeOverlayEnabled","boxesOverlayEnabled","recoveryActive"):
+                if key in body["mapping"]:
+                    if type(body["mapping"][key]) is not bool:
+                        raise ValueError("Mapping flags must be booleans.")
+                    mapping[key] = body["mapping"][key]
         if type(body.get("playing")) is not bool:
             raise ValueError("Playing must be a boolean.")
-        session(request).tick(int(number(body.get("clip"), 0, 100)), number(body.get("video_t"), 0, 600),
+        index = int(number(body.get("clip"), 0, 100))
+        accepted = session(request).tick(index, number(body.get("video_t"), 0, 600),
                               body["playing"], rect, number(body.get("wall"), 0, 1e13) / 1000,
                               clip_id=body.get("clip_id"), epoch=int(number(body.get("epoch", 0), 0, 1e10)),
                               playback_rate=number(body.get("playback_rate", 1), .1, 4), visible_rect=visible,
                               mapping=mapping)
-        return {"ok": True}
+        s = session(request)
+        clip = s.clips[index]
+        capture = body.get("tracking_capture")
+        if isinstance(capture,dict):
+            reasons = ("not_attempted","local_or_inactive","invalid_time","inactive_video","no_current_frame",
+                "cors_disabled","cadence","no_dimensions","dimensions_limit","no_context","encode_failed",
+                "encoded","payload_limit","cors_tainted","request_in_flight")
+            reason = capture.get("reason")
+            counters = capture.get("counters")
+            if reason in reasons and isinstance(counters,dict):
+                bounded = {k:min(1_000_000,v) for k,v in counters.items() if k in reasons and type(v) is int and v>=0}
+                clip.setdefault("presentedFrameDiagnostics",dict(counters={}))['capture'] = dict(reason=reason,counters=bounded)
+                s.presented_diagnostic(clip,"capture",reason)
+        frame_accepted = None
+        if body.get("tracking_frame") is not None:
+            frame_accepted = s.offer_tracking_frame(body) if accepted else False
+            if not accepted:
+                s.presented_diagnostic(clip,"route","out_of_order_tick" if accepted is False else "inactive_tick")
+        return {"ok": True, "tickAccepted":bool(accepted), "trackingFrameAccepted":frame_accepted,
+                "clipId":clip["id"], "generationId":clip.get("trackingGenerationId"), "trackingRunId":clip.get("trackingRunId"),
+                "tracking":clip.get("track", [])[-4:]}
 
     @app.post("/api/adaptive/ended")
     async def ended(request: Request):
@@ -431,9 +473,11 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
                 raise ValueError("Invalid transition state.")
             values = {}
             for key, upper in (("elapsedMs", 86_400_000), ("holdMs", 86_400_000), ("videoTime", 3600),
-                               ("readyState", 4), ("networkState", 3), ("mediaErrorCode", 4)):
+                               ("readyState", 4), ("networkState", 3), ("mediaErrorCode", 4), ("bufferedAheadS", 3600)):
                 value = diagnostic.get(key)
                 values[key] = number(value, 0, upper) if value is not None else None
+            if diagnostic.get("delivery") in ("original","validated_local"):
+                values["delivery"] = diagnostic["delivery"]
             error_name = diagnostic.get("errorName")
             if error_name is not None and (not isinstance(error_name, str) or len(error_name) > 80 or not error_name.isidentifier()):
                 raise ValueError("Invalid media error name.")

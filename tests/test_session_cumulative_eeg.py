@@ -37,23 +37,23 @@ async def test_sustained_prior_history_reaches_next_prompt_without_delaying_gaze
     origin=s.started
     for scene,value in ((0,0.),(1,z)):
         clip=s.clips[scene]
-        start=origin+16*scene
+        start=origin+15*scene
         for i in range(61):
             clock[0]=start+i*.25
             s.eeg.series.append((clock[0],.6,value,False))
             s.tick(scene,i*.25,True,{},clock[0],clip_id=clip['id'])
-            if i==14:
+            if i==20:
                 await asyncio.wait_for(s.task,5)
                 policy=submitted[-1][0]['engagementDecision']['eeg_policy']
                 assert not policy['eligible'] and policy['action']=='keep'
                 assert 'EEG DELIVERY TRIAL' not in submitted[-1][0]['prompt']
-                assert submitted[-1][0]['observationMs']==3500
+                assert submitted[-1][0]['observationMs']==5000
                 frozen=deepcopy(clip['frozenEvidence']['eegPolicy'])
         assert clip['frozenEvidence']['eegPolicy']==frozen
         s.ended(scene)
     third=s.clips[2]
-    start=origin+32
-    for i in range(15):
+    start=origin+30
+    for i in range(21):
         clock[0]=start+i*.25
         s.eeg.series.append((clock[0],.6,z,False))
         s.tick(2,i*.25,True,{},clock[0],clip_id=third['id'])
@@ -66,7 +66,7 @@ async def test_sustained_prior_history_reaches_next_prompt_without_delaying_gaze
     assert policy['reference_coverage_s']>=12
     assert policy['coverage']['current_fraction']>=.8
     assert cue in submitted[-1][0]['prompt']
-    assert submitted[-1][0]['observationMs']==3500 and len(submitted)==3
+    assert submitted[-1][0]['observationMs']==5000 and len(submitted)==3
     if channel_mode == 'two_clean':
         assert policy['confidence'] == policy['confidence_threshold'] == .5
         await engine.trace_journal.flush()
@@ -77,9 +77,9 @@ async def test_sustained_prior_history_reaches_next_prompt_without_delaying_gaze
         assert eligible[-1]['channel_coverage'] == eligible[-1]['confidence_threshold'] == .5
         assert eligible[-1]['reduced_redundancy'] and eligible[-1]['channel_eligibility_reason']
         assert eligible[-1]['coverage']['prior_clean_s'] >= 12
-    clock[0]=start+4
+    clock[0]=start+5.5
     s.eeg.series.append((clock[0],.6,-z,False))
-    s.tick(2,4,True,{},clock[0],clip_id=third['id'])
+    s.tick(2,5.5,True,{},clock[0],clip_id=third['id'])
     assert third['frozenEvidence']['eegPolicy']==frozen3
     await tracking_diagnostics.for_clip(s,third).flush()
     logs=tracking_diagnostics.read(tmp_path,s.id)

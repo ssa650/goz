@@ -6,6 +6,7 @@ from pathlib import Path
 import struct
 import sys
 import threading
+import time
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
@@ -17,7 +18,18 @@ from test_sensor_setup import sensors
 
 
 PHONE = dict(index=7, name="iPhone Camera", deviceId="phone-uid")
-OPENED = dict(name="Shayan's iPhone Camera", deviceId="phone-uid", verified=True, backend="avfoundation-uid")
+OPENED = dict(name="Shayan's iPhone Camera", deviceId="phone-uid", verified=True, backend="avfoundation-uid", frameProtocol=2)
+
+
+def frame_packet(pixels, sequence=1, **changes):
+    now, mono = time.time(), time.monotonic()
+    metadata = dict(width=2, height=1, length=len(pixels), sequence=sequence,
+                    capturedAt=now-.03, capturedMonotonic=mono-.03,
+                    deliveredAt=now, deliveredMonotonic=mono,
+                    nativeDelivered=sequence, nativeDropped=0, nativeReplaced=0, previousWriteMs=0.)
+    metadata.update(changes)
+    encoded = json.dumps(metadata).encode()
+    return struct.pack("<I", len(encoded)) + encoded + pixels
 
 
 @pytest.fixture(autouse=True)
@@ -50,7 +62,7 @@ def fake_capture(monkeypatch, opened=OPENED, packets=b""):
 
 def test_uid_capture_ignores_index_and_decodes_native_frame(monkeypatch):
     pixels = bytes([11, 22, 33, 255, 44, 55, 66, 255])
-    process, calls = fake_capture(monkeypatch, packets=struct.pack("<III", 2, 1, len(pixels)) + pixels)
+    process, calls = fake_capture(monkeypatch, packets=frame_packet(pixels))
     cap = native.NativeCapture(PHONE)
     try:
         assert calls == [["fake-helper", "capture", "phone-uid"]]
@@ -85,6 +97,8 @@ def test_native_disconnect_and_no_frames_are_explicit_errors(monkeypatch):
     cap.error, cap.closed, cap.last_frame = None, False, 0
     import queue
     cap.packets = queue.Queue()
+    cap._stats_lock = threading.Lock()
+    cap._stats = dict(readTimeouts=0)
     with pytest.raises(ValueError, match="no frames.*no fallback"):
         cap.read()
 

@@ -511,7 +511,16 @@ async def test_gazekit_screen_coordinates_arrive_in_goz_over_udp():
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
             sender.sendto(json.dumps(sample).encode(), feed.transport.get_extra_info('sockname'))
         await asyncio.wait_for(receive(), 1)
-        assert feed.latest() == sample
+        received = feed.latest()
+        assert {key: received[key] for key in sample} == sample
+        assert set(received) == set(sample) | {'receivedAt', 'receiptDiagnostics'}
+        assert math.isfinite(received['receivedAt']) and sample['t'] <= received['receivedAt'] <= time.time()
+        receipt = received['receiptDiagnostics']
+        assert isinstance(receipt, dict) and set(receipt) == set(feed.status()['inputDiagnostics'])
+        assert all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                   and math.isfinite(value) and value >= 0 for value in receipt.values())
+        assert (receipt['packets'], receipt['accepted'], receipt['rejected']) == (1, 1, 0)
+        assert receipt['captureToReceiptMsMax'] == pytest.approx((received['receivedAt']-sample['t'])*1000)
         assert feed.status()['live'] and feed.status()['source'] == 'gazekit'
     finally:
         feed.close()

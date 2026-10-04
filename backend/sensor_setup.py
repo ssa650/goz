@@ -13,6 +13,7 @@ import shlex
 
 from .fal_adapter import FalError
 from .adaptive.eeg_calibration import calibration_status
+from .muse_diagnostics import MuseDiagnostics, producer_observation
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -48,6 +49,66 @@ class SensorSetup:
         self.manual_muse_state = "disconnected"
         self.manual_muse_error = None
         self.manual_muse_generation = 0
+        self.muse_intent = False
+        self.muse_owner = None
+        self.muse_retry_count = 0
+        self.muse_retry_limit = 3
+        self.muse_reason = None
+        self.muse_exit = None
+        self.muse_exit_task = None
+        self.muse_stop_reason = None
+        self.muse_retry_at = None
+        self.muse_last_loss = None
+        self.muse_observation = None
+        self.muse_lock = asyncio.Lock()
+        self.muse_diagnostics = MuseDiagnostics(self.directory)
+        if hasattr(self.sensors.eeg, "muse_diagnostic_sink"):
+            self.sensors.eeg.muse_diagnostic_sink = self.muse_diagnostics.record
+
+    def muse_connection(self, eeg=None):
+        eeg = eeg or self.sensors.eeg.status()
+        bridge = self.children.get("muse")
+        alive = bridge is not None and bridge.returncode is None
+        state = ("disconnected" if not self.muse_intent else
+                 "error" if self.manual_muse_state == "error" else
+                 "connected" if eeg["live"] and (self.muse_owner == "external" or alive) else
+                 "connecting")
+        reason = self.muse_reason
+        if self.muse_intent and not eeg["live"] and reason is None:
+            reason = "silent_outlet" if eeg.get("outletAvailable") else "no_outlet"
+        if self.muse_intent and bridge is not None and bridge.returncode is not None and self.muse_owner != "external":
+            reason = "producer_exited"
+            if state == "connected": state = "connecting"
+        exhausted = state == 'error' and self.muse_retry_count >= self.muse_retry_limit
+        retry_in = max(0, round(self.muse_retry_at - time.time(), 1)) if self.muse_retry_at else None
+        description = {'producer_exited': 'Muse producer exited', 'silent_outlet': 'Muse outlet has no fresh samples',
+                       'no_outlet': 'Muse LSL outlet is unavailable', 'clock_unavailable': 'Muse clock synchronization is unavailable',
+                       'reader_error': 'Muse reader reported an error', 'reader_stop_timeout': 'Muse reader did not stop; replacement is blocked',
+                       'producer_stop_timeout': 'Muse producer did not stop; replacement is blocked'}.get(reason, 'Waiting for Muse samples')
+        if state == 'connected':
+            message = 'Muse samples are live.'
+        elif state == 'disconnected':
+            message = 'Muse disconnected by request. Choose Connect to start.'
+        else:
+            message = description + '. Underlying Bluetooth cause is unknown.'
+            if self.muse_observation and self.muse_observation['category'] == 'discovery_empty':
+                message += ' The producer scan reported no Muses found.'
+            if retry_in is not None:
+                message += f' Retry {self.muse_retry_count}/{self.muse_retry_limit} in {retry_in:g}s.'
+            elif exhausted:
+                message += ' Automatic recovery budget exhausted. Check the headband, then choose Connect to retry.'
+            elif state == 'error':
+                message += ' Review the diagnostic reason before choosing Connect again.'
+            else:
+                message += f' Recovery {self.muse_retry_count}/{self.muse_retry_limit}; waiting for fresh samples.'
+        return dict(state=state, error=self.manual_muse_error, connectIntent=self.muse_intent,
+                    ownership=self.muse_owner, producerAlive=alive, producerPid=getattr(bridge, "pid", None),
+                    reason=reason, retryCount=self.muse_retry_count, retryLimit=self.muse_retry_limit,
+                    retryRemaining=max(0, self.muse_retry_limit-self.muse_retry_count), recoveryExhausted=exhausted,
+                    nextRetryAt=self.muse_retry_at, retryInSeconds=retry_in, message=message[:500],
+                    lastLoss=self.muse_last_loss, lastProducerObservation=self.muse_observation, bluetoothCause='unknown',
+                    exit=self.muse_exit, lastSampleAt=eeg.get("acquisitionDiagnostics", {}).get("lastSampleAt"),
+                    diagnostics=self.muse_diagnostics.snapshot())
 
     def saved_gaze(self):
         if not self.saved_gaze_path.exists():
@@ -111,7 +172,7 @@ class SensorSetup:
         return dict(required=self.required, enabled=self.enabled, eegMode=self.sensors.eeg_mode, generationReady=bool(ready), phase=self.phase,
                     message=message, error=self.error, canRetry=self.enabled and (self.phase == "failed" or self.phase == "ready" and (not gaze_live or self.required and not ready)),
                     gazeOnly=gaze_only, eegCalibration=dict(guided,gazeOnly=gaze_only),
-                    museConnection=dict(state=self.manual_muse_state, error=self.manual_muse_error),
+                    museConnection=self.muse_connection(muse),
                     camera=dict(source=self.selected_camera, **self.camera_details),
                     muse=muse, gaze=dict(**gaze.status(), calibrated=self.gaze_calibrated,
                                         valid=gaze_live, report=self.gaze_report,
@@ -168,6 +229,8 @@ class SensorSetup:
         return " ".join(self.logs.get(name, [])[-4:])[-700:]
 
     async def launch(self, name, argv, cwd):
+        if name == "muse":
+            return await self._launch_muse(argv, cwd)
         if name in self.children and self.children[name].returncode is None:
             raise ValueError(f"{name} is already running.")
         env = {k:v for k,v in os.environ.items() if k not in ("FAL_KEY", "FAL_API_KEY", "OPENAI_API_KEY")}
@@ -329,79 +392,276 @@ class SensorSetup:
             self.set_phase("failed", "Sensor setup failed. Correct the issue, then retry setup.")
             await self.stop_children(keep_muse=True)
 
+    async def _launch_muse(self, argv, cwd):
+        """Own only children created here, with bounded pipes and an exit observer."""
+        if not self.muse_intent or self.stopping:
+            raise ValueError("Muse connect intent was cancelled.")
+        current = self.children.get("muse")
+        if current is not None and current.returncode is None:
+            raise ValueError("Muse bridge is already running; replacement is blocked.")
+        env = {k: v for k, v in os.environ.items()
+               if not any(word in k.upper() for word in ("KEY", "TOKEN", "SECRET", "PASSWORD"))}
+        env["PYTHONPATH"] = str(ROOT)
+        spawning = asyncio.create_task(self.spawn(*map(str, argv), cwd=str(cwd), env=env,
+                                      stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                                      start_new_session=True))
+        cancelled = False
+        try:
+            child = await asyncio.shield(spawning)
+        except asyncio.CancelledError:
+            child = await spawning
+            cancelled = True  # Register a child created during cancellation.
+        self.children["muse"] = child
+        self.muse_owner = "owned"
+        self.logs["muse"] = []
+        self.muse_exit = None
+        self.muse_stop_reason = None
+        self.muse_observation = None
+        self.muse_diagnostics.record("producer_started", pid=child.pid, generation=self.manual_muse_generation)
+
+        async def read_pipe(pipe, stream):
+            if pipe is None: return
+            def record_line(line):
+                raw = line.decode(errors="replace").strip()
+                value = self.muse_diagnostics.safe_text(raw)
+                self.logs["muse"].append(value)
+                self.logs["muse"] = self.logs["muse"][-20:]
+                self.muse_diagnostics.record("producer_output", pid=child.pid, stream=stream, text=value)
+                if category := producer_observation(raw):
+                    self.muse_observation = dict(at=time.time(), pid=child.pid, category=category)
+                    self.muse_diagnostics.record('producer_observation', **self.muse_observation, stream=stream)
+            pending = b""
+            while chunk := await pipe.read(1024):
+                pending += chunk
+                while b"\n" in pending or len(pending) >= 1024:
+                    if b"\n" in pending:
+                        line, pending = pending.split(b"\n", 1)
+                    else:
+                        line, pending = pending[:1024], pending[1024:]
+                    record_line(line)
+            if pending:
+                record_line(pending)
+
+        async def drain():
+            await asyncio.gather(read_pipe(child.stdout, "stdout"), read_pipe(getattr(child, "stderr", None), "stderr"))
+        reader = self.readers["muse"] = asyncio.create_task(drain())
+
+        async def observe_exit():
+            code = await child.wait()
+            reason = self.muse_stop_reason or ("disconnect" if not self.muse_intent else "producer_exited")
+            exit_info = dict(at=time.time(), pid=child.pid, code=code, reason=reason)
+            if self.children.get("muse") is child:
+                self.muse_exit = exit_info
+            self.muse_diagnostics.record("producer_exit", **exit_info)
+            try:
+                await asyncio.wait_for(asyncio.shield(reader), 1)
+            except TimeoutError:
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
+        self.muse_exit_task = asyncio.create_task(observe_exit())
+        if cancelled: raise asyncio.CancelledError
+        return child
+
+    async def _stop_owned_muse(self, reason):
+        child = self.children.get("muse")
+        if child is None: return True
+        if child.returncode is None:
+            self.muse_stop_reason = reason
+            self.muse_diagnostics.record("producer_stop_requested", pid=child.pid, reason=reason)
+            try: os.killpg(child.pid, signal.SIGTERM)
+            except ProcessLookupError: pass
+            try:
+                await asyncio.wait_for(child.wait(), 3)
+            except TimeoutError:
+                self.muse_reason = "producer_stop_timeout"
+                self.manual_muse_error = "Owned Muse bridge did not stop cooperatively; replacement is blocked."
+                self.muse_diagnostics.record("recovery_blocked", reason=self.muse_reason)
+                return False
+        if self.muse_exit_task: await self.muse_exit_task
+        reader = self.readers.pop("muse", None)
+        if reader and not reader.done():
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+        if self.children.get("muse") is child: self.children.pop("muse", None)
+        return True
+
     async def connect_muse(self):
-        """Start Muse discovery only after an explicit user request."""
-        if self.sensors.eeg_mode != "muse":
+        """One supervisor and bounded retry budget per explicit Connect intent."""
+        if getattr(self.sensors, "eeg_mode", None) != "muse":
             raise FalError("Muse controls require GOZ_EEG=muse.", 409)
-        if self.manual_muse_state in ("connecting", "connected"):
-            return
-        self.manual_muse_generation += 1
-        generation = self.manual_muse_generation
-        self.manual_muse_error = None
-        self.manual_muse_state = "connecting"
-        self.sensors.start_muse_reader()
-        self.muse_task = asyncio.create_task(self._connect_muse(generation))
+        async with self.muse_lock:
+            if self.muse_intent and self.muse_task and not self.muse_task.done(): return
+            self.manual_muse_generation += 1
+            self.muse_intent = True
+            self.manual_muse_error = self.muse_reason = None
+            self.muse_retry_at = None
+            self.muse_retry_count = 0
+            self.manual_muse_state = "connecting"
+            self.muse_diagnostics.record("connect_requested", generation=self.manual_muse_generation)
+            try:
+                self.sensors.start_muse_reader()
+            except ValueError as error:
+                self.manual_muse_state = "error"
+                self.manual_muse_error = str(error)
+                self.muse_reason = "reader_stop_timeout"
+                self.muse_diagnostics.record("recovery_blocked", reason=self.muse_reason)
+                return
+            self.muse_task = asyncio.create_task(self._connect_muse(self.manual_muse_generation))
 
     async def _connect_muse(self, generation):
+        """Continue supervising producer/outlet/sample health after calibration."""
+        def active():
+            return self.muse_intent and generation == self.manual_muse_generation and not self.stopping
+
+        async def probe():
+            deadline = time.monotonic() + 4
+            while active() and not self.sensors.eeg.device_id and time.monotonic() < deadline:
+                if self.sensors.eeg.connection_error:
+                    self.muse_reason = "reader_error"
+                    raise ValueError(self.sensors.eeg.connection_error)
+                await asyncio.sleep(.25)
+            return active() and bool(self.sensors.eeg.device_id)
+
+        async def restart_reader():
+            stop_reader = getattr(self.sensors, "stop_muse_reader", None)
+            if stop_reader and not await stop_reader():
+                self.muse_reason = "reader_stop_timeout"
+                raise ValueError("Muse reader did not stop cooperatively; replacement is blocked.")
+            self.sensors.eeg.disconnected()
+            self.sensors.start_muse_reader()
+
         try:
-            try:
-                await self.wait_for(lambda: bool(self.sensors.eeg.device_id), 4)
-            except ValueError:
-                argv = [sys.executable, "-u", "-m", "muselsl", "stream", "--backend", "bleak", "--model", "legacy", "--lsltime", "--retries", "2"]
-                for option, env_name in (("--address", "GOZ_MUSE_ADDRESS"), ("--name", "GOZ_MUSE_NAME")):
-                    if os.getenv(env_name): argv += [option, os.environ[env_name]]
+            bridge = self.children.get("muse")
+            if bridge is None or bridge.returncode is not None:
+                if bridge is not None:
+                    await self._stop_owned_muse("previous_exit")
+                    await restart_reader()
+                if await probe():
+                    self.muse_owner = "external"
+                    self.muse_diagnostics.record("external_outlet_reused")
+                elif active():
+                    await self._stop_owned_muse("previous_exit")
+                    await self.launch("muse", self._muse_argv(), ROOT)
+            else:
+                self.muse_owner = "owned"
+            deadline = time.monotonic() + 90
+            last_sample = saved_calibration = None
+            while active():
+                eeg = self.sensors.eeg.status()
+                if self.sensors.eeg.connection_error:
+                    self.muse_reason = "reader_error"
+                    raise ValueError(self.sensors.eeg.connection_error)
                 bridge = self.children.get("muse")
-                if bridge is None or bridge.returncode is not None:
-                    bridge = await self.launch("muse", argv, ROOT)
-                await self.wait_for(lambda: bool(self.sensors.eeg.device_id), 90, bridge)
-            if generation != self.manual_muse_generation:
-                return
-            self.sensors.eeg.begin_calibration()
-            await self.wait_for(lambda: self.sensors.eeg.status()["calibrated"], 240, self.children.get("muse"))
-            if generation != self.manual_muse_generation:
-                return
-            if self.attempt_dir:
-                (self.attempt_dir / "muse.json").write_text(json.dumps(self.sensors.eeg.calibration, indent=2))
-                (self.attempt_dir / "muse.json").chmod(0o600)
-            self.set_phase("ready", "Muse and gaze are ready. You can generate your video.")
-            self.manual_muse_state = "connected"
+                producer_exited = self.muse_owner == "owned" and (bridge is None or bridge.returncode is not None)
+                if eeg["live"] and not producer_exited:
+                    if self.manual_muse_state != 'connected' and self.muse_last_loss:
+                        self.muse_diagnostics.record('recovery_restored', generation=generation,
+                                                     ownership=self.muse_owner, attempt=self.muse_retry_count,
+                                                     lastSampleAt=eeg['lastSampleAt'])
+                    self.manual_muse_state = "connected"
+                    self.manual_muse_error = self.muse_reason = None
+                    deadline = time.monotonic() + 15
+                    stamp = eeg["lastSampleAt"]
+                    if stamp != last_sample:
+                        last_sample = stamp
+                        self.muse_diagnostics.record("sample_progress", lastSampleAt=stamp, samplesReceived=eeg["samplesReceived"])
+                    calibration = self.sensors.eeg.calibration
+                    if calibration is not None and calibration is not saved_calibration:
+                        saved_calibration = calibration
+                        if self.attempt_dir:
+                            path = self.attempt_dir / "muse.json"
+                            path.write_text(json.dumps(calibration, indent=2))
+                            path.chmod(0o600)
+                else:
+                    self.manual_muse_state = "connecting"
+                    self.muse_reason = ("producer_exited" if producer_exited else
+                                        "clock_unavailable" if eeg["acquisitionPhase"] in ("synchronizing_clock", "waiting_for_clock") else
+                                        "silent_outlet" if eeg["outletAvailable"] or (eeg.get("acquisitionDiagnostics", {}).get("lastInterruption") or {}).get("reason") == "silent_outlet" else
+                                        "no_outlet")
+                    if producer_exited or time.monotonic() >= deadline:
+                        reason = self.muse_reason
+                        self.muse_last_loss = self.muse_diagnostics.safe_value(dict(at=time.time(), reason=reason,
+                            lastSampleAt=eeg.get('acquisitionDiagnostics', {}).get('lastSampleAt'),
+                            readerInterruption=eeg.get('acquisitionDiagnostics', {}).get('lastInterruption'),
+                            producerExit=self.muse_exit, producerObservation=self.muse_observation,
+                            ownership=self.muse_owner, acquisitionPhase=eeg['acquisitionPhase'],
+                            outletAvailable=eeg['outletAvailable']))
+                        self.muse_diagnostics.record("recovery_needed", **self.muse_last_loss,
+                                                     generation=generation, attempt=self.muse_retry_count)
+                        if self.muse_retry_count >= self.muse_retry_limit or reason == "clock_unavailable":
+                            raise ValueError("Muse recovery budget exhausted." if reason != "clock_unavailable" else
+                                             "Muse clock synchronization unavailable; reader retains the same inlet.")
+                        self.muse_retry_count += 1
+                        self.muse_retry_at = time.time() + 2 ** self.muse_retry_count
+                        self.muse_diagnostics.record("recovery_backoff", reason=reason, attempt=self.muse_retry_count,
+                                                     seconds=2 ** self.muse_retry_count, nextRetryAt=self.muse_retry_at,
+                                                     generation=generation, ownership=self.muse_owner)
+                        await asyncio.sleep(2 ** self.muse_retry_count)
+                        self.muse_retry_at = None
+                        if not active(): return
+                        if self.muse_owner == "external":
+                            self.sensors.start_muse_reader()  # Never take over an external bridge.
+                        else:
+                            if not await self._stop_owned_muse(reason):
+                                raise ValueError(self.manual_muse_error)
+                            await restart_reader()
+                            if await probe():
+                                self.muse_owner = "external"
+                            elif active():
+                                self.sensors.start_muse_reader()
+                                await self.launch("muse", self._muse_argv(), ROOT)
+                        deadline = time.monotonic() + 90
+                await asyncio.sleep(1)
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            if generation != self.manual_muse_generation:
-                return
-            self.manual_muse_state = "error"
-            self.manual_muse_error = str(error)[:500]
-            self.sensors.eeg.state = f"Muse connection error: {error}. Gaze-only mode remains available."
-            self.sensors.eeg.connection_error = self.sensors.eeg.state
+            if active():
+                self.manual_muse_state = "error"
+                self.manual_muse_error = self.muse_diagnostics.safe_text(error)
+                self.muse_diagnostics.record("supervisor_error", reason=self.muse_reason or "connection_error",
+                                             detail=self.manual_muse_error)
+                # Exhaustion ends retries. A clock-only failure keeps the same
+                # estimator/inlet alive, with its unavailable status visible.
+                if self.muse_reason != "clock_unavailable":
+                    stop_reader = getattr(self.sensors, "stop_muse_reader", None)
+                    if stop_reader and not await stop_reader():
+                        self.muse_diagnostics.record("recovery_blocked", reason="reader_stop_timeout")
+        finally:
+            self.muse_retry_at = None
+            self.muse_diagnostics.record("supervisor_stopped", generation=generation, connectIntent=self.muse_intent)
+
+    @staticmethod
+    def _muse_argv():
+        argv = [sys.executable, "-u", "-m", "muselsl", "stream", "--backend", "bleak", "--model", "legacy", "--lsltime", "--retries", "2"]
+        for option, env_name in (("--address", "GOZ_MUSE_ADDRESS"), ("--name", "GOZ_MUSE_NAME")):
+            if os.getenv(env_name): argv += [option, os.environ[env_name]]
+        return argv
 
     async def disconnect_muse(self):
-        """Stop only the bridge process launched and owned by this setup."""
-        self.manual_muse_generation += 1
-        if self.muse_task and not self.muse_task.done():
-            self.muse_task.cancel()
-            await asyncio.gather(self.muse_task, return_exceptions=True)
-        bridge = self.children.get("muse")
-        if bridge is not None and bridge.returncode is None:
-            try: os.killpg(bridge.pid, signal.SIGTERM)
-            except ProcessLookupError: pass
-            try: await asyncio.wait_for(bridge.wait(), 3)
-            except TimeoutError:
-                try: os.killpg(bridge.pid, signal.SIGKILL)
-                except ProcessLookupError: pass
-                await bridge.wait()
-            reader = self.readers.pop("muse", None)
-            if reader and not reader.done():
-                reader.cancel()
-                await asyncio.gather(reader, return_exceptions=True)
-            self.children.pop("muse", None)
-        self.sensors.eeg.disconnected()
-        self.manual_muse_state = "disconnected"
-        self.manual_muse_error = None
+        """Cancel intent/retries first; cooperatively stop only owned workers."""
+        async with self.muse_lock:
+            self.muse_intent = False
+            self.manual_muse_generation += 1
+            self.manual_muse_state = "disconnected"
+            self.manual_muse_error = None
+            self.muse_reason = "disconnect"
+            self.muse_diagnostics.record("disconnect_requested", generation=self.manual_muse_generation)
+            if self.muse_task and not self.muse_task.done():
+                self.muse_task.cancel()
+                await asyncio.gather(self.muse_task, return_exceptions=True)
+            stop_reader = getattr(self.sensors, "stop_muse_reader", None)
+            if stop_reader and not await stop_reader():
+                self.muse_reason = "reader_stop_timeout"
+                self.manual_muse_error = "Muse reader did not stop cooperatively; duplicate reader is blocked."
+                self.muse_diagnostics.record("recovery_blocked", reason=self.muse_reason)
+            await self._stop_owned_muse("disconnect")
+            self.sensors.eeg.disconnected()
 
     async def stop_children(self, keep_muse=False):
+        if not keep_muse:
+            await self._stop_owned_muse("setup_close")
         targets = {name: child for name, child in self.children.items()
-                   if not (keep_muse and name == "muse" and child.returncode is None)}
+                   if name != "muse"}
         for child in targets.values():
             if child.returncode is None:
                 try: os.killpg(child.pid, signal.SIGTERM)
@@ -424,14 +684,15 @@ class SensorSetup:
     async def retry(self):
         if self.task and not self.task.done():
             raise FalError("Sensor setup is already running.", 409)
-        if self.muse_task and not self.muse_task.done():
+        if not self.muse_intent and self.muse_task and not self.muse_task.done():
             self.muse_task.cancel()
             await asyncio.gather(self.muse_task, return_exceptions=True)
         bridge = self.children.get("muse")
         if bridge is not None and bridge.returncode is not None:
             self.sensors.eeg.disconnected()
         await self.stop_children(keep_muse=True)
-        self.sensors.eeg.reset_calibration()
+        if getattr(self.sensors, "eeg_mode", None) != "muse":
+            self.sensors.eeg.reset_calibration()
         self.selected_camera = None
         self.camera_details = {}
         self.set_phase("waiting", "Retrying sensor setup…")
@@ -491,6 +752,8 @@ class SensorSetup:
 
     async def close(self):
         self.stopping = True
+        if getattr(self.sensors, "eeg_mode", None) == "muse":
+            await self.disconnect_muse()
         if self.task and not self.task.done():
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)

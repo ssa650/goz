@@ -84,7 +84,8 @@ def create(session, clip, source=None):
              storedClipId=safe_id((clip.get("bundle") or {}).get("id")), firstFrame=None, endFrame=None, settings=None),
         timing=dict(frozenAt=frozen.get("frozenAt"), submitAttemptAt=None, submittedAt=None, readyAt=None,
                     freezeToAttemptMs=None, freezeToSubmitMs=None, freezeToReadyMs=None,
-                    freezeWorkMs=frozen.get("freezeWorkMs"), trackingAtFreeze=frozen.get("trackingTiming"))), (secret,))
+                    freezeWorkMs=frozen.get("freezeWorkMs"), trackingAtFreeze=frozen.get("trackingTiming"),
+                    gazeInputAtFreeze=frozen.get("gazeInputDiagnostics"))), (secret,))
 
 
 def attempted(job, payload, at, key=None):

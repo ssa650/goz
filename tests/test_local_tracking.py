@@ -186,7 +186,7 @@ async def test_florence_retained_with_full_clip_local_progress_and_late_cloud(tm
     s.tracker='fal'
     entered,release=asyncio.Event(),asyncio.Event()
     async def cloud(*args,**kwargs):
-        assert kwargs['observation_seconds']==3.5
+        assert kwargs['observation_seconds']==5.0
         entered.set();await release.wait()
         return [dict(t=0,boxes={'Bea':[.6,.1,.9,.9]},valid_until=.8)]
     async def local(*args,**kwargs):
@@ -216,7 +216,7 @@ async def test_pending_full_tracker_does_not_gate_freeze_generation_or_clip_end(
     await entered.wait()
     task=s.detection_by_clip[clip['id']]
     monkeypatch.setattr(s,'start_detection',lambda *a:None)
-    tick(s,clock,0);tick(s,clock,3.5)
+    tick(s,clock,0);tick(s,clock,5.0)
     frozen=deepcopy(clip['frozenEvidence'])
     await asyncio.wait_for(s.task,.5)
     assert len(submitted)==1 and s.clips[1]['status']=='ready' and not task.done()
@@ -307,7 +307,7 @@ async def test_session_supplies_frozen_quality_window_to_policy_without_waiting(
         calls.append(deepcopy(kwargs))
         return original(*args,**kwargs)
     monkeypatch.setattr(fusion,'analyze',analyze)
-    tick(s,clock,0);tick(s,clock,3.5)
+    tick(s,clock,0);tick(s,clock,5.0)
     frozen=deepcopy(clip['frozenEvidence'])
     await asyncio.wait_for(s.task,.5)
     assert calls[0]['eeg_quality']==frozen['quality']

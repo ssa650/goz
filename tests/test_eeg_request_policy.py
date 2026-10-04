@@ -154,9 +154,9 @@ async def test_frozen_eeg_reaches_exact_mocked_request_at_playback_deadline(tmp_
         s.story.update(premise=BASE, characters=[dict(name=n) for n in NAMES])
         boxes={"SpongeBob":[.05,.15,.4,.9], "Patrick":[.6,.15,.95,.9]}
         clip["track"]=[dict(t=i/8,valid_until=(i+1)/8,boxes=boxes,
-            session_id=s.id,clip_id="source") for i in range(29)]
+            session_id=s.id,clip_id="source") for i in range(41)]
         s.eeg.source="muse"
-        s.eeg.series.extend((s.started+i*.25,.6,z,False) for i in range(15))
+        s.eeg.series.extend((s.started+i*.25,.6,z,False) for i in range(21))
         monkeypatch.setattr(s.eeg, "status", lambda: quality())
         async def generate(job, images):
             job["seed"]=42
@@ -165,7 +165,7 @@ async def test_frozen_eeg_reaches_exact_mocked_request_at_playback_deadline(tmp_
             payloads.append(payload)
             job.update(status="completed",apiStartedAt=time.time()*1000)
         monkeypatch.setattr(engine,"run_job",generate)
-        for i in range(71):
+        for i in range(101):
             clock[0]=s.started+i/20
             s.gaze.add(dict(t=clock[0],x=75,y=50,valid=True,face=True,confidence=.9,yaw=0))
             tick(s,clock,i/20)
@@ -174,8 +174,8 @@ async def test_frozen_eeg_reaches_exact_mocked_request_at_playback_deadline(tmp_
         decision=job["engagementDecision"]
         assert decision["focus"]=="Patrick" and decision["eeg_applied"]
         assert decision["eeg_policy"]["state"]==("above_baseline" if z>0 else "below_baseline")
-        assert decision["observationWindow"]["end"]-decision["observationWindow"]["start"]==3.5
-        assert job["observationToSubmitMs"]==3500
+        assert decision["observationWindow"]["end"]-decision["observationWindow"]["start"]==5.0
+        assert job["observationToSubmitMs"]==5000
         assert clip["detectionStatus"]=="processing" and clip["status"]=="playing"
         assert "endedAt" not in clip
         assert "PRIMARY SHOT: Patrick" in payloads[-1]["prompt"]

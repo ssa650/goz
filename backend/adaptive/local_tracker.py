@@ -20,6 +20,7 @@ MAX_WALL_SECONDS = 30
 IDENTITY_TTL = .8
 OUTPUT_CAPACITY = 2
 LIVE_MAX_AGE_S = .25
+MAX_FRAME_BYTES = 60_000
 _gates = weakref.WeakKeyDictionary()
 _worker_slot = threading.BoundedSemaphore(1)
 
@@ -368,6 +369,80 @@ def _worker(video, names, tags, output, stop, playback=None, provider="opencv"):
 
 
 
+def _frames_worker(names, tags, output, stop, playback, inputs, provider):
+    """Infer only bounded presented video pixels; never open a provider URL."""
+    import cv2
+    import numpy as np
+    started = time.perf_counter()
+    tracker = _new_tracker(names, tags, provider)
+    previous_t, previous_epoch = -1, None
+    counts = {}
+    def stage(reason, **fields):
+        count = counts[reason] = counts.get(reason,0)+1
+        if count & (count-1) == 0:
+            _emit(output,dict(diagnostic_event="presented_worker_stage",reason=reason,count=count,**fields),stop)
+    _emit(output, dict(diagnostic_event="worker_entered", worker_pid=os.getpid(),
+        input_source="presented_video_frame"), stop)
+    try:
+        while not stop.is_set() and time.perf_counter()-started < MAX_SECONDS:
+            try:
+                item = inputs.get(timeout=.05)
+            except queue.Empty:
+                continue
+            if item.get("tags") != tags:
+                stage("provenance_mismatch")
+                continue
+            t, epoch = item["t"], item["epoch"]
+            with playback.get_lock():
+                media_t, at, playing, current, current_epoch, rate = playback[:]
+            target = playback_target(dict(media_t=media_t, at=at, playing=bool(playing),
+                current=bool(current), rate=rate), time.monotonic())
+            if target is None or epoch != current_epoch or not -.001 <= target-t <= LIVE_MAX_AGE_S:
+                stage("inactive_or_stale",mediaTime=t,playbackTarget=target,epoch=epoch,currentEpoch=current_epoch)
+                continue
+            if epoch == previous_epoch and t <= previous_t:
+                stage("out_of_order",mediaTime=t)
+                continue
+            gap = previous_epoch != epoch or t-previous_t > LIVE_MAX_AGE_S+.001
+            if gap:
+                tracker = _new_tracker(names, tags, provider)
+            encoded = item["jpeg"]
+            if not 0 < len(encoded) <= MAX_FRAME_BYTES:
+                stage("payload_limit")
+                continue
+            # Inspect dimensions before native allocation; a small compressed
+            # payload must not cause an unbounded decoded image allocation.
+            from io import BytesIO
+            from PIL import Image
+            try:
+                with Image.open(BytesIO(encoded)) as image:
+                    if image.format != "JPEG" or image.width > WIDTH or image.height > 1280:
+                        stage("dimensions_or_format")
+                        continue
+            except (ValueError,OSError):
+                stage("invalid_jpeg")
+                continue
+            bgr = cv2.imdecode(np.frombuffer(encoded,np.uint8), cv2.IMREAD_COLOR)
+            if bgr is None or bgr.shape[1] > WIDTH or bgr.shape[0] > 1280:
+                stage("decode_failed")
+                continue
+            stage("infer",mediaTime=t)
+            pixels = cv2.cvtColor(bgr,cv2.COLOR_BGR2RGB)
+            inference = time.perf_counter()
+            record = tracker.step(pixels,t)
+            previous_t, previous_epoch = t, epoch
+            record.update(**tags, playback_epoch=epoch, input_gap=gap, produced_at=time.time(),
+                decode=dict(decoder="browser_presented_jpeg",actual_media_t=t),
+                scheduling=dict(mode="presented_latest_frame",queue_capacity=1,
+                    inference_ms=round((time.perf_counter()-inference)*1000,3)),
+                resources=dict(width=bgr.shape[1],height=bgr.shape[0],opencv_threads=cv2.getNumThreads()))
+            if not _emit(output,record,stop):
+                break
+        _emit(output,None,stop)
+    except Exception as error:
+        _emit(output,dict(worker_error=type(error).__name__,message="Presented frame inference failed."),stop)
+
+
 def _dispose(process, output):
     """Cooperatively owned worker exits; never terminate/kill a process."""
     process.join()
@@ -417,7 +492,7 @@ class _CombinedStop:
         return self.job_stop.is_set() or self.lifetime_stop.is_set()
 
 
-def _warm_host(commands, output, job_stop, lifetime_stop, playback, provider, idle_seconds):
+def _warm_host(commands, output, job_stop, lifetime_stop, playback, inputs, provider, idle_seconds):
     """One CPU interpreter; block without CPU work between bounded clip jobs."""
     try:
         started = time.perf_counter()
@@ -453,9 +528,13 @@ def _warm_host(commands, output, job_stop, lifetime_stop, playback, provider, id
                 break
             token = command["token"]
             try:
-                _worker(command["video"],command["names"],command["tags"],_JobOutput(output,token),
-                    _CombinedStop(job_stop,lifetime_stop),
-                    playback if command["live"] else None,provider)
+                if command["video"] is None:
+                    _frames_worker(command["names"],command["tags"],_JobOutput(output,token),
+                        _CombinedStop(job_stop,lifetime_stop),playback,inputs,provider)
+                else:
+                    _worker(command["video"],command["names"],command["tags"],_JobOutput(output,token),
+                        _CombinedStop(job_stop,lifetime_stop),
+                        playback if command["live"] else None,provider)
             finally:
                 # Retirement must acknowledge native cleanup even after job
                 # cancellation. The parent drains results while retaining slot.
@@ -481,7 +560,7 @@ class _WarmLease:
             raise RuntimeError("Previous local job has not retired.")
         owner.sequence += 1
         self.owner, self.token = owner, owner.sequence
-        self.command = dict(token=self.token,video=str(video),names=list(names),tags=tags,live=live)
+        self.command = dict(token=self.token,video=str(video) if video is not None else None,names=list(names),tags=tags,live=live)
         self.idle_seen = False
         self.pid = owner.process.pid
 
@@ -548,10 +627,11 @@ class WarmLocalWorker:
         context = multiprocessing.get_context("spawn")
         self.commands = context.Queue(maxsize=1)
         self.output = context.Queue(maxsize=OUTPUT_CAPACITY)
+        self.inputs = context.Queue(maxsize=1)
         self.job_stop, self.lifetime_stop = context.Event(), context.Event()
         self.playback = context.Array("d",[0,0,0,0,0,1])
         self.process = context.Process(target=_warm_host,args=(self.commands,self.output,self.job_stop,
-            self.lifetime_stop,self.playback,provider,idle_seconds),daemon=False)
+            self.lifetime_stop,self.playback,self.inputs,provider,idle_seconds),daemon=False)
 
     def request_close(self):
         self.closed = True
@@ -566,6 +646,14 @@ class WarmLocalWorker:
         self.process.join()
         self.job_retired.wait()  # Active lease retirement owns the inference slot.
         self.commands.close()
+        # The child has retired. Drain the single pending feeder message before
+        # closing so cooperative shutdown cannot wait on unread JPEG bytes.
+        try:
+            self.inputs.get(timeout=.1)
+        except queue.Empty:
+            pass
+        self.inputs.close()
+        self.inputs.join_thread()
         self.output.close()
         self.process.close()
 
@@ -637,6 +725,7 @@ async def prewarm_local_tracker(provider="color", *, idle_seconds=WARM_IDLE_SECO
                 retiring = True
                 threading.Thread(target=retire,name="opencv-warm-retirement",daemon=True).start()
             else:
+                worker.inputs.close()
                 worker.commands.close()
                 worker.output.close()
                 worker.process.close()
@@ -649,7 +738,7 @@ async def prewarm_local_tracker(provider="color", *, idle_seconds=WARM_IDLE_SECO
                 gate.release()
 
 
-async def detect_local(video, names, *, clip_id, session_id, generation_id=None, on_progress=None, playback_state=None, provider="opencv", diagnostics_directory=None, warm_worker=None):
+async def detect_local(video, names, *, clip_id, session_id, generation_id=None, on_progress=None, playback_state=None, provider="opencv", diagnostics_directory=None, warm_worker=None, frame_source=None):
     """Offline coverage within a wall budget or playback stale-work skipping.
 
     Playback/generation never await tracking. Cancellation signals stop between
@@ -657,10 +746,12 @@ async def detect_local(video, names, *, clip_id, session_id, generation_id=None,
     worker slot until it exits. No process termination is authorized or attempted.
     """
     from . import tracking_diagnostics
-    journal = tracking_diagnostics.for_video(video, session_id, clip_id, generation_id, diagnostics_directory)
+    journal = tracking_diagnostics.for_video(video, session_id, clip_id, generation_id, diagnostics_directory) if video is not None or diagnostics_directory else None
     def diagnostic(kind, **fields):
         if journal:
             journal.record(kind, **fields)
+    if frame_source is not None and warm_worker is None:
+        raise ValueError("Presented frames require an already warm worker.")
     diagnostic("job_requested", provider=provider)
     queued = time.perf_counter()
     loop = asyncio.get_running_loop()
@@ -704,6 +795,7 @@ async def detect_local(video, names, *, clip_id, session_id, generation_id=None,
         _worker_slot.release()
         raise
     result = []
+    input_queued = 0
     def receive(record):
         if record is None:
             diagnostic("worker_complete", records=len(result))
@@ -721,6 +813,11 @@ async def detect_local(video, names, *, clip_id, session_id, generation_id=None,
                 (("clip_id",clip_id),("session_id",session_id),("generation_id",generation_id))):
             diagnostic("transport_rejected", reason="provenance_mismatch", mediaTime=record.get("t"))
             return True
+        if frame_source is not None:
+            state = playback_state()
+            if not state or not state.get("current") or not state.get("playing") or record.get("playback_epoch") != state.get("epoch",0):
+                diagnostic("transport_rejected",reason="playback_epoch_mismatch")
+                return True
         record["received_at"] = time.time()
         produced = record.get("produced_at")
         record["transport"] = dict(status="accepted", received_at=record["received_at"],
@@ -730,7 +827,7 @@ async def detect_local(video, names, *, clip_id, session_id, generation_id=None,
         result.append(record)
         return True
     try:
-        async with asyncio.timeout(MAX_WALL_SECONDS):
+        async with asyncio.timeout(MAX_SECONDS if frame_source else MAX_WALL_SECONDS):
             while True:
                 if playback is not None:
                     state = playback_state()
@@ -738,6 +835,23 @@ async def detect_local(video, names, *, clip_id, session_id, generation_id=None,
                         playback[:] = ([state["media_t"], state["at"], state.get("playing", False),
                             state.get("current", True), state.get("epoch", 0), state.get("rate", 1)]
                             if state else [0, 0, 0, 0, 0, 1])
+                if frame_source is not None:
+                    item = frame_source()
+                    if item is not None:
+                        try:
+                            warm_worker.inputs.put_nowait(item)
+                            input_queued += 1
+                            if input_queued & (input_queued-1) == 0:
+                                diagnostic("presented_input_queued",count=input_queued,mediaTime=item["t"],epoch=item["epoch"])
+                        except queue.Full:
+                            # Replace the older pending input when its feeder
+                            # has delivered it. Never block on a feeder race.
+                            try:
+                                warm_worker.inputs.get_nowait()
+                                warm_worker.inputs.put_nowait(item)
+                            except (queue.Empty,queue.Full):
+                                pass
+                            diagnostic("input_dropped",reason="pending_frame")
                 received = False
                 for _ in range(OUTPUT_CAPACITY):
                     try:

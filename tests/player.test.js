@@ -278,3 +278,19 @@ test('autoplay denial waits for a gesture without triggering progressive fallbac
   assert.equal(states.at(-1),'gesture');assert.equal(q.pending.src,'/stream');assert.equal(q.fallbacks.size,0);
   videos[0].blockAutoplay=false;await q.tryPlay();assert.equal(q.current.src,'/stream');assert.equal(states.at(-1),'playing');
 });
+
+test('validated local media is selected only before staging, with real buffer diagnostics',async()=>{
+ const videos=[new Video(),new Video()],diagnostics=[];
+ const q=new PlaybackQueue(videos,()=>{},d=>diagnostics.push(d));
+ q.update([{url:'/stream-0',fallbackUrl:'/validated-0'}],'running');await flush();
+ const active=q.current;
+ q.update([{url:'/stream-0',fallbackUrl:'/validated-0',localMediaStatus:'validated'},
+   {url:'/stream-1',fallbackUrl:'/validated-1',localMediaStatus:'validated'}],'running');await flush();
+ assert.equal(q.current,active);assert.equal(active.src,'/stream-0');assert.equal(q.pending.src,'/validated-1');
+ assert.equal(q.pending.preload,'auto');
+ q.pending.currentTime=0;q.pending.buffered={length:1,start:()=>0,end:()=>15};
+ active.events.ended();await flush();
+ assert.equal(q.current.src,'/validated-1');assert.equal(q.next,1);
+ const transition=diagnostics.find(d=>d.index===1 && d.phase==='playing');
+ assert.equal(transition.delivery,'validated_local');assert.equal(transition.bufferedAheadS,15);
+});

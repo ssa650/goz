@@ -1,0 +1,164 @@
+Provider and Muse diagnostic changes — 2026-10-04
+
+Scope
+-----
+Source changes and mocked/saved-log verification only. No live provider request,
+paid generation/retry, top-up, provider contact, device activation, user browser,
+OS permission change, backend restart, process kill, or Git index action.
+No EEG quality thresholds, filters, baseline rules or acquisition rewrite.
+No applicable repository/ancestor AGENTS.md or .agents directory was present;
+/Users/shayan/.codex/AGENTS.md exists and is empty.
+
+Verified provider diagnostic defect
+----------------------------------
+The saved job 62f6d53a-1372-4f01-8a40-671b82b27133 was submitted with provider
+request ID 01a106b5-ba11-7ed3-bbb6-dfcddd25d537. It ended with the exact message:
+  User is locked. Reason: TOP_UP.
+It has no saved HTTP status or full safe response detail. Its submittedAt is
+1791113935406; finishedAt is 1791113935616.
+
+FalAdapter previously raised an error with only detail and status. Engine's
+terminal monitor exception handler saved only the message, discarding status.
+AdaptiveSession then converted the failed job back to a plain ValueError,
+discarding any provider context. This is a verified application diagnostic defect.
+
+The historical HTTP status cannot be recovered from these files. TOP_UP is the
+provider's reported reason; it does not establish the actual account balance,
+a transient billing condition, or why a later user retry succeeded. No historical
+HTTP status has been invented or written into the retained run.
+
+Provider changes
+----------------
+Fal errors now carry an allowlisted providerError object:
+  provider, httpStatus, requestId, category, detail, stage,
+  retryability, automaticRetry.
+Detail is sanitized before truncation to 400 characters. Identifiers are bounded
+and validated. Only named diagnostic body leaves are selected; arbitrary bodies,
+validation inputs and raw headers are excluded. HTML and oversized error bodies
+are omitted. Explicit credentials, loaded secrets, bearer/basic/key strings,
+URLs, JWT-like strings and long opaque data are removed. A safe x-request-id
+header is used only as an identifier fallback; headers are never copied.
+
+Status/result errors preserve the confirmed request ID, actual available HTTP
+status, stage and provider category. An HTTP 200 response containing a provider
+error retains HTTP 200 in the diagnostic while the application sends an error
+response. Malformed JSON and transport errors receive precise categories;
+transport exception URLs are omitted. Submission errors remain one-shot and
+ambiguous submissions remain blocked across restart.
+
+retryability describes scope: same_request_read, manual_review or none.
+automaticRetry=false means the adapter has not retried the failed operation;
+the existing engine may reconnect eligible status reads to the SAME saved request.
+It never resubmits a generation automatically. Explicit account-lock reports
+require manual review even if their HTTP status would otherwise permit a read
+reconnect. Cancellation behavior is unchanged; a failed cancel retains safe
+context alongside the existing unconfirmed-cancel warning.
+
+Failure metadata persists in job history and private bounded journal
+data/diagnostics/provider-errors.jsonl (64 KiB plus one rotated file, mode 0600).
+Adaptive public state and provider_failed events retain the same safe object.
+Existing UI error text includes stage, HTTP status when known, request ID,
+provider detail, and a request/account-review action without asserting a balance
+cause or encouraging an automatic paid retry. The FalError API handler exposes
+the same safe metadata. Journal write failure does not initiate retries.
+
+Verified Muse observations
+--------------------------
+Evidence: data/diagnostics/muse.jsonl and muse-state.json retained before edits.
+The final video ended at 11:41:09.509 UTC (delegated run evidence). The journal
+records last samples at 11:41:31.619, baseline invalidation at 11:41:34.883,
+LSL stream loss at 11:41:35.435, producer "Disconnected." at 11:41:35.444,
+and producer exit code 0 at 11:41:36.185. Backoff began at 11:41:36.606;
+the replacement producer started at 11:41:43.257. BLE connected at
+11:42:01.189; outlet discovery and fresh samples followed around 11:42:02–04.
+
+A second stale baseline/producer disconnect occurred at 11:43:36, followed by
+exit code 0 at 11:43:37.146 and another bounded retry. Subsequent producer scans
+reported "No Muses found." at 11:44:01.849, 11:44:12.889, 11:44:24.446 and
+later scans. Retry attempt 3 used an eight-second backoff. At 11:45:17.797
+the supervisor recorded exhaustion; explicit disconnect was recorded at
+11:49:03.733. These events show recovery worked once and later exhausted its
+existing budget. A zero exit code does not prove a healthy stream.
+
+Installed muselsl/stream.py loops while time since last data is less than
+AUTO_DISCONNECT_DELAY (three seconds), then prints "Disconnected." and exits.
+That mechanism is consistent with the observed loss timing. Its debug-level
+"auto-disconnect: ..." elapsed-data message was not retained, so this report
+does not claim that branch was directly observed, or identify why data stopped.
+No retained traceback or supervisor ownership/duplicate-worker defect explains
+the original data loss. No physical RF, battery or OS Bluetooth cause is proven.
+
+Muse diagnostic changes
+-----------------------
+Explicit producer output now adds a bounded classified observation:
+discovery_empty, stream_disconnected, connection_failed, ble_connected, or
+stream_started. Both complete and final partial pipe lines are handled.
+Classification does not infer a Bluetooth root cause. Loss records include
+reader interruption, last sample, producer exit/observation, outlet/acquisition
+state, ownership and attempt. Recovery backoff includes nextRetryAt;
+fresh sample recovery records recovery_restored.
+
+museConnection adds a bounded message, retryRemaining, recoveryExhausted,
+nextRetryAt/retryInSeconds, lastLoss, lastProducerObservation and explicit
+bluetoothCause=unknown. The message distinguishes loss, a pending retry and
+exhaustion, and gives the existing Connect action for a new explicit intent.
+Frontend integration of museState.message is reserved to the parent/UI owner.
+
+Nested diagnostics are sanitized; raw numerical arrays are omitted, device UUIDs
+and MAC addresses are redacted, and non-finite numbers become unknown. Rows,
+in-memory history, journal rotation and the durable latest-event summary are
+bounded even with pathological nested input. Lifecycle scalars survive detail
+compaction. Existing Connect intent, finite retry budget, external ownership,
+single-reader/producer guards, cooperative stopping and baseline invalidations
+are preserved.
+
+Evidence still needed for underlying causes
+------------------------------------------
+Provider: the original safe HTTP status/body-category/request evidence was not
+retained. A later user-authorized failure can now preserve it, but it cannot
+reconstruct the past response or establish account/provider billing state.
+Muse: a user-authorized live reproduction would need the producer's exact
+last-data/auto-disconnect diagnostic plus any concrete BLE backend disconnect
+reason or exception around the loss. Existing logs contain no battery/RF or
+OS Bluetooth reason. No broad OS monitoring was added.
+
+Verification
+------------
+156 passed, 1 deselected in 10.30 seconds for:
+  tests/test_provider_errors.py
+  tests/test_muse_supervision.py
+  tests/test_backend.py
+  tests/test_adaptive_resilience.py
+  tests/test_sensor_setup.py
+  tests/test_eeg_acquisition.py
+  tests/test_eeg_timeout_recovery.py
+  tests/test_generation_timing.py
+The deselected existing localhost UDP fixture initially failed only because the
+sandbox blocked socket.bind. It passed separately (1 passed in 0.67 seconds)
+under reviewed loopback-only execution, using synthetic gaze packets and no
+hardware. git diff --check passed. No live validation was performed.
+
+Tests cover sanitized/nested/oversized bodies, credentials/URL/header exclusion,
+provider codes, safe API errors, confirmed status/result failures, adaptive
+journaling, one paid POST only, ambiguous submission persistence/restart blocking,
+Muse zero-exit/empty-discovery observations, precise loss and restored-sample
+events, bounded file/summary sizes, external ownership, no duplicate workers,
+cooperative stop failures and baseline safety.
+
+Changed files and source freeze
+-------------------------------
+backend/provider_errors.py (new)
+backend/fal_adapter.py
+backend/engine.py (reserved failure/error/cancel-warning metadata only)
+backend/app.py (reserved FalError handler only)
+backend/adaptive/session.py (reserved failure/public-state/event propagation only)
+backend/muse_diagnostics.py (pre-existing untracked file, amended in place)
+backend/sensor_setup.py (Muse diagnostics/status fields only)
+tests/test_provider_errors.py (new)
+tests/test_muse_supervision.py (pre-existing untracked file, amended in place)
+docs/PROVIDER_MUSE_DIAGNOSTICS.txt (this report)
+
+Source edits are frozen after the passing verification above. Other owners may
+still change reserved unrelated regions of shared files; the parent owns final
+aggregate verification. Existing working changes were preserved, and the Git
+index remains unchanged. No staging, commit, push, restart or runtime action.

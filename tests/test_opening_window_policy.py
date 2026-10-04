@@ -16,7 +16,8 @@ from test_adaptation_acceptance import BASE, BOXES, NAMES
 from test_detection_acceptance import CASES, fixture_image
 
 
-def test_adaptive_sampler_prioritizes_eight_real_opening_frames_and_stops_decode(monkeypatch):
+@pytest.mark.parametrize('seconds',[3.5,5.0])
+def test_adaptive_sampler_prioritizes_eight_real_opening_frames_and_stops_decode(monkeypatch,seconds):
     reads = []
     pixels = bytes([0,0,0,255,255,255]*2)
     def reader(path, **kwargs):
@@ -25,11 +26,11 @@ def test_adaptive_sampler_prioritizes_eight_real_opening_frames_and_stops_decode
             reads.append(i)
             yield pixels
     monkeypatch.setattr(tracks.imageio_ffmpeg,'read_frames',reader)
-    frames=tracks.sample_scene_frames('unused',width=2,observation_seconds=3.5)
+    frames=tracks.sample_scene_frames('unused',width=2,observation_seconds=seconds)
     sampled=[f for f in frames if f['jpeg']]
-    assert [f['t'] for f in sampled]==[i/2 for i in range(8)]
-    assert len(sampled)==8 and len(reads)<=72, 'do not decode the full30s clip for opening evidence'
-    assert sampled[-1]['t']<=3.5
+    assert len(sampled)==8 and len(reads)<=int(seconds*20)+2
+    assert sampled[0]['t']==0 and sampled[-1]['t']<=seconds
+    assert all(abs(f['t']-i*seconds/7)<=.05+1e-6 for i,f in enumerate(sampled))
 
 
 def test_general_sampler_retains_existing_whole_clip_cadence(monkeypatch):
@@ -95,14 +96,14 @@ async def test_realistic_3_5s_decoded_identity_and_gaze_change_exact_request(tmp
         monkeypatch.setattr(engine,'run_job',generate)
         box=clip['track'][0]['boxes'][focused]
         x,y=(box[0]+box[2])*50,(box[1]+box[3])*50
-        for i in range(106):
+        for i in range(151):
             clock[0]=s.started+i/30
             s.gaze.add(dict(t=clock[0],x=x,y=y,valid=True,face=True,confidence=.9,blink=False,yaw=0))
             tick(s,clock,i/30)
         await s.task
         decision=engine.jobs[s.clips[1]['jobId']]['engagementDecision']
         assert decision['focus']==focused and clip['analysis']['comparison_s']>=3.4
-        assert decision['observationWindow']['end']-decision['observationWindow']['start']==3.5
+        assert decision['observationWindow']['end']-decision['observationWindow']['start']==5.0
         assert f'PRIMARY SHOT: {focused} receives the main medium close-up' in requests[-1]['prompt']
         assert clip['status']=='playing' and 'endedAt' not in clip
         assert all(f['valid_until']-f['t']<=.8+1e-6 for f in clip['track'])
@@ -126,7 +127,7 @@ async def test_opening_policy_never_forces_focus_on_unusable_evidence(tmp_path,m
     elif failure=='expired-boxes':clip['track']=clip['track'][:1]
     elif failure=='crossclip':
         for f in clip['track']:f['clip_id']='old'
-    for i in range(106):
+    for i in range(151):
         clock[0]=s.started+i/30
         if failure!='missing-gaze':
             s.gaze.add(dict(t=clock[0],x=75 if failure!='ambiguous' else 50,y=50,
@@ -187,7 +188,7 @@ async def test_partial_opening_coverage_uses_only_completed_fresh_frames(tmp_pat
     clip['track']=[dict(t=i/2,valid_until=(i+1)/2,boxes=BOXES,clip_id='source',session_id=s.id)
                    for i in range(completed_frames)]
     clip['detectionStatus']='processing'
-    for i in range(106):
+    for i in range(151):
         clock[0]=s.started+i/30
         s.gaze.add(dict(t=clock[0],x=75,y=50,valid=True,face=True,confidence=.9,yaw=0))
         tick(s,clock,i/30)
@@ -196,5 +197,5 @@ async def test_partial_opening_coverage_uses_only_completed_fresh_frames(tmp_pat
     decision=submitted[0][0]['engagementDecision']
     assert decision['focus']==('Patrick' if eligible else None)
     assert len(submitted)==1 and clip['detectionStatus']=='processing'
-    assert decision['observationWindow']['end']-decision['observationWindow']['start']==3.5
+    assert decision['observationWindow']['end']-decision['observationWindow']['start']==5.0
     await engine.close()

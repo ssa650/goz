@@ -28,5 +28,11 @@ def summarize(samples, ticks, timeline):
         capture_delayed_over_500ms=sum(age>.5 for age in ages),
         capture_to_send_ms_p95=round(ages[min(len(ages)-1, int(.95*len(ages)))]*1000,3) if ages else None,
         capture_to_send_ms_max=round(max(ages)*1000, 3) if ages else None,
+        pipeline_diagnostics=next((s["pipelineDiagnostics"] for s in reversed(samples)
+                                   if isinstance(s.get("pipelineDiagnostics"), dict)), None),
+        receipt_diagnostics=next((s["receiptDiagnostics"] for s in reversed(samples)
+                                  if isinstance(s.get("receiptDiagnostics"), dict)), None),
+        blink_reasons=dict(Counter(s["blinkDiagnostics"].get("reason", "unspecified") for s in samples
+                                  if isinstance(s.get("blinkDiagnostics"), dict))),
         camera_mirror_verified=None, eye_calibration_verified=None,
         note="Mapping fit does not validate eye calibration; raw invalid/blink flags are preserved.")

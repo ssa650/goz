@@ -205,8 +205,8 @@ async def test_custom_continuation_freezes_then_waits_for_actual_local_end_frame
     await s.make_scene({},s.opening,None,[])
     clip=s.clips[0];wall=time.time()
     s.tick(0,0,True,{},wall,clip_id=clip['id'])
-    s.tick(0,3.5,True,{},wall+.001,clip_id=clip['id'])
-    assert clip['frozenEvidence']['end']-clip['frozenEvidence']['start']<=3.5
+    s.tick(0,5.0,True,{},wall+.001,clip_id=clip['id'])
+    assert clip['frozenEvidence']['end']-clip['frozenEvidence']['start']<=5.0
     await asyncio.sleep(.01)
     assert len(engine.adapter.submissions)==1,'No custom continuation before actual final-frame extraction'
     made=[]

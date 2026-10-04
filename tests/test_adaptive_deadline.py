@@ -2,6 +2,7 @@
 import asyncio
 from copy import deepcopy
 from pathlib import Path
+import json
 import time
 
 import httpx
@@ -23,10 +24,10 @@ def clock(monkeypatch):
     return clock
 
 
-def setup(tmp_path, monkeypatch, clock, *, final=False, eeg_run_mode="cumulative_prior_clips", eeg_gaze_only=False):
+def setup(tmp_path, monkeypatch, clock, *, final=False, eeg_run_mode="cumulative_prior_clips", eeg_gaze_only=False, playback_mode="download"):
     engine = Engine(FakeAdapter(), tmp_path, poll_seconds=.001)
     s = AdaptiveSession(engine, GazeFeed(), EegFeed(), tmp_path, 'Two explorers find a box.',
-                        [dict(name='Ana'), dict(name='Bea')], 15, '480P', verify_image(png()),eeg_run_mode=eeg_run_mode,eeg_gaze_only=eeg_gaze_only)
+                        [dict(name='Ana'), dict(name='Bea')], 15, '480P', verify_image(png()),eeg_run_mode=eeg_run_mode,eeg_gaze_only=eeg_gaze_only,playback_mode=playback_mode)
     s.max_scenes = 1 if final else 2
     clip = dict(id='source', sessionId=s.id, index=0, status='ready', duration=15,
                 ticks=[], track=[], detectionStatus='processing', path='source.mp4', plan=dict(beats=[]))
@@ -57,6 +58,8 @@ async def test_deadline_submits_with_missing_evidence_before_end(tmp_path, monke
     s, clip, engine, submitted = setup(tmp_path, monkeypatch, clock)
     clip['detectionStatus'] = detection_status
     tick(s, clock, 0)
+    tick(s, clock, 3.5)
+    assert not clip.get('analysisStarted') and not submitted
     tick(s, clock, OBSERVATION_SECONDS-.01)
     assert not clip.get('analysisStarted') and not submitted
     tick(s, clock, OBSERVATION_SECONDS)
@@ -67,10 +70,11 @@ async def test_deadline_submits_with_missing_evidence_before_end(tmp_path, monke
     assert decision['focus'] is None and decision['action'] == 'keep'
     assert 'Insufficient' in ' '.join(decision['reasons'])
     assert clip['analysis']['eeg_available'] is False
-    assert decision['observationWindow']['end'] - decision['observationWindow']['start'] == 3.5
+    assert decision['observationWindow']['end'] - decision['observationWindow']['start'] == 5.0
+    assert decision['observationWindow']['configuredSeconds'] == 5.0
     job = engine.jobs[s.clips[1]['jobId']]
-    assert job['observationToSubmitMs'] == 3500 and job['observationToReadyMs'] == 3500
-    assert job['observationMs'] == 3500
+    assert job['observationToSubmitMs'] == 5000 and job['observationToReadyMs'] == 5000
+    assert job['observationMs'] == 5000
     assert not engine.adapter.submissions
     await engine.close()
 
@@ -85,15 +89,15 @@ async def test_loading_time_does_not_consume_playback_window(tmp_path, monkeypat
     assert not clip.get('analysisStarted')
     s.tick(0, 0, True, {}, clock[0]+.01, clip_id='source')
     playback_start += .01
-    clock[0] = playback_start + 3.49
-    s.tick(0, 3.49, True, {}, clock[0], clip_id='source')
+    clock[0] = playback_start + 4.99
+    s.tick(0, 4.99, True, {}, clock[0], clip_id='source')
     assert not submitted and not clip.get('analysisStarted')
-    clock[0] = playback_start + 3.5
-    s.tick(0, 3.5, True, {}, clock[0], clip_id='source')
+    clock[0] = playback_start + 5.0
+    s.tick(0, 5.0, True, {}, clock[0], clip_id='source')
     await s.task
     window = submitted[0][0]['observationWindow']
     assert window['start'] == playback_start and window['start'] >= created+60
-    assert window['end'] - window['start'] == 3.5
+    assert window['end'] - window['start'] == 5.0
     await engine.close()
 
 
@@ -101,7 +105,7 @@ async def test_loading_time_does_not_consume_playback_window(tmp_path, monkeypat
 async def test_freeze_is_synchronous_and_late_evidence_cannot_change_decision(tmp_path, monkeypatch, clock):
     s, clip, engine, submitted = setup(tmp_path, monkeypatch, clock)
     tick(s, clock, 0)
-    tick(s, clock, 3.5)
+    tick(s, clock, 5.0)
     frozen = deepcopy(clip['frozenEvidence'])
     # Complete detection and receive delayed samples before adapt() gets CPU.
     clip.update(track=[dict(t=0,boxes={'Bea':[0,0,1,1]})], detectionStatus='ready')
@@ -110,7 +114,7 @@ async def test_freeze_is_synchronous_and_late_evidence_cannot_change_decision(tm
     await s.task
     assert clip['frozenEvidence'] == frozen
     assert clip['analysis']['samples'] == 0 and submitted[0][0]['engagementDecision']['focus'] is None
-    assert submitted[0][0]['observationWindow']['end'] == s.started+3.5
+    assert submitted[0][0]['observationWindow']['end'] == s.started+5.0
     # Repeated end/tick/adapt events never add another paid job.
     s.ended(0); s.ended(0)
     await s.adapt(0)
@@ -122,8 +126,8 @@ async def test_freeze_is_synchronous_and_late_evidence_cannot_change_decision(tm
 async def test_available_partial_valid_gaze_can_drive_focus_at_deadline(tmp_path, monkeypatch, clock):
     s, clip, engine, submitted = setup(tmp_path, monkeypatch, clock)
     boxes = {'Ana':[0,.2,.4,1], 'Bea':[.6,.2,1,1]}
-    clip['track'] = [dict(t=i/4, boxes=boxes, clip_id='source', session_id=s.id) for i in range(15)]
-    for i in range(71):
+    clip['track'] = [dict(t=i/4, boxes=boxes, clip_id='source', session_id=s.id) for i in range(21)]
+    for i in range(101):
         clock[0] = s.started+i/20
         s.gaze.add(dict(t=clock[0],x=80,y=50,valid=True,face=True,confidence=1,blink=False,yaw=0))
         tick(s, clock, i/20)
@@ -141,7 +145,7 @@ async def test_stale_sensors_and_crossclip_boxes_have_neutral_fallback(tmp_path,
     clip['track'] = [dict(t=i/4,boxes={'Ana':[0,0,1,1]},clip_id='wrong',session_id='old') for i in range(15)]
     s.gaze.add(dict(t=s.started-1,x=50,y=50,valid=True,confidence=1))
     s.eeg.series.append((s.started-1,1,20,False))
-    tick(s, clock, 0); tick(s, clock, 3.5)
+    tick(s, clock, 0); tick(s, clock, 5.0)
     await s.task
     assert clip['frozenEvidence']['track'] == []
     assert clip['analysis']['valid_gaze_s'] == 0 and not clip['analysis']['eeg_available']
@@ -169,7 +173,7 @@ async def test_scene_change_cancels_obsolete_planning_and_releases_owner(tmp_pat
         entered.set(); await release.wait()
         return director.template(story, decision, duration, s.names), 'test'
     monkeypatch.setattr(director, 'write_scene', compose)
-    tick(s, clock, 0); tick(s, clock, 3.5)
+    tick(s, clock, 0); tick(s, clock, 5.0)
     old = s.task
     await entered.wait()
     s.clips.append(dict(id='new',index=1,status='ready',duration=15,ticks=[],track=[]))
@@ -189,7 +193,7 @@ async def test_stop_cancels_pending_adaptation_and_late_completion_is_not_playab
     async def pending(job, images):
         submitted.append(job); entered.set(); await release.wait(); job.update(status='completed')
     monkeypatch.setattr(engine, 'run_job', pending)
-    tick(s, clock, 0); tick(s, clock, 3.5)
+    tick(s, clock, 0); tick(s, clock, 5.0)
     old = s.task
     await entered.wait()
     s.stop(); release.set()
@@ -290,7 +294,7 @@ async def test_actual_file_end_is_precomputed_and_used_instead_of_early_frame(tm
     monkeypatch.setattr(engine,'run_job',generate);monkeypatch.setattr(engine,'media_path',media)
     now=time.time()
     s.tick(0,0,True,{},now,clip_id=clip['id'])
-    s.tick(0,3.5,True,{},now+.01,clip_id=clip['id'])
+    s.tick(0,5.0,True,{},now+.01,clip_id=clip['id'])
     await s.task
     assert submitted[0]['start'][0] is boundary
     assert calls==[video], 'deadline does not decode the frame again'
@@ -304,7 +308,7 @@ async def test_boundary_failure_never_substitutes_opening_frame(tmp_path, monkey
     s.boundary_frames.clear()
     async def broken(path): raise ValueError('decode failed')
     monkeypatch.setattr(engine,'extractor',broken)
-    tick(s,clock,0);tick(s,clock,3.5)
+    tick(s,clock,0);tick(s,clock,5.0)
     await s.task
     assert s.status=='failed' and not submitted
     assert clip['boundaryFrameStatus']=='failed'
@@ -327,7 +331,7 @@ async def test_cancelled_detection_does_not_strand_running_playback(tmp_path,mon
     for task in tasks:task.cancel()
     await asyncio.gather(*tasks,return_exceptions=True)
     monkeypatch.setattr(s,'start_detection',lambda *a:None)
-    tick(s,clock,0);tick(s,clock,3.5)
+    tick(s,clock,0);tick(s,clock,5.0)
     await s.task
     assert s.status=='running' and s.clips[1]['status']=='ready' and len(submitted)==1
     await engine.close()
@@ -362,7 +366,7 @@ async def test_failed_provider_cancellation_cannot_hold_generation_owner(tmp_pat
     async def cancel(model,request):raise ValueError('cancel unavailable')
     monkeypatch.setattr(engine,'run_job',pending)
     monkeypatch.setattr(engine.adapter,'cancel',cancel)
-    tick(s,clock,0);tick(s,clock,3.5)
+    tick(s,clock,0);tick(s,clock,5.0)
     old=s.task
     await entered.wait()
     # An external ordered scene change invalidates the pending source job.
@@ -385,9 +389,23 @@ async def test_sensor_read_errors_use_unknown_fallback_without_waiting(tmp_path,
     monkeypatch.setattr(s.gaze,'window',broken)
     monkeypatch.setattr(s.eeg,'window',broken)
     monkeypatch.setattr(s.eeg,'status',broken)
-    tick(s,clock,0);tick(s,clock,3.5)
+    tick(s,clock,0);tick(s,clock,5.0)
     await s.task
     assert s.status=='running' and len(submitted)==1
     assert clip['analysis']['samples']==0 and not clip['analysis']['eeg_available']
     assert submitted[0][0]['engagementDecision']['focus'] is None
+    await engine.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('playback_mode',['download','stream'])
+@pytest.mark.parametrize('eeg_run_mode',['baseline','cumulative_prior_clips'])
+async def test_configured_window_is_snapshotted_and_logged(tmp_path,monkeypatch,clock,playback_mode,eeg_run_mode):
+    import backend.adaptive.session as session_module
+    s,clip,engine,_=setup(tmp_path,monkeypatch,clock,eeg_run_mode=eeg_run_mode,playback_mode=playback_mode)
+    assert s.public()['observationSeconds']==5.0
+    assert json.loads((s.dir/'session.json').read_text())['observationSeconds']==5.0
+    monkeypatch.setattr(session_module,'OBSERVATION_SECONDS',3.5)
+    assert s.analyze_at(clip)==5.0  # An existing run retains its actual configured window.
+    assert s.analyze_at(dict(duration=2))==2
     await engine.close()

@@ -150,7 +150,13 @@ def create_app(engine=None):
 
     @app.exception_handler(FalError)
     async def provider_error(request, error):
-        return JSONResponse({"error": request.app.state.engine.error(error)}, status_code=error.status or 502)
+        from .provider_errors import safe_diagnostic
+        engine = request.app.state.engine
+        body = {"error": engine.error(error)}
+        info = safe_diagnostic(error.provider_error, (getattr(engine.adapter, 'key', ''),))
+        if info:
+            body['providerError'] = info
+        return JSONResponse(body, status_code=error.status or 502)
 
     @app.exception_handler(Exception)
     async def unexpected(request, error):

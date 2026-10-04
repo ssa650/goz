@@ -1,14 +1,15 @@
 // @ts-check
 // A strict, two-element playback queue. Generating and watching are independent.
-/** @typedef {{url:string,index?:number,jobId?:string,duration?:number,fallbackUrl?:string|null}} PlaybackClip */
+/** @typedef {{url:string,index?:number,jobId?:string,duration?:number,fallbackUrl?:string|null,localMediaStatus?:string}} PlaybackClip */
 /** @typedef {HTMLVideoElement & {clipIndex?:number,resumeTime?:number}} QueueVideo */
 /** @typedef {'playing'|'loading'|'buffering'|'finished'|'cancelled'|'stopped'|'gesture'|'error'} PlaybackState */
-/** @typedef {{phase:string,index:number,previousIndex:number|null,epoch:number,elapsedMs:number,holdMs:number|null,readyState:number|null,networkState:number|null,videoTime:number|null,mediaErrorCode:number|null,errorName?:string,reason?:PlaybackState}} TransitionDiagnostic */
+/** @typedef {{phase:string,index:number,previousIndex:number|null,epoch:number,elapsedMs:number,holdMs:number|null,readyState:number|null,networkState:number|null,videoTime:number|null,mediaErrorCode:number|null,bufferedAheadS?:number|null,delivery?:string,errorName?:string,reason?:PlaybackState}} TransitionDiagnostic */
 export class PlaybackQueue {
   /** @param {QueueVideo[]} videos @param {(event:{state:PlaybackState,index:number,count:number})=>void} notify @param {(event:TransitionDiagnostic)=>void} [diagnostic] */
   constructor(videos, notify, diagnostic=()=>{}) {
     this.diagnostic = diagnostic; this.playAttempt = 0;
     /** @type {Set<number>} */ this.fallbacks = new Set();
+    /** @type {Set<number>} */ this.localSources = new Set();
     /** @type {number|null} */ this.holdStartedAt = null;
     /** @type {Map<number,{startedAt:number,count:number,seen:Set<string>}>} */ this.diagnostics = new Map();
     this.videos = videos; this.notify = notify; this.epoch = 0; this.next=0;
@@ -37,7 +38,7 @@ export class PlaybackQueue {
     this.epoch++; this.stopped = false; this.clips = []; this.next = 0; this.current = null;
     this.pending = null; this.displayed = null; this.complete = false; this.failed = false; this.blocked = false; this.starting = false;
     this.autoplayBlocked = false; this.holdStartedAt = null;
-    this.diagnostics.clear(); this.fallbacks.clear(); this.playAttempt++;
+    this.diagnostics.clear(); this.fallbacks.clear(); this.localSources.clear(); this.playAttempt++;
     for (const video of this.videos) { video.pause(); video.hidden = true; video.removeAttribute('src'); video.load(); }
   }
   stop() { this.epoch++; this.stopped = true; for (const video of this.videos) video.pause(); this.emit('cancelled'); }
@@ -66,8 +67,17 @@ export class PlaybackQueue {
       elapsedMs:Math.max(0,at-record.startedAt),holdMs:this.holdStartedAt === null ? null : Math.max(0,at-this.holdStartedAt),
       readyState:video?.readyState ?? null,networkState:video?.networkState ?? null,
       videoTime:video && Number.isFinite(video.currentTime) ? video.currentTime : null,mediaErrorCode:video?.error?.code ?? null,
+      bufferedAheadS:this.bufferedAhead(video),delivery:this.fallbacks.has(index) || this.localSources.has(index) ? 'validated_local' : 'original',
       ...(reason ? {reason} : {}),...(errorName ? {errorName:errorName.slice(0,80)} : {})}); }
     catch { /* Diagnostics must not interrupt ordered playback. */ }
+  }
+  /** @param {QueueVideo|null} video */
+  bufferedAhead(video) {
+    if (!video?.buffered || !Number.isFinite(video.currentTime)) return null;
+    for(let i=0;i<video.buffered.length;i++) {
+      if (video.buffered.start(i)<=video.currentTime && video.currentTime<=video.buffered.end(i)) return Math.max(0,video.buffered.end(i)-video.currentTime);
+    }
+    return 0;
   }
   /** @param {PlaybackState} state */
   emit(state) { this.trace('state',this.current||this.pending,state); this.notify({ state, index: this.next, count: this.clips.length }); }
@@ -79,7 +89,9 @@ export class PlaybackQueue {
       // Preserve the last displayed frame when the next clip arrives after a gap.
       this.pending = this.videos.find(v => v !== (this.current||this.displayed))||null;
       if(!this.pending) return;
-      this.pending.clipIndex = index; this.pending.src = clip.url; this.trace('preload',this.pending); this.pending.load();
+      const local=clip.localMediaStatus==='validated' && clip.fallbackUrl;
+      this.pending.clipIndex = index; this.pending.preload='auto'; this.pending.src = local || clip.url;
+      if(local) this.localSources.add(index); this.trace('preload',this.pending); this.pending.load();
     }
     if (!this.current) {
       if (clip) { if(!this.autoplayBlocked) {this.emit('loading'); void this.tryPlay(false);} }
@@ -89,7 +101,7 @@ export class PlaybackQueue {
   /** @param {QueueVideo} video */
   fallback(video) {
     const index = video.clipIndex ?? this.next, clip = this.clips[index];
-    if (!clip?.fallbackUrl || this.fallbacks.has(index) || this.stopped) return false;
+    if (!clip?.fallbackUrl || this.fallbacks.has(index) || this.localSources.has(index) || this.stopped) return false;
     this.fallbacks.add(index); this.playAttempt++; this.starting = false;
     const active = video === this.current;
     const resume = active && Number.isFinite(video.currentTime) ? video.currentTime : 0;

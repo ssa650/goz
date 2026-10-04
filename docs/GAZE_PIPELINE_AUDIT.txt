@@ -1,0 +1,92 @@
+GÖZ gaze stall patch: source-only validation, 2026-10-04
+
+Evidence and limits
+The recorded ac2920b9-fcee-4bf8-a463-017d051c4202 run has 77 blink-gated
+samples among 82 scene-1 samples. Its samples contain capture-read completion
+and send times, but no native PTS, receipt time, blink score or lid openness.
+Thus neither the 12.286s camera-read gap nor the early prolonged blink gates
+can be assigned definitively to hardware, inference or backend scheduling.
+There is no evidence here establishing historical thermal overload.
+No personalized Gazekit data/blink_profile.json was present during inspection.
+Gazekit calibration accepts blink score <0.35; generic live hysteresis uses
+on=0.28, off=0.18 and minimum lid openness=0.16. These different acceptance
+rules can allow a calibration pass with later live gating. That is a
+hypothesis, not proof of false blinks; this patch preserves those thresholds.
+
+Identified implementation defects and changes
+1. Native AVFoundation callbacks previously wrote full BGRA frames directly to
+   stdout. A slow reader could block the callback on a pipe write. The callback
+   now copies into a single replaceable pending slot; a separate writer owns
+   stdout. There is at most one pending frame and one write in flight. Native
+   delivered, AVFoundation dropped and pending-replacement counters distinguish
+   these paths. A separate two-second stderr heartbeat records callback age,
+   write-in-flight age and queue state even when the pixel pipe is blocked.
+2. Python previously converted every incoming frame before replacing its latest
+   slot. The receiver now drains raw bytes into a single latest slot and only
+   converts a consumed frame. Read timeout is 250ms; capture silence still fails
+   explicitly after ten seconds, without another device or backend fallback.
+3. Retimestamping camera-read completion hid the age of buffered native frames.
+   Protocol v2 carries host-clock PTS mapped into Unix and monotonic capture
+   time, callback time, native sequence and counters. Gaze samples use native
+   capture time. Frames older than 500ms before processing are dropped; frames
+   that age past 500ms during processing are sent explicitly invalid/stale.
+4. Gazekit FaceTracker advances VIDEO timestamps by a synthetic 33ms per call.
+   A local adapter supplies strictly increasing milliseconds from actual
+   native capture intervals. The dependency checkout is unchanged. Models
+   initialize before capture opens, avoiding cold-start camera buffering.
+5. The previous reopen hold retained its timer across ambiguous eye states.
+   Reopening now needs continuous fresh open evidence for the existing 250ms
+   hold; delivery gaps restart the hold. A closure never times out into valid
+   gaze. Each sample carries exact gate reason, score, minimum lid openness,
+   gate duration and effective thresholds/profile. No-face is distinguished
+   from blink gating. Invalid retained coordinates remain invalid evidence.
+
+Diagnostics and bounded work
+OpenCV and BLAS pools are limited to one thread while streaming. This does
+not claim to constrain MediaPipe's internal native worker pool. Cumulative
+stage latency summaries have fixed keys, count/total/max/last; there is no
+per-frame disk write, raw pixel log or unbounded timing history. A background
+writer overwrites model.parent/gaze-stream-diagnostics.json every two seconds,
+including while capture/model processing is stalled. Each snapshot identifies
+setupId, profileId, verified camera and current stage/age, CPU/wall duration,
+startup costs, frame counters, stale drops, native heartbeat and gate state.
+File mode is 0600, with atomic replacement/fsync. Diagnostic writes are off
+the processing thread; storage errors are counted. Shutdown bounds waiting
+for an already-stalled writer to one second.
+
+Outgoing samples carry frameSequence (native frames) and sentSequence (UDP
+samples), worker/capture summaries and native/Python/read timestamps.
+GazeFeed stamps the backend callback time receivedAt, records reject counts,
+late-packet delays, accepted-frame sequence gaps and received sender-sequence
+gaps. It measures event-loop sleep scheduling lag independently from callback
+interarrival gaps. receivedAt is callback time, not kernel arrival time; sender
+sequence gaps are missing observations, not conclusive proof of UDP loss.
+Late packets are measured before evidence rejection. Accepted samples carry
+receiptDiagnostics; gaze_audit preserves latest stage/receipt snapshots and
+counts blink reasons in saved decision analyses. The coordinating session
+owner adds a current inputDiagnostics snapshot at freeze for cases without a
+recent accepted sample.
+
+Safeguards
+UID selection and verified opened identity remain mandatory; frameProtocol=2
+is required. No index fallback, camera probing, resolution/prediction geometry
+change or calibration schema weakening. Existing schema3/viewer/display/model
+checks remain in force. Calibration/check UI paths still receive the same
+BGR, unmirrored capture contract and Gazekit's single mirror.
+
+Validation
+47 tests passed in the focused pipeline/camera/fusion suite, with the HTTP
+camera API test deselected because sandbox loopback binding is unavailable.
+The tests use fake native pipes, synthetic observations/frames/clocks, fake
+UDP endpoints and no hardware. They cover cold/warm startup order and costs,
+steady processing, a 1.418s inference delay, stale inputs/outputs, latest-slot
+replacement before conversion, malformed native metadata, strict VIDEO time,
+actual/prolonged blink versus reopen hold, unchanged personalized thresholds,
+fixed-cost counters, durable snapshots during silence, heartbeat without pixel
+packets, late backend rejects, sender sequence gaps and independent loop lag.
+Ten selected saved-model/alignment/UID/gaze sensor tests also pass.
+The Swift source compiles with the same Swift 5/plist flags used by the helper.
+A real-model smoke test with generated black 1080p frames aborted in restricted
+headless macOS during MediaPipe Metal graph initialization (GL pixel format /
+service unavailable), before inference. No hardware, real-face cadence or
+accuracy success is claimed. Aggregate tests are coordinated by the parent.

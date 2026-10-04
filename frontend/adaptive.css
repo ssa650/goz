@@ -57,3 +57,8 @@ body.adaptive main{width:min(1480px,100%);padding:20px 22px 40px}
 .adaptive #screen video {position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
 .adaptive #screen video[hidden]{display:none}
 .adaptive #overlay {background:#111b;padding:12px;text-align:center}
+#mapping-panel{position:absolute;z-index:4;left:12px;bottom:12px;max-width:600px;padding:9px 12px;border:1px solid #4a505b;border-radius:8px;background:#111e;color:#e8e8eb;font-size:12px}
+#mapping-message{margin:0 0 7px;line-height:1.4}
+.mapping-actions{display:flex;gap:8px;flex-wrap:wrap}
+.mapping-actions button{padding:6px 10px;font-size:12px}
+#mapping-target{position:absolute;z-index:5;transform:translate(-50%,-50%);width:44px;height:44px;padding:0;border:3px solid #111;border-radius:50%;background:#baecd0;color:#111;font-size:20px;box-shadow:0 0 0 2px #baecd0;touch-action:none}

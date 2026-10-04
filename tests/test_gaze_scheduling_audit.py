@@ -104,7 +104,7 @@ async def test_live_playback_skips_old_inference_and_keeps_unknown_provenance(tm
 async def test_invalid_mapping_audit_and_frozen_trace_are_nonblocking(tmp_path,monkeypatch,clock):
     s,clip,engine,submitted=setup(tmp_path,monkeypatch,clock)
     clip['trackingTiming']=dict(firstRecordMs=12.5,throughMediaS=14.375)
-    for i in range(71):
+    for i in range(101):
         clock[0]=s.started+i/20
         s.gaze.add(dict(t=clock[0],x=80,y=50,valid=True,blink=i%2==0))
         s.tick(0,i/20,True,dict(x=0,y=0,w=100,h=100),clock[0],clip_id='source',
@@ -113,8 +113,8 @@ async def test_invalid_mapping_audit_and_frozen_trace_are_nonblocking(tmp_path,m
     await asyncio.wait_for(s.task,.5)
     assert submitted and submitted[0][0]['engagementDecision']['focus'] is None
     audit=clip['analysis']['gaze_audit']
-    assert audit['received_samples']==71 and audit['flags']['blink_gated']==36
-    assert audit['invalid_mapping_ticks']==71 and audit['unaligned_samples']==71
+    assert audit['received_samples']==101 and audit['flags']['blink_gated']==51
+    assert audit['invalid_mapping_ticks']==101 and audit['unaligned_samples']==101
     assert clip['frozenEvidence']==frozen
     trace=s.clips[1]['decisionTrace']
     assert trace['evidence']['gazeAudit']==audit
@@ -182,7 +182,7 @@ async def test_yoloe_pending_detection_does_not_delay_freeze_or_end(tmp_path,mon
     s.start_detection(clip,'unused',None,None,15);await entered.wait()
     task=s.detection_by_clip[clip['id']]
     monkeypatch.setattr(s,'start_detection',lambda *a:None)
-    tick(s,clock,0);tick(s,clock,3.5)
+    tick(s,clock,0);tick(s,clock,5.0)
     frozen=deepcopy(clip['frozenEvidence'])
     await asyncio.wait_for(s.task,.5)
     assert len(submitted)==1 and not task.done()

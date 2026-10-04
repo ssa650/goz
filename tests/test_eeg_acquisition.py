@@ -308,22 +308,19 @@ async def test_optional_retry_cancels_previous_discovery_and_preserves_bridge(tm
 async def test_explicit_connect_reuses_existing_bridge_during_reader_recovery(tmp_path, clock):
     feed = muse()
     feed.disconnected()
-    sensors = SimpleNamespace(eeg=feed, gaze_mode="off", eeg_mode="muse", start_muse_reader=lambda: None)
+    def start_reader():
+        feed.connected("Muse-device")
+        feed.push([[1, 2, 3, 4]], [clock[0]])
+    sensors = SimpleNamespace(eeg=feed, gaze_mode="off", eeg_mode="muse", start_muse_reader=start_reader)
     setup = SensorSetup(sensors, tmp_path)
     bridge = SimpleNamespace(returncode=None)
     setup.children["muse"] = bridge
-    calls = []
-    async def wait_for(predicate, timeout, child=None):
-        calls.append(child)
-        if child is None:
-            raise ValueError("No outlet yet")
-        feed.connected("Muse-device")
-        if timeout == 240:
-            return  # Calibration completion is independent from bridge ownership.
-        assert predicate()
-    async def launch(*a): pytest.fail("A second bridge must not be launched")
-    setup.wait_for, setup.launch = wait_for, launch
+    async def launch(*args): pytest.fail("A second bridge must not be launched")
+    async def stop_owned(reason): return True
+    setup.launch, setup._stop_owned_muse = launch, stop_owned
     await setup.connect_muse()
-    await setup.muse_task
-    assert calls == [None, bridge, bridge]
+    await asyncio.sleep(0)
     assert setup.manual_muse_state == "connected" and not feed.connection_error
+    assert not setup.muse_task.done(), "supervision must continue after samples arrive"
+    assert not feed.calibration, "connection must not invent a baseline"
+    await setup.disconnect_muse()

@@ -88,52 +88,152 @@ def load_predictor(model, screen):
     return predict, ridge
 
 
+def process_timed(tracker, frame, captured_monotonic):
+    """Adapt Gazekit's fixed +33ms VIDEO clock without editing its checkout."""
+    if not hasattr(tracker, "_goz_time_origin"):
+        tracker._goz_time_origin = captured_monotonic
+    timestamp_ms = max(tracker._ts_ms + 1,
+                       round((captured_monotonic-tracker._goz_time_origin)*1000) + 1)
+    tracker._ts_ms = timestamp_ms - 33
+    return tracker.process(frame)
+
+
+def finite_point(value):
+    try:
+        return value is not None and len(value) == 2 and all(math.isfinite(float(v)) for v in value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def stream_gaze(args, model, landmarker, screen):
-    """Use Gazekit's tracker/filter with explicit capture time and no clamping."""
+    """Latest native capture time owns freshness, tracking and blink recovery."""
     import cv2
-    from gazekit.camera import read_mirrored
+    from threadpoolctl import threadpool_limits
     from gazekit.tracker import FaceTracker
     from gazekit.filters import GazeSmoother
-    from gazekit.live import BlinkGate
-    predict, _ = load_predictor(model, screen)
-    ax, bx, ay, by = alignment_values(model)
-    cap = open_selected_camera(args)
-    tracker = FaceTracker(str(landmarker))
-    smoother, gate = GazeSmoother(), BlinkGate()
-    started = last_frame = time.monotonic()
-    sent = valid = 0
-    last_xy = (screen[0] / 2, screen[1] / 2)
+    from .gaze_pipeline import (BlinkGate, StageDiagnostics, DurableDiagnostics, MAX_FRAME_AGE_S,
+                                calibration_eye_evidence, observation_quality_reason, HeldCoordinates)
+    cv2.setNumThreads(1)
+    stats = StageDiagnostics()
+    cap = tracker = reporter = None
+    started = time.monotonic()
+    completed = False
+    # Setup IDs identify worker lifetimes even when a saved model is reused.
+    path = model.parent / "gaze-stream-diagnostics.json"
+    def snapshot():
+        return dict(version=1, setupId=args.setup_id, profileId=args.profile,
+                    updatedAt=time.time(), finished=completed, worker=stats.snapshot(),
+                    capture=cap.diagnostics() if cap is not None else None,
+                    camera=getattr(cap, "identity", None))
+    reporter = DurableDiagnostics(path, snapshot, atomic_json)
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
-            while not args.seconds or time.monotonic() - started < args.seconds:
-                frame = read_mirrored(cap)
-                captured = time.time()  # Camera-read completion, before inference.
-                if frame is None:
-                    if time.monotonic() - last_frame > 10:
-                        raise ValueError("Camera opened but delivered no frames for 10 seconds. Reconnect Continuity Camera or check macOS Camera permission.")
-                    time.sleep(.01)
-                    continue
-                last_frame = time.monotonic()
-                obs = tracker.process(frame)
-                frozen = gate.update(obs)
-                point = None if frozen else predict(obs)
-                if point is not None:
-                    last_xy = smoother.apply(ax * float(point[0]) + bx, ay * float(point[1]) + by, last_frame)
-                sample = dict(t=captured, capturedAt=captured, sentAt=time.time(),
-                              captureClock="unix-seconds", captureTiming="camera-read-complete",
-                              coordinateSpace="screen-points", screenOrigin=[0, 0],
-                              x=round(last_xy[0], 2), y=round(last_xy[1], 2), sw=screen[0], sh=screen[1],
-                              valid=point is not None, face=bool(obs.ok), blink=bool(obs.ok and frozen),
-                              yaw=float(obs.yaw), pitch=float(obs.pitch), setupId=args.setup_id,
-                              profileId=args.profile)
-                sender.sendto(json.dumps(sample, allow_nan=False).encode(), ("127.0.0.1", args.port))
-                sent += 1
-                valid += point is not None
+        with threadpool_limits(limits=1):
+            stats.enter("model-load")
+            before = time.monotonic()
+            predict, _ = load_predictor(model, screen)
+            ax, bx, ay, by = alignment_values(model)
+            evidence = calibration_eye_evidence(model, getattr(args, "calibration_metadata", None))
+            gate, smoother = BlinkGate(eye_evidence=evidence), GazeSmoother()
+            coordinates = HeldCoordinates(screen)
+            stats.observe("modelLoad", time.monotonic()-before)
+            stats.enter("tracker-load")
+            before = time.monotonic()
+            tracker = FaceTracker(str(landmarker))
+            stats.observe("trackerLoad", time.monotonic()-before)
+            # Load models before capture so cold initialization cannot accumulate
+            # camera frames or turn startup delay into stale first predictions.
+            stats.enter("camera-open")
+            before = time.monotonic()
+            cap = open_selected_camera(args)
+            stats.observe("cameraOpen", time.monotonic()-before)
+            started = time.monotonic()
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+                while not args.seconds or time.monotonic()-started < args.seconds:
+                    stats.enter("capture-read")
+                    before = time.monotonic()
+                    ok, frame, timing = cap.read_timed()
+                    stats.observe("read", time.monotonic()-before)
+                    if not ok:
+                        stats.count("readTimeouts")
+                        continue
+                    captured_mono, captured = timing["capturedMonotonic"], timing["capturedAt"]
+                    stats.frame(captured_mono)
+                    stats.observe("captureToRead", time.monotonic()-captured_mono)
+                    if not 0 <= time.monotonic()-captured_mono <= MAX_FRAME_AGE_S:
+                        stats.count("staleBefore")
+                        gate.reject(captured_mono, "stale-frame")
+                        stats.set_eye(gate.diagnostics(captured_mono))
+                        continue
+                    frame = cv2.flip(frame, 1)
+                    stats.enter("inference")
+                    before = time.monotonic()
+                    obs = process_timed(tracker, frame, captured_mono)
+                    stats.observe("inference", time.monotonic()-before)
+                    stats.count("processed")
+                    fresh = 0 <= time.monotonic()-captured_mono <= MAX_FRAME_AGE_S
+                    frozen = gate.update(obs, captured_mono, fresh=fresh,
+                                         quality_reason=observation_quality_reason(obs, frame.shape[1]))
+                    stats.enter("prediction")
+                    before = time.monotonic()
+                    point = None
+                    # Check finite model output throughout the recovery hold;
+                    # closure/no-face/bad-quality frames never run prediction.
+                    if not frozen or gate.recovery_at is not None:
+                        prediction = predict(obs)
+                        if not finite_point(prediction):
+                            frozen = gate.reject(captured_mono, "invalid-prediction")
+                        elif not frozen:
+                            point = (ax * float(prediction[0]) + bx, ay * float(prediction[1]) + by)
+                            if not all(math.isfinite(v) for v in point):
+                                point = None
+                                frozen = gate.reject(captured_mono, "invalid-aligned-prediction")
+                    stats.observe("prediction", time.monotonic()-before)
+                    stale = not 0 <= time.monotonic()-captured_mono <= MAX_FRAME_AGE_S
+                    if stale:
+                        stats.count("staleAfter")
+                        point = None
+                        frozen = gate.reject(captured_mono, "stale-frame")
+                    if point is not None:
+                        if coordinates.expired(captured_mono): smoother = GazeSmoother()
+                        point = smoother.apply(*point, captured_mono)
+                        if not finite_point(point):
+                            point = None
+                            frozen = gate.reject(captured_mono, "invalid-filtered-prediction")
+                    last_xy, coordinate_state, held_age = coordinates.select(point, captured_mono)
+                    eye = gate.diagnostics(captured_mono)
+                    stats.set_eye(eye)
+                    if not obs.ok: stats.count("noFace")
+                    if obs.ok and frozen: stats.count("blink")
+                    if eye["gatedSeconds"] >= 2: stats.count("prolongedGate")
+                    stats.enter("udp-send")
+                    before = time.monotonic()
+                    pipeline = dict(worker=stats.snapshot(), capture=cap.diagnostics())
+                    sample = dict(t=captured, capturedAt=captured, sentAt=time.time(),
+                                  captureClock="unix-seconds", captureTiming="native-host-clock-pts",
+                                  coordinateSpace="screen-points", screenOrigin=[0, 0],
+                                  x=round(last_xy[0], 2), y=round(last_xy[1], 2), sw=screen[0], sh=screen[1],
+                                  valid=point is not None, stale=stale, face=bool(obs.ok), blink=bool(obs.ok and frozen),
+                                  validityReason="eligible" if point is not None else eye["reason"],
+                                  coordinateState=coordinate_state, heldCoordinateAgeS=held_age,
+                                  yaw=float(obs.yaw) if math.isfinite(float(obs.yaw)) else 0.,
+                                  pitch=float(obs.pitch) if math.isfinite(float(obs.pitch)) else 0., setupId=args.setup_id,
+                                  profileId=args.profile, frameSequence=timing["sequence"],
+                                  sentSequence=pipeline["worker"]["counts"]["sent"]+1,
+                                  blinkDiagnostics=eye,
+                                  frameTiming={k: timing[k] for k in ("deliveredAt", "receivedAt", "readAt")},
+                                  pipelineDiagnostics=pipeline)
+                    sender.sendto(json.dumps(sample, allow_nan=False).encode(), ("127.0.0.1", args.port))
+                    stats.observe("send", time.monotonic()-before)
+                    stats.observe("captureToSend", time.monotonic()-captured_mono)
+                    stats.count("sent")
+                    if point is not None: stats.count("valid")
+        completed = True
     finally:
-        tracker.close()
-        cap.release()
-        cv2.destroyAllWindows()
-    print("GOZ_STREAM " + json.dumps(dict(samples=sent, valid=valid, elapsed=time.monotonic()-started)), flush=True)
+        stats.enter("completed" if completed else "failed")
+        if tracker is not None: tracker.close()
+        if cap is not None: cap.release()
+        reporter.close()
+    print("GOZ_STREAM " + json.dumps(snapshot()), flush=True)
 
 
 def check_alignment(args, model, landmarker, screen):
@@ -330,6 +430,7 @@ def main():
     if args.command != "calibrate":
         metadata = json.loads(model.with_suffix(".report.json").read_text())
         validate_compatibility(metadata, repo, args.profile, screen)
+        args.calibration_metadata = metadata
         if args.command == "stream" and metadata.get("verdict") not in ("STABLE", "USABLE"):
             raise ValueError("This model failed gaze validation. Run a passing fresh check or recalibrate before streaming it into the adaptive story.")
         if args.camera_device_id and args.camera_device_id != metadata["cameraDeviceId"]:

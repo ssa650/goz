@@ -35,6 +35,15 @@
         <video id="video-next" hidden muted playsinline preload="auto" disablepictureinpicture disableremoteplayback></video>
         <canvas id="overlay-canvas"></canvas>
         <div id="overlay">Set up the opening scene below, then press Start.</div>
+        <div id="mapping-panel" aria-label="Screen mapping">
+          <p id="mapping-message" role="status" aria-live="polite">Gaze cannot map to video yet. Click Map gaze to video, then click three targets. Eye calibration stays separate.</p>
+          <div class="mapping-actions">
+            <button id="mapping-start" class="secondary" type="button">Map gaze to video</button>
+            <button id="mapping-cancel" class="secondary" type="button" hidden>Cancel mapping</button>
+            <button id="mapping-exit-fullscreen" class="secondary" type="button" hidden>Exit fullscreen</button>
+          </div>
+        </div>
+        <button id="mapping-target" type="button" tabindex="-1" hidden>1</button>
       </div>
       <div class="player-footer">
         <p id="stage" role="status">Idle.</p>
@@ -89,7 +98,7 @@
       <div class="card">
         <div class="card-head"><h3>Gaze target</h3><span id="gaze-source" class="pill">—</span></div>
         <div id="gaze-target" class="big">—</div>
-        <div class="metrics"><span>valid dwell <b id="dwell">0.0</b>s</span><span>attention <b id="response-strength">0%</b></span><span>tracking quality <b id="gaze-confidence">0%</b></span></div>
+        <div class="metrics"><span>valid dwell <b id="dwell">0.0</b>s</span><span>attention <b id="response-strength">—</b></span><span>tracking quality <b id="gaze-confidence">—</b></span></div>
         <div class="metrics"><span>blinks <b id="blinks">—</b>/min</span><span>head yaw <b id="yaw">—</b>°</span><span>gaze <b id="gaze-hz">—</b> Hz</span></div>
       </div>
       <div class="card">
@@ -99,11 +108,11 @@
         <p id="eeg-quality" class="hint"></p>
       </div>
       <div class="card">
-        <div class="card-head"><h3>Viewer profile</h3><span id="profile-clips" class="pill">0 scenes</span></div>
+        <div class="card-head"><h3>Viewer profile</h3><span id="profile-clips" class="pill">0 scenes evaluated</span></div>
         <div id="affinity"></div>
         <div id="prefs"></div>
         <h4>What changed</h4>
-        <ul id="changes" class="changes"><li class="hint">Nothing yet: watch the first scene.</li></ul>
+        <ul id="changes" class="changes"><li class="hint">No viewing evidence yet; starting settings retained.</li></ul>
       </div>
       <div class="card decision">
         <h3>Intended story state</h3><p id="story-state" class="hint">Waiting for the opening scene.</p>

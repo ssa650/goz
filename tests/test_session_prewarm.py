@@ -106,8 +106,8 @@ async def test_frozen_gaze_only_abstains_both_eeg_policies_and_retains_gaze_focu
     monkeypatch.setattr(s.eeg,'status',lambda:deepcopy(q))
     feed_before=deepcopy(s.eeg.calibration)
     boxes={'Ana':[.05,.1,.4,.9],'Bea':[.6,.1,.95,.9]}
-    clip['track']=[dict(t=i/8,valid_until=(i+1)/8,boxes=boxes,clip_id=clip['id'],session_id=s.id) for i in range(29)]
-    for i in range(71):
+    clip['track']=[dict(t=i/8,valid_until=(i+1)/8,boxes=boxes,clip_id=clip['id'],session_id=s.id) for i in range(41)]
+    for i in range(101):
         clock[0]=s.started+i/20
         if i%5==0:s.eeg.series.append((clock[0],.6,1.5,False))
         s.gaze.add(dict(t=clock[0],x=75,y=50,valid=True,face=True,confidence=.9,yaw=0))

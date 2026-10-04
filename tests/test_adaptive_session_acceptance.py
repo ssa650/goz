@@ -132,7 +132,7 @@ async def test_comparative_visibility_does_not_extend_deadline_for_late_dwell(tm
     original=deepcopy(s.profile)
     # Both actors are observable, but the viewer makes only brief, evenly
     # divided looks at either actor; most valid gaze stays on background.
-    for i in range(63):
+    for i in range(93):
         phase=(i%20)/20
         x=20 if phase<.15 else 80 if phase<.3 else 50
         captured_tick(s,clock,i/20,x,50 if x!=50 else 5)
@@ -143,14 +143,14 @@ async def test_comparative_visibility_does_not_extend_deadline_for_late_dwell(tm
     assert s.profile==original, 'previewing must not learn or increment real profile clips'
 
     # Sustained Patrick gaze starts too late to qualify by the deadline.
-    for i in range(63,161):
+    for i in range(93,161):
         captured_tick(s,clock,i/20,80,50)
         if clip.get('analysisStarted'):
             break
     assert clip.get('analysisStarted')
     assert s.profile==original, 'only adapt(), not the synchronous preview, learns'
     await s.task
-    assert clip['frozenEvidence']['end']-s.started==pytest.approx(3.5)
+    assert clip['frozenEvidence']['end']-s.started==pytest.approx(5.0)
     assert s.profile['policy']['focus'] is None, 'late dwell cannot extend the frozen window'
     assert s.profile['clips']==1 and not engine.jobs
     await engine.close()
@@ -165,7 +165,7 @@ async def test_deadline_can_commit_balanced_when_no_action_ever_becomes_valid(tm
     for i in range(70):
         captured_tick(s,clock,i/20)  # Valid background, no target preference.
     assert not clip.get('analysisStarted')
-    captured_tick(s,clock,3.5)
+    captured_tick(s,clock,5.0)
     assert clip.get('analysisStarted')
     await s.task
     assert s.profile['policy']['focus'] is None
@@ -192,7 +192,7 @@ async def test_deadline_supports_readability_with_preserved_absolute_evidence(tm
     assert clip.get('analysisStarted'), 'readability adjustments must not wait for a character preference'
     assert s.profile['clips']==0
     await s.task
-    assert clip['analysis']['valid_gaze_s']<=3.5
+    assert clip['analysis']['valid_gaze_s']<=5.0
     assert s.profile[readability]<0, 'adequate absolute readability evidence fits the opening window'
     assert s.profile['policy']['focus'] is None
     assert not engine.jobs
@@ -245,6 +245,6 @@ async def test_continuation_readiness_includes_extraction_composition_and_engine
     assert job['continuationReadyMs']==pytest.approx(10700)
     assert continuation['timing']['continuationReadyMs']==pytest.approx(10700)
     assert s.readiness_samples==[10.7]
-    assert s.analyze_at({'duration':20})==pytest.approx(3.5)
+    assert s.analyze_at({'duration':20})==pytest.approx(5.0)
     assert 'continuationStarted' not in job, 'process-local monotonic timestamps must not be persisted'
     await engine.close()

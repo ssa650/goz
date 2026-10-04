@@ -1,0 +1,152 @@
+GÖZ eye-state recovery: source-only verification, 2026-10-04
+
+Outcome
+The persistent generic eye-state lockout can now recover using the saved
+viewer's measured open-lid evidence. Recovery preserves uncertainty, keeps
+the original closure onset, and requires continuous fresh observations and
+usable model output. It never opens solely because a gate has lasted long.
+No camera, EEG, UI, OS permission, restart, process kill, paid API call,
+staging, commit or push was performed. Existing transport/timestamp changes
+remain intact. No sensors.py, native camera, frontend or media files were
+edited by this task. The pre-existing index/working-tree edits were retained.
+
+Evidence
+Run: c3da329e-2dcb-4546-a65e-b72ee4500ff5, began 11:39:59.800 UTC.
+Model: data/calibration/d2bdd4e9-2193-43ae-8942-472165a65a3f/gaze_model.pkl.
+Its schema3 report is STABLE, mean error 73.1 screen points, viewer default,
+screen 1710x1107, verified FaceTime HD UID
+3642F2CD-E322-42E7-9360-19815B003AA6. The current feature/model hash matches
+the report. The replay independently checked existing compatibility rules.
+
+The previous gate froze on blink score >0.28 or minimum lid openness <0.16.
+It reopened only after score <0.18 and lids >0.184 for 250ms. In scenes 2–4,
+scores frequently stayed around 0.22–0.25 while lid openness stayed around
+0.27. These frames provided neither closure onset nor strict reopen evidence,
+so a previous closure left the gate frozen indefinitely. This demonstrates
+a persistent classifier/state-machine lockout, not continuous actual blinking.
+The complete playback logs extend the reported 45.49s failure interval: the
+same gate reaches 57.929s in the scene-4 tail. Distinct high-score/collapsed-lid
+episodes also occur within this interval and remain rejected after the fix.
+
+The model's own dataset has 923 accepted calib rows and 327 probe rows. Calib
+blink scores range 0.0592–0.3406, showing the calibration's <0.35 rule differs
+from live hysteresis. Calib minimum lid openness ranges 0.2570–0.3672; its
+measured 1st percentile is 0.2673588393608966. All 327 held-out probe rows
+independently meet that lid floor. No closed-eye labels are present here.
+Dataset SHA-256:
+70693bfca06457dea657148dc3e6f55ce03a8143c70f57e7eb0d6b8aa25ccd42
+
+Implementation
+backend/gaze_pipeline.py reads only the validated model folder's single
+dataset session. Schema/verdict/held-out/UID/screen metadata must agree;
+at least 100 calib rows, 80 probe rows and four targets in each group are
+required. Finite 14-feature open-target rows and calibration pose bounds
+are checked. Probe support must be >=95%. Missing, mixed, damaged or
+insufficient evidence disables alternative recovery with a diagnostic reason.
+Reading is bounded to 8 MiB and occurs once before the camera opens.
+
+Generic onset=0.28, reopen=0.18, lid-collapse=0.16 and strict hold=250ms remain.
+After >=2s of gating, recovery additionally allows sub-onset scores when
+both lids meet the measured calibration floor continuously for >=750ms.
+An observation gap >150ms restarts this evidence. Face loss, closure,
+invalid eye features, quality rejection, stale frames or non-increasing
+capture timestamps reset recovery. A recovered ambiguous sample continues
+to need calibrated lid evidence and cadence; losing either gates it again.
+Personal blink profiles take precedence and disable this alternate path.
+No ambiguous stream samples are used to learn or lower the baseline.
+
+The percentile, minimum counts, wait/hold timers and cadence bound are
+conservative engineering choices, not measurements of classification accuracy.
+Calibration rows were accepted during gaze-target collection; they support
+open-lid consistency but do not supply a validated blink/closure classifier.
+
+backend/gaze_worker.py passes the already validated calibration metadata.
+It enforces finite 14-feature model input, finite pose/quality values, the
+calibration pose limit (<30 degrees yaw/pitch), calibration setup lighting
+(40–235) and face scale (interocular/frame width 0.03–0.40). Gazekit supplies
+no prediction-confidence value; none is invented. Finite output is checked
+throughout a recovery hold and invalid output resets it. Camera-native
+capture times own all holds, coordinate ages and freshness. Frames stale
+before or after inference reset recovery. Closure, face loss and bad
+observation quality do not invoke the gaze predictor.
+
+Invalid coordinates may be held only for 250ms after a valid point. They then
+become a finite center placeholder tagged coordinateState=unavailable and
+valid=false; heldCoordinateAgeS is null. No dwell eligibility is assigned to
+the placeholder. A new smoother is created after hold expiration, avoiding
+old fixation state contaminating reacquired points. Outside-screen model
+coordinates remain unclipped, preserving the earlier mapping contract.
+
+Diagnostics remain present in packets and durable snapshots. New fields
+include uncertain, recovered, recovery reason/baseline/provenance/count,
+continuous evidence duration, validityReason, coordinateState and held age.
+Recovered ambiguous samples explicitly report calibrated-open-recovery and
+uncertain=true. The existing camera UID and schema3/viewer/display/model
+compatibility checks are retained. Calibration/model artifacts are unchanged.
+
+Recorded replay
+The before implementation is snapshotted in
+output/eye-gate-recovery/gaze_pipeline_before.py, SHA-256
+e218a9201cd591a86ccbb0fb9a1fb52a7d6fff7b28dd1d4867e7e64104deb84b.
+Both gates use the recorded capture timestamps and the first recorded frozen
+state/gate duration. Overlapping complete-scene samples are deduplicated by
+setup ID/native sequence for continuous replay, then counted in their original
+scene windows. There are 1753 unique frames. No historical file was rewritten.
+
+Scene     Samples   Recorded valid   Before eye eligible   After eye eligible
+1         409       100              100                   221
+2         455       0                0                     350
+3         459       0                0                     178
+4         464       0                0                     252
+
+All 780 newly eligible scene-2–4 window samples remain explicitly uncertain.
+Every closure-evidence sample (score >0.28 or lids <0.16) stays gated:
+scene 1: 0/86 accepted; scene 2: 0/27; scene 3: 0/79; scene 4: 0/30.
+These window counts include overlap; unique replay avoids double advancement.
+
+Replay command, from /Users/shayan/goz:
+.venv/bin/python tests/replay_eye_gate.py \
+  --run data/adaptive/c3da329e-2dcb-4546-a65e-b72ee4500ff5 \
+  --model data/calibration/d2bdd4e9-2193-43ae-8942-472165a65a3f/gaze_model.pkl \
+  --baseline output/eye-gate-recovery/gaze_pipeline_before.py \
+  --repo /Users/shayan/gazekit \
+  --report output/eye-gate-recovery/replay.json
+
+Validation
+Owned source/test files were frozen at 12:04:36.652 UTC; hashes are in
+output/eye-gate-recovery/source-freeze.json and verified after testing.
+Combined focused suite: 75 passed, 1 deselected, 3.63s. The deselected HTTP
+full_recalibration_api test needs loopback binding; other camera identity and
+compatibility tests passed. Logs/JUnit: focused-tests.txt and focused-tests.xml
+in output/eye-gate-recovery/. Compile checks and scoped git diff --check pass.
+
+Synthetic replay: eight 10s, 300-frame negative scenarios each have zero
+eligible frames: low-score closed lids, high blink score with open-looking
+lids, absent face, stale frames, invalid predictions, poor lighting, weak
+lid evidence and missing calibration evidence. A 200ms simulated blink
+rejects all six closure frames and regains strict open evidence afterward.
+Unit tests also cover interrupted recovery, duplicate/delivery-gap timestamps,
+NaN in either eye, damaged/mixed/insufficient calibration evidence, personalized
+profile precedence, pose/scale/model-feature quality and bounded coordinates.
+A fake-camera/fake-model/fake-UDP worker test checks packet-level recovery,
+prediction rejection, lighting/face loss, stale-before/stale-after handling,
+no prediction during closure and held-coordinate expiration.
+
+Limits and remaining validation
+Recorded results measure eye-gate eligibility only. The historical logs lack
+raw 14-feature vectors, brightness, face scale and unsuppressed predictions,
+so full post-change valid gaze, prediction quality and accuracy cannot be
+reconstructed. Recorded closure evidence is not human-labelled blink truth.
+No genuine labelled closed-eye dataset was available. A true partial closure
+misreported simultaneously as sub-onset score and calibrated-open lids could
+still be accepted; the available evidence cannot estimate that risk.
+Synthetic zero false acceptances do not establish a real-world rate.
+No live camera/EEG, real-face inference, new gaze accuracy, frontend geometry,
+profile display or end-to-end adaptive session validation was performed.
+Those remain separate from this source/replay verification.
+
+Workspace instructions
+No AGENTS.md or .agents directory exists in this repo or its parent chain.
+/Users/shayan/.codex/AGENTS.md was read and is empty. No relevant local skill
+instructions were available. The delegated edit scope and restrictions were
+followed; broader aggregate validation belongs to the coordinating parent.

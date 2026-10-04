@@ -4,7 +4,9 @@ import { museProgress } from './muse-status.js';
 import { currentObservation } from './adaptive-observation.js';
 import { trackerValue, trackingSummary } from './adaptive-tracker.js';
 import { PlaybackQueue } from './queue.js';
-import { videoContentRect, ScreenPointMapping, boxesAt } from './adaptive-geometry.js';
+import { PresentedFrameCapture, applyTrackingReply } from './presented-frame.js';
+import { videoContentRect, visibleContentRect, mappingIdentity, ScreenPointMapping, boxesAt } from './adaptive-geometry.js';
+import { profilePresentation } from './adaptive-profile.js';
 const $ = id => document.getElementById(id);
 const COLORS = ['#e07a5f', '#3d85c6', '#81b29a', '#f2cc8f'];
 let video = $('video');
@@ -16,13 +18,32 @@ let clockOffset = 0, tickPending = false, pendingStop = null;
 let endingIndex = null;
 let playbackEpoch = 0, presented = null, lastTickAt = 0, playerMode = 'idle';
 const screenMapping = new ScreenPointMapping();
+const trackingCapture = new PresentedFrameCapture(document.createElement('canvas'));
 let lastPresentedClip = null;
 const ending = new Set();
 setupTracePanel($('trace-panel'), () => sessionId);
-const windowKey = () => [window.screenX, window.screenY, window.innerWidth, window.innerHeight, devicePixelRatio, screen.width, screen.height, !!document.fullscreenElement].join(':');
+const isFullscreen = () => !!(document.fullscreenElement || document.webkitFullscreenElement);
+const windowKey = () => mappingIdentity({screenX:window.screenX,screenY:window.screenY,innerWidth,innerHeight,
+  outerWidth,outerHeight,devicePixelRatio,screen,fullscreen:isFullscreen(),visualViewport:window.visualViewport});
+let mappingValidSince = Infinity, geometryChangedAt = Infinity, lastGeometryKey = '', lastMappingRevision = -1;
 window.addEventListener('pointermove', e => {
-  screenMapping.observe(e, windowKey());
+  if (e.isTrusted && ['mouse','pen'].includes(e.pointerType)) screenMapping.validatePointer(e,windowKey());
 });
+for (const event of ['resize','focus']) window.addEventListener(event,renderMappingStatus);
+for (const event of ['resize','scroll']) window.visualViewport?.addEventListener(event,renderMappingStatus);
+for (const event of ['fullscreenchange','webkitfullscreenchange']) document.addEventListener(event,renderMappingStatus);
+for (const id of ['show-gaze','show-boxes']) $(id).addEventListener('change',renderMappingStatus);
+$('mapping-panel').addEventListener('click',e=>e.stopPropagation());
+$('mapping-start').addEventListener('click',()=>{screenMapping.beginRecovery(windowKey());renderMappingStatus();});
+$('mapping-cancel').addEventListener('click',()=>{screenMapping.reset(windowKey(),'mapping-recovery-cancelled');renderMappingStatus();});
+$('mapping-exit-fullscreen').addEventListener('click',()=>document.exitFullscreen().catch(e=>error(e.message)));
+$('mapping-target').addEventListener('click',e=>e.stopPropagation());
+$('mapping-target').addEventListener('pointerdown',e=>{
+  e.stopPropagation();
+  if (!e.isTrusted || e.button!==0 || !['mouse','pen'].includes(e.pointerType)) return;
+  screenMapping.acceptAnchor(e,windowKey()); renderMappingStatus();
+});
+setInterval(renderMappingStatus,150); // Window moves need not dispatch resize.
 
 async function request(path, options) {
   const controller=new AbortController(), timeout=setTimeout(()=>controller.abort(),8000);
@@ -111,15 +132,83 @@ $('sound').addEventListener('click', () => { sound = !sound; player.setSound(sou
 
 // -- player -------------------------------------------------------------------
 function contentRect() {
-  return videoContentRect(video.getBoundingClientRect(), video.videoWidth, video.videoHeight, getComputedStyle(video).objectFit);
+  const style=getComputedStyle(video);
+  return videoContentRect(video.getBoundingClientRect(),video.videoWidth,video.videoHeight,style.objectFit,style.objectPosition);
+}
+function visibleRect(c,element=video) {
+  const v=window.visualViewport;
+  const bounds=[{left:v?.offsetLeft || 0,top:v?.offsetTop || 0,w:v?.width ?? innerWidth,h:v?.height ?? innerHeight}];
+  const r=element.getBoundingClientRect(); bounds.push({left:r.left,top:r.top,w:r.width,h:r.height});
+  for (let ancestor=element.parentElement; ancestor; ancestor=ancestor.parentElement) {
+    const style=getComputedStyle(ancestor), r=ancestor.getBoundingClientRect();
+    const clipX=/^(hidden|clip|scroll|auto)$/.test(style.overflowX), clipY=/^(hidden|clip|scroll|auto)$/.test(style.overflowY);
+    if (clipX || clipY) bounds.push({left:clipX ? r.left+ancestor.clientLeft : -1e9,
+      top:clipY ? r.top+ancestor.clientTop : -1e9,w:clipX ? ancestor.clientWidth : 2e9,h:clipY ? ancestor.clientHeight : 2e9});
+  }
+  return visibleContentRect(c,bounds);
+}
+function mappingGeometry() {
+  const key=windowKey(); screenMapping.sync(key);
+  if (lastMappingRevision!==screenMapping.revision) {
+    lastMappingRevision=screenMapping.revision; mappingValidSince=Infinity;
+  }
+  if (screenMapping.valid(key) && mappingValidSince===Infinity) mappingValidSince=Date.now()+clockOffset;
+  const content=contentRect(), visible=content ? visibleRect(content) : null;
+  const geometryKey=JSON.stringify([content,visible]);
+  if (geometryKey!==lastGeometryKey) {lastGeometryKey=geometryKey;geometryChangedAt=Date.now()+clockOffset;}
+  const reason=video.webkitDisplayingFullscreen ? 'native-video-fullscreen' : window.visualViewport?.scale!==undefined && window.visualViewport.scale!==1 ?
+    'visual-viewport-scaled' : !content ? 'video-content-unavailable' : !visible?.w || !visible?.h ? 'video-not-visible' : null;
+  return {key,content,visible,reason};
 }
 function screenRect() {
-  const c = contentRect(); if (!c || !screenMapping.valid(windowKey())) return null;
-  const convert = r => screenMapping.rect(r,windowKey());
-  const r = video.getBoundingClientRect();
-  const left = Math.max(c.left,r.left,0), top = Math.max(c.top,r.top,0);
-  const right = Math.min(c.left+c.w,r.right,innerWidth), bottom = Math.min(c.top+c.h,r.bottom,innerHeight);
-  return {rect:convert(c), visible_rect:convert({left,top,w:Math.max(0,right-left),h:Math.max(0,bottom-top)})};
+  const {key,content,visible,reason}=mappingGeometry();
+  if (reason || !content || !visible || !screenMapping.valid(key)) return null;
+  return {rect:screenMapping.rect(content,key),visible_rect:screenMapping.rect(visible,key)};
+}
+// Frame-feed uses these hooks. Diagnostics contain bounded scalars, never anchors
+// or raw camera points. Geometry validity and eye calibration stay separate.
+function mappingAudit() {
+  const geometry=mappingGeometry(), v=window.visualViewport, audit=screenMapping.audit(geometry.key);
+  return {...audit,valid:audit.valid && !geometry.reason,reason:geometry.reason || audit.reason,
+    devicePixelRatio,screenWidth:screen.width,screenHeight:screen.height,
+    viewportWidth:v?.width ?? innerWidth,viewportHeight:v?.height ?? innerHeight,
+    viewportOffsetX:v?.offsetLeft || 0,viewportOffsetY:v?.offsetTop || 0,viewportScale:v?.scale ?? 1,
+    windowX:window.screenX,windowY:window.screenY,fullscreen:isFullscreen(),
+    gazeOverlayEnabled:$('show-gaze').checked,boxesOverlayEnabled:$('show-boxes').checked};
+}
+function mappingAllowsObservation(point) {
+  return !!point && mappingAudit().valid && Number.isFinite(point.t) &&
+    point.t*1000>=Math.max(mappingValidSince,geometryChangedAt);
+}
+function renderMappingStatus() {
+  const geometry=mappingGeometry(), audit=screenMapping.audit(geometry.key), panel=$('mapping-panel');
+  const r=$('screen').getBoundingClientRect(), view=visibleRect({left:r.left,top:r.top,w:r.width,h:r.height},$('screen'));
+  panel.hidden=!view.w || !view.h;
+  panel.style.left=`${Math.max(0,view.left-r.left)+12}px`;
+  panel.style.bottom=`${Math.max(0,r.bottom-view.top-view.h)+12}px`;
+  panel.style.maxWidth=`${Math.max(0,view.w-24)}px`;
+  const active=screenMapping.recoveryActive;
+  $('mapping-start').hidden=active; $('mapping-cancel').hidden=!active;
+  $('mapping-exit-fullscreen').hidden=!isFullscreen();
+  const tooSmall=view.w<180 || view.h<180;
+  $('mapping-start').disabled=tooSmall || geometry.reason==='visual-viewport-scaled' || geometry.reason==='native-video-fullscreen';
+  $('mapping-target').hidden=!active || tooSmall;
+  if (active && tooSmall) screenMapping.reset(geometry.key,'player-too-small-for-targets');
+  if (active && !tooSmall) {
+    const positions=[[.15,.15],[.85,.6],[.5,.35]], n=screenMapping.recoverySamples;
+    $('mapping-target').style.left=`${view.left-r.left+view.w*positions[n][0]}px`;
+    $('mapping-target').style.top=`${view.top-r.top+view.h*positions[n][1]}px`;
+    $('mapping-target').textContent=`${n+1}`; $('mapping-target').setAttribute('aria-label',`Mapping target ${n+1} of 3; click with mouse or pen`);
+  }
+  const guidance=geometry.reason==='visual-viewport-scaled' ? 'Return pinch zoom to 100%, then map gaze to video.' :
+    geometry.reason==='native-video-fullscreen' ? 'Exit native video fullscreen, then use the player Fullscreen button to map gaze.' :
+    tooSmall ? 'Enlarge the player or scroll it into view to click mapping targets.' :
+    active ? `Click target ${screenMapping.recoverySamples+1} of 3 with the mouse or pen. Keep this window on the eye-calibrated display.` :
+    audit.valid && !geometry.reason ? `Screen mapping ready · measured scale ${audit.scale.toFixed(3)}. Eye calibration is a separate check.` :
+    audit.valid ? 'Screen mapping measured; waiting for visible video dimensions.' :
+    `Gaze cannot map to video${audit.reason==='window-display-or-zoom-changed' ? ': window, fullscreen or display changed' : audit.reason==='pointer-transform-inconsistent' || audit.reason==='pointer-transform-changed' ? ': pointer coordinates changed or did not agree' : ''}. Click Map gaze to video, then click three targets. Eye calibration stays separate.`;
+  $('mapping-message').textContent=guidance; $('mapping-state').textContent=guidance;
+  $('mapping-start').textContent=audit.valid ? 'Check screen mapping' : 'Map gaze to video';
 }
 function transitionDiagnostic(diagnostic) {
   const s = state?.session, sid = sessionId;
@@ -144,7 +233,9 @@ for (const v of videos) {
     ending.add(v.clipIndex); void playbackEvent('ended', v); playingIndex = null; presented = null;
   });
   v.addEventListener('canplay', () => void playbackEvent('ready', v));
-  v.addEventListener('seeking', () => { if (v === video) { playbackEpoch++; presented=null; void reportTick(false); } });
+  v.addEventListener('seeking', () => { if (v === video) { playbackEpoch++; presented=null;
+    const clip=state?.session?.clips[playingIndex];if(clip)clip.track=(clip.track||[]).filter(f=>f.playback_epoch==null);
+    void reportTick(false); } });
   v.addEventListener('pause', () => { if (v === video) void reportTick(false); });
   v.addEventListener('waiting', () => { if (v === video) { void reportTick(false); void playbackEvent('waiting',v); } });
   if ('requestVideoFrameCallback' in v) {
@@ -182,21 +273,27 @@ function managePlayer(s) {
   player.update(s.clips.map(c => c.url && ['ready','playing','watched'].includes(c.status) ? c : null), s.status === 'finished' ? 'completed' : s.status);
 }
 async function reportTick(playing) {
-  if (playingIndex == null || !state?.session || (playing && (tickPending || performance.now()-lastTickAt < 80))) return;
+  if (playingIndex == null || !state?.session) return;
+  if (playing && tickPending) { trackingCapture.count('request_in_flight'); return; }
+  if (playing && performance.now()-lastTickAt < 80) return;
   const mapping = screenRect() || {rect:null,visible_rect:null};
   const sid=sessionId, index=playingIndex, clip=state.session.clips[index];
   const fresh=presented && performance.now()-presented.at < 250;
   const hasFrames='requestVideoFrameCallback' in video;
-  const active=playing && !video.paused && !video.seeking && !video.ended && video.readyState>=3 && (!hasFrames || fresh);
-  const payload={session_id:sid,clip:index,clip_id:clip.id,epoch:playbackEpoch,
+  const active=playing && !document.hidden && !video.hidden && !video.paused && !video.seeking && !video.ended && video.readyState>=2 && (!hasFrames || fresh);
+  const payload={session_id:sid,clip:index,clip_id:clip.id,epoch:playbackEpoch,tracking_run_id:clip.trackingRunId,
       video_t:fresh && active ? presented.time : video.currentTime,playing:!!active,playback_rate:video.playbackRate,
-      ...mapping,mapping: {...screenMapping.audit(windowKey()),devicePixelRatio,screenWidth:screen.width,screenHeight:screen.height},wall:fresh && active ? presented.wall : Date.now()+clockOffset};
-  if (tickPending) { if (!playing && !pendingStop) pendingStop=payload; return; }
+      ...mapping,mapping:mappingAudit(),wall:fresh && active ? presented.wall : Date.now()+clockOffset};
+  if (tickPending) { if (!playing) pendingStop=payload; return; }
+  const frame=trackingCapture.capture(video,{sessionId:sid,clipId:clip.id,epoch:playbackEpoch,mediaTime:payload.video_t},
+    active && clip.detectionInput==='presented_video_frame');
+  if (frame) payload.tracking_frame=frame;
+  payload.tracking_capture=trackingCapture.diagnostics();
   lastTickAt=performance.now(); await sendCapturedTick(payload);
 }
 async function sendCapturedTick(payload) {
   tickPending=true;
-  try {await post('/api/adaptive/tick',payload);}
+  try {const reply=await post('/api/adaptive/tick',payload);applyTrackingReply(state,payload,reply,playbackEpoch);}
   catch(e) {$('backend-status').textContent=`Playback sync: ${e.message}`;}
   finally {tickPending=false;if(pendingStop){const next=pendingStop;pendingStop=null;void sendCapturedTick(next);}}
 }
@@ -231,7 +328,7 @@ function draw() {
       }
     }
     const g = matchingPoint;
-    if ($('show-gaze').checked && g && g.valid && g.on_video && Date.now()+clockOffset-g.t*1000 < 500) {
+    if ($('show-gaze').checked && g && g.valid && g.on_video && mappingAllowsObservation(g) && Date.now()+clockOffset-g.t*1000 < 500) {
       ctx.beginPath(); ctx.arc(ox + g.nx * c.w, oy + g.ny * c.h, 11, 0, 2 * Math.PI);
       ctx.strokeStyle = g.target ? '#baf5ce' : '#ffffff'; ctx.lineWidth = 3; ctx.stroke();
     }
@@ -260,14 +357,15 @@ function drawEeg(series) {
 }
 function render(st) {
   state = st; const s = st.session;
+  renderMappingStatus();
   const setup = st.setup;
   $('sensor-setup').hidden = !setup?.required && !setup?.enabled && setup?.eegMode !== 'muse';
   $('sensor-message').textContent = (setup?.error || setup?.message || '') +
     (setup && (setup.muse.source === 'mindmonitor' || setup.phase === 'calibrating_muse') ? ` (${museProgress(setup.muse)})` : '');
   if (setup?.camera?.name) $('sensor-message').textContent += ` Camera ${setup.camera.verified ? 'opened and verified' : 'selected; awaiting verification'}: ${setup.camera.name}.`;
   const museState = setup?.museConnection || {state:'disconnected'};
-  $('muse-connection-status').textContent = museState.state === 'error' ? `Muse connection error: ${museState.error || 'Unknown error'}` :
-    museState.state === 'connecting' ? 'Connecting to Muse 2…' : museState.state === 'connected' ? 'Muse 2 connected.' : 'Muse 2 disconnected. Gaze and playback remain available.';
+  $('muse-connection-status').textContent = museState.message || (museState.state === 'error' ? `Muse connection error: ${museState.error || 'Unknown error'}` :
+    museState.state === 'connecting' ? 'Connecting to Muse 2…' : museState.state === 'connected' ? 'Muse 2 connected.' : 'Muse 2 disconnected. Gaze and playback remain available.');
   $('muse-connect').hidden = !setup || setup.eegMode !== 'muse';
   $('muse-connect').textContent = museState.state === 'error' ? 'Retry Muse 2' : 'Connect Muse 2';
   $('muse-disconnect').hidden = !setup || !['connecting','connected','error'].includes(museState.state);
@@ -295,12 +393,13 @@ function render(st) {
   $('eeg-quality').textContent = (ee.calibrationRetained && !ee.signalReady ? 'Calibration saved; EEG cues unavailable · ' : !ee.live || !(ee.confidence > 0) ? 'EEG unavailable — gaze-only mode · ' : '') + (ee.qualityError || (ee.selectedChannels?.length ? `Calibrated channels: ${ee.selectedChannels.join(', ')}${ee.qualityWarning ? ' · '+ee.qualityWarning : ''}` : ee.goodChannels ? `Good channels: ${ee.goodChannels.join(', ')}` : ''));
   $('gaze-hz').textContent = gz.hz ?? '—'; $('blinks').textContent = gz.blinks_per_min ?? '—'; $('yaw').textContent = gz.yaw != null ? Math.round(gz.yaw) : '—';
   const point=currentObservation(gz.point,sessionId,s?.clips[playingIndex]?.id,(Date.now()+clockOffset)/1000);
-  const target = point?.valid ? point.target : null, tg = $('gaze-target'); tg.replaceChildren();
+  const target = point?.valid && mappingAllowsObservation(point) ? point.target : null, tg = $('gaze-target'); tg.replaceChildren();
   if (target) { const sw = el('span', 'swatch'); sw.style.background = color(target); tg.append(sw, target); }
-  else tg.textContent = !point ? (s?.status !== 'running' ? 'No active video frame' : 'Tracking unavailable / stale') : !point.valid ? 'Tracking invalid' : !point.on_video ? 'Outside video' : point.state === 'ambiguous' ? 'Ambiguous target' : point.state === 'unavailable' ? 'Attribution unavailable' : 'Background';
+  else tg.textContent = s?.status==='running' && !mappingAudit().valid ? 'Screen mapping unavailable' : !point ? (s?.status !== 'running' ? 'No active video frame' : 'Tracking unavailable / stale') : !point.valid ? 'Tracking invalid' : !point.on_video ? 'Outside video' : point.state === 'ambiguous' ? 'Ambiguous target' : point.state === 'unavailable' ? 'Attribution unavailable' : 'Background';
   $('dwell').textContent = (st.response?.characters?.[target]?.dwell_s || 0).toFixed(1);
-  $('response-strength').textContent = `${Math.round(100 * (st.response?.response_strength || 0))}%`;
-  $('gaze-confidence').textContent = `${Math.round(100 * (st.response?.gaze_confidence || 0))}%`;
+  const hasGazeEvidence=st.response?.valid_gaze_s>0;
+  $('response-strength').textContent = hasGazeEvidence ? `${Math.round(100 * (st.response?.response_strength || 0))}%` : '—';
+  $('gaze-confidence').textContent = hasGazeEvidence ? `${Math.round(100 * (st.response?.gaze_confidence || 0))}%` : '—';
   const z = ee.live && ee.confidence > 0 ? ee.series.at(-1)?.z : null; $('eeg-z').textContent = z != null ? `${z >= 0 ? '+' : ''}${z.toFixed(2)}${ee.source === 'mindmonitor' ? '' : 'σ'}` : '—'; drawEeg(ee.series);
   const yoloOption=$('tracker').querySelector('option[value="yoloe"]');
   const yolo=st.trackerAvailability?.yoloe || s?.trackerAvailability?.yoloe;
@@ -315,7 +414,7 @@ function render(st) {
     return;
   }
   if (s.id !== sessionId) {
-    sessionId = s.id; playingIndex = null; endingIndex = null; ending.clear(); playbackEpoch++; presented=null; player.reset(); player.setSound(sound);
+    sessionId = s.id; playingIndex = null; endingIndex = null; ending.clear(); playbackEpoch++; presented=null; pendingStop=null; player.reset(); player.setSound(sound);
     waitingFor = s.clips.findIndex(c => c.status !== 'watched');
     if (waitingFor < 0) waitingFor = s.clips.length;
     lastChanges = ''; player.next=waitingFor;
@@ -325,11 +424,12 @@ function render(st) {
   $('warnings').textContent = s.warnings?.map(w => `${w.component}: ${w.message}`).join('\n') || '';
   $('warnings').hidden = !s.warnings?.length;
   $('story-state').textContent = s.story.current_event || s.story.scenes.at(-1)?.summary || s.story.premise;
-  $('profile-clips').textContent = `${s.profile.clips} scene${s.profile.clips === 1 ? '' : 's'} measured`;
+  const profileView=profilePresentation(s);
+  $('profile-clips').textContent = profileView.scenes;
   const lastChange = [...s.clips].reverse().find(c => c.profileChanges?.length)?.profileChanges || [...s.clips].reverse().find(c => c.changes?.length)?.changes || [];
   const changedKeys = new Set(lastChange.map(c => c.key));
-  $('affinity').replaceChildren(el('h4', null, 'Observed attention'), ...Object.entries(s.profile.characters).map(([n, v]) => bar(n, v, { swatch: color(n), flash: changedKeys.has(`character:${n}`) })));
-  $('prefs').replaceChildren(el('h4', null, 'Tentative preferences'), bar('pacing', s.profile.pacing, { signed: true, flash: changedKeys.has('pacing') }),
+  $('affinity').replaceChildren(el('h4', null, profileView.characterHeading),el('p','hint',profileView.characterNote), ...Object.entries(s.profile.characters).map(([n, v]) => bar(n, v, { swatch: color(n), flash: changedKeys.has(`character:${n}`) })));
+  $('prefs').replaceChildren(el('h4', null, profileView.deliveryHeading), bar('pacing', s.profile.pacing, { signed: true, flash: changedKeys.has('pacing') }),
     bar('dialogue', s.profile.dialogue, { signed: true, flash: changedKeys.has('dialogue') }),
     ...Object.entries(s.profile.genres).filter(([, v]) => v !== 0).map(([g, v]) => bar(g, v, { signed: true, flash: changedKeys.has(`genre:${g}`) })));
   const key = JSON.stringify([lastChange,s.profile.clips > 0]);
@@ -339,7 +439,7 @@ function render(st) {
       const li = el('li', c.strong ? 'strong' : null);
       li.append(el('span', null, `${c.key.replace('character:', '')} `), el('span', 'delta', `${c.before.toFixed(2)} → ${c.after.toFixed(2)}`), el('div', 'hint', c.why + (c.strong ? ' · CONSISTENT ATTENTION' : '')));
       return li;
-    }) : [el('li', 'hint', s.profile.clips ? 'No preference change: observations have not met the adaptation thresholds.' : 'Nothing yet: watch the first scene.')]));
+    }) : [el('li', 'hint', profileView.noChanges)]));
   }
   const latest = s.clips.at(-1);
   const current=s.clips[playingIndex ?? s.playing];
@@ -349,9 +449,8 @@ function render(st) {
   const currentChange=current?.decision.focus || (current?.decision.pacing !== 'same' && current?.decision.pacing ? `${current.decision.pacing} pacing` : 'balanced');
   $('current-decision').textContent=current ? `${running ? 'Playing' : 'Last played'} scene ${current.index+1} · decision ${current.decisionId || 'opening'} · ${currentChange}` : 'No clip playing';
   $('queue-state').textContent=`${playerMode} · ${s.clips.filter(c=>c.status==='ready').length} media ready · future queue limit 1`;
-  $('latency').textContent=s.latency?.samples ? `Readiness ${s.latency.readinessS.map(t=>t.toFixed(1)+'s').join(', ')} (n=${s.latency.samples}); adaptation freezes at ${Math.min(3.5,current?.duration ?? s.duration).toFixed(1)}s of playback. Full-clip tracking runs independently.` : 'Waiting for measured readiness.';
+  $('latency').textContent=s.latency?.samples ? `Readiness ${s.latency.readinessS.map(t=>t.toFixed(1)+'s').join(', ')} (n=${s.latency.samples}); adaptation freezes at ${Math.min(s.observationSeconds ?? 3.5,current?.duration ?? s.duration).toFixed(1)}s of playback. Full-clip tracking runs independently.` : 'Waiting for measured readiness.';
   $('latency').textContent += s.playbackMode === 'stream' ? ` Delivery: ${current?.playbackDelivery === 'stream' ? 'progressive MP4' : 'validated download'}; local copy ${current?.localMediaStatus || 'pending'}.` : ' Delivery: fully validated download.';
-  $('mapping-state').textContent=screenMapping.valid(windowKey()) ? `Screen mapping measured (scale ${screenMapping.transform.scale.toFixed(3)}) · eye calibration remains a separate check.` : 'After entering/exiting fullscreen or moving/resizing the window, move the pointer diagonally across the player (both horizontal and vertical movement) to measure screen mapping. Eye calibration is checked separately.';
   if (latest) {
     const d = latest.decision;
     $('decision').replaceChildren(el('span', `chip${d.focus ? ' on' : ''}`, `focus: ${d.focus || 'balanced'}`), el('span', `chip${d.tension !== 'same' ? ' on' : ''}`, `tension: ${d.tension}`),

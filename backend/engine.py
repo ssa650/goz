@@ -11,6 +11,7 @@ from uuid import uuid4
 from .config import MODELS, POLL_SECONDS, MAX_CLIPS
 from .frames import download_video, extract_last_frame, video_url, media_metadata
 from .fal_adapter import FalError
+from .provider_errors import ProviderFailureJournal, diagnostic, safe_diagnostic, safe_text
 from .prompts import plan
 from .clip_settings import random_seed, build_h3_request, ReferenceFrame
 from .adaptive import decision_trace
@@ -41,6 +42,7 @@ class Engine:
         self.jobs = self.load("history.json")
         self.sequences = self.load("sequences.json")
         self.trace_journal = decision_trace.Journal(self.directory)
+        self.provider_error_journal = ProviderFailureJournal(self.directory)
         self.clips = ClipService(self)
         self.bundles = BundleSequenceService(self)
         self.lock = asyncio.Lock()
@@ -107,10 +109,21 @@ class Engine:
         return result
 
     def error(self, error):
-        message = self.adapter.redact(str(error))
-        if os.getenv("OPENAI_API_KEY"):
-            message = message.replace(os.environ["OPENAI_API_KEY"], "[redacted]")
-        return message[:1800] or "The request failed."
+        return safe_text(str(error), (getattr(self.adapter, 'key', ''),), limit=1800) or "The request failed."
+
+    def preserve_provider_error(self, job, error, *, terminal=True):
+        info = safe_diagnostic(getattr(error, 'provider_error', None),
+                               (getattr(self.adapter, 'key', ''),), request_id=job.get('requestId'))
+        if info is None:
+            return {}
+        self.provider_error_journal.record(info, job_id=job.get('id'), session_id=job.get('adaptiveSession'),
+                                           secrets=(getattr(self.adapter, 'key', ''),))
+        patch = {'providerError' if terminal else 'lastProviderError': info}
+        if info['httpStatus'] is not None:
+            patch['providerStatus'] = info['httpStatus']
+        if self.provider_error_journal.write_error:
+            patch['providerDiagnosticWriteError'] = self.provider_error_journal.write_error
+        return patch
 
     def update(self, record, **patch):
         record.update(patch)
@@ -208,8 +221,10 @@ class Engine:
                 self.trace_journal.schedule(job["decisionTrace"])
             submitted = await self.adapter.submit(job["model"], payload)
             job["submissionMs"] = round((time.perf_counter()-submission_started)*1000, 3)
-            if not submitted.get("request_id"):
-                raise FalError("Fal returned no request ID. Check your Fal history.")
+            if not isinstance(submitted, dict) or not submitted.get("request_id"):
+                info = diagnostic('Fal returned no usable request ID. Check your Fal history.',
+                                  stage='submit', category='malformed_response')
+                raise FalError(provider_error=info)
             self.update(job, requestId=submitted["request_id"], submittedAt=now(), status="queued")
             if job.get("cancelRequested"):
                 await self.cancel_job(job)
@@ -219,7 +234,8 @@ class Engine:
                 job["providerStatus"] = error.status
             if job.get("apiStartedAt") and not job.get("requestId") and getattr(error, "status", None) not in (400,401,403,422):
                 job["requestUncertain"] = True
-            self.finish(job, status="failed", error=self.error(error)+(" Check Fal request history; new submissions are blocked." if job.get("requestUncertain") else ""))
+            self.finish(job, status="failed", **self.preserve_provider_error(job, error),
+                        error=self.error(error)+(" Check Fal request history; new submissions are blocked." if job.get("requestUncertain") else ""))
         return job
 
     async def monitor(self, job):
@@ -236,11 +252,13 @@ class Engine:
                     status = await self.adapter.status(job["model"], job["requestId"])
                     errors = 0
                 except Exception as error:
-                    if getattr(error, "status", None) in (400,401,403,404,422):
+                    info = getattr(error, 'provider_error', None)
+                    if getattr(error, "status", None) in (400,401,403,404,422) or (info and info['retryability'] != 'same_request_read'):
                         job["requestUncertain"] = getattr(error, "status", None) in (401,403,404)
                         raise
                     errors += 1
-                    self.update(job, connectionWarning="Status connection interrupted; reconnecting to the same Fal request.")
+                    self.update(job, **self.preserve_provider_error(job, error, terminal=False),
+                                connectionWarning="Status connection interrupted; reconnecting to the same Fal request.")
                     await asyncio.sleep(min(5, self.poll_seconds * 2**min(errors, 4)))
                     continue
                 if not isinstance(status, dict):
@@ -267,7 +285,10 @@ class Engine:
                     job["providerMetrics"] = {k: v for k, v in metrics.items() if timing_ms(v) is not None}
                     job["providerRunnerMs"] = timing_ms(metrics.get("inference_time"))
                     if status.get("error"):
-                        raise FalError(f"Fal reported a failed request: {status['error']}")
+                        from .provider_errors import selected_detail
+                        info = diagnostic(selected_detail(status['error']), stage='status', request_id=job['requestId'],
+                                          secrets=(getattr(self.adapter, 'key', ''),))
+                        raise FalError(provider_error=info)
                     result_started = time.perf_counter()
                     result = await self.adapter.result(job["model"], job["requestId"])
                     job["resultRetrievalMs"] = round((time.perf_counter()-result_started)*1000, 3)
@@ -289,7 +310,7 @@ class Engine:
                     return
                 await asyncio.sleep(self.poll_seconds)
         except Exception as error:
-            self.finish(job, status="failed", error=self.error(error))
+            self.finish(job, status="failed", error=self.error(error), **self.preserve_provider_error(job, error))
         finally:
             self.monitored.discard(job["id"])
 
@@ -302,8 +323,9 @@ class Engine:
         self.update(job, cancelSent=True)
         try:
             await self.adapter.cancel(job["model"], job["requestId"])
-        except Exception:
-            self.update(job, connectionWarning="Cancellation could not be confirmed. Waiting for the submitted request.")
+        except Exception as error:
+            self.update(job, **self.preserve_provider_error(job, error, terminal=False),
+                        connectionWarning="Cancellation could not be confirmed. Waiting for the submitted request.")
 
     async def start_sequence(self, run_id, text, mode, duration, resolution, frames):
         async with self.lock:
