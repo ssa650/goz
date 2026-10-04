@@ -44,6 +44,7 @@ Independent GÖZ implementation
 - fusion.analyze optional keyword-only eeg_quality=dict, eeg_window=(start,end).
   Missing metadata fails closed. Existing descriptive fields remain compatible.
 - Requires live/calibrated, confidence>=.6, no qualityError, fresh streaming state.
+  Strict mode is the library default; see the explicit two-clean exception below.
   Muse raw sample age must be<3s. Feature rows must fall in the frozen window,
   and Muse's entire2s acquisition window must fit inside it. Clipped |index|>=5,
   nonfinite/nonpositive values and artifacts are excluded. Invalid rows or gaps
@@ -81,3 +82,24 @@ artifact gates, full-window scope and prompt length. Paired provider payloads
 must differ only in prompt, with identical gaze, reference frames and settings.
 These show software decisions, not physiological validity or rendered-video
 compliance. No hardware, paid generation, training, commits or restarts performed.
+
+Experimental reduced-redundancy Muse coverage exception (2026-10-04)
+- GOZ_EEG_CHANNEL_POLICY=two_clean opts in; strict rolls back to the existing
+  0.6 threshold. The local demo opts in via .env; an already running server is
+  not restarted by this change. Unknown policy modes fail closed.
+- The 0.5 threshold applies only to direct Muse with exactly two canonical
+  selected channels matching a genuine 60-unique-clean-second per-channel
+  calibration and device identity. Both selected channels must remain available,
+  usable, and free of rejection reasons under raw-validity-causal-sos-v1;
+  channelConfidenceCeiling must be 0.5. Confidence must reach that ceiling,
+  without being inflated or normalized to a scientific probability.
+- Additional recovered channels never substitute into the locked reference;
+  loss of either reference channel blocks the exception. Unsupported sources,
+  including Mind Monitor, retain their existing strict gates.
+- Only the shared confidence cutoff changes. Raw clipping, movement, flatness,
+  timing gaps, source freshness, unique calibration accumulation, channel locking,
+  sustained 12s evidence, disjoint prior reference, persistence, hysteresis,
+  bounded cue and gaze priority are preserved. Acquisition is unchanged.
+- Status, calibration presentation, policy results and decision journal record
+  the loaded mode, selected channels, coverage/ceiling, effective threshold,
+  reduced redundancy and eligibility reason, including abstentions.

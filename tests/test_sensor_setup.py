@@ -148,11 +148,12 @@ async def test_manual_disconnect_does_not_kill_external_bridge(monkeypatch):
 def test_gaze_metadata_rejects_changed_viewer_display_schema_and_missing_camera(monkeypatch):
     import backend.gaze_worker as worker
     monkeypatch.setattr(worker, "model_schema", lambda repo: "features-v5")
-    report = dict(schemaVersion=2, profileId="viewer", modelSchema="features-v5", screen=[1710, 1107], cameraName="FaceTime")
+    report = dict(schemaVersion=3, profileId="viewer", modelSchema="features-v5", screen=[1710, 1107], cameraName="FaceTime",
+                  cameraDeviceId="mac", cameraIdentityVerified=True, cameraBackend="avfoundation-uid")
     worker.validate_compatibility(report, "unused", "viewer", (1710, 1107))
     for fields, message in [({"profileId":"other"}, "viewer profile"), ({"screen":[1000, 800]}, "geometry changed"),
-                            ({"modelSchema":"old"}, "schema changed"), ({"schemaVersion":1}, "Legacy"),
-                            ({"cameraName":None}, "camera identity")]:
+                            ({"modelSchema":"old"}, "schema changed"), ({"schemaVersion":2}, "predates verified"),
+                            ({"cameraDeviceId":None}, "camera identity"), ({"cameraIdentityVerified":False}, "camera identity")]:
         with pytest.raises(ValueError, match=message):
             worker.validate_compatibility(dict(report, **fields), "unused", "viewer", (1710, 1107))
 
@@ -414,7 +415,7 @@ def test_damaged_saved_calibration_requires_explicit_removal(tmp_path, damage):
         data = json.loads(setup.saved_gaze_path.read_text())
         data['model'] = '../outside.pkl'
         setup.saved_gaze_path.write_text(json.dumps(data))
-    with pytest.raises(ValueError, match='Remove eye calibration'):
+    with pytest.raises(ValueError, match='full eye recalibration'):
         SensorSetup(sensors(), tmp_path).saved_gaze()
     assert setup.saved_gaze_path.exists()  # Never silently replace saved state.
 
@@ -422,8 +423,8 @@ def test_damaged_saved_calibration_requires_explicit_removal(tmp_path, damage):
 def test_saved_camera_follows_device_when_indexes_change():
     from backend.gaze_worker import saved_camera
     cameras = [dict(index=0, name='Other', deviceId='other'), dict(index=3, name='iPhone Camera', deviceId='phone')]
-    assert saved_camera(cameras, 'phone', 'iPhone Camera') == '3'
-    assert saved_camera(cameras, None, 'iPhone Camera') == '3'
+    assert saved_camera(cameras, 'phone', 'iPhone Camera') is cameras[1]
+    assert saved_camera(cameras, None, 'iPhone Camera') is cameras[1]
     with pytest.raises(ValueError, match='Reconnect'):
         saved_camera(cameras, 'missing', 'iPhone Camera')
 
@@ -469,7 +470,7 @@ def test_external_camera_reference_is_shared_with_dataset(tmp_path, monkeypatch)
     assert Path.cwd() == attempt
 
 
-@pytest.mark.parametrize('keys,expected,iphone', [([255,13], '2', True), ([255,ord('2')], '0', True),
+@pytest.mark.parametrize('keys,expected,iphone', [([255,13], '2', True), ([255,ord('1')], '2', True), ([255,ord('2')], '0', True),
                                                ([255,27], None, True), ([255,13,27], None, False)])
 def test_gazekit_native_camera_selection(keys, expected, iphone, monkeypatch):
     from backend.gaze_worker import choose_camera
@@ -491,7 +492,7 @@ def test_gazekit_native_camera_selection(keys, expected, iphone, monkeypatch):
         with pytest.raises(ValueError, match='cancelled'):
             choose_camera(ui, cv2, camera, lambda: (1200,800))
     else:
-        assert choose_camera(ui, cv2, camera, lambda: (1200,800)) == expected
+        assert choose_camera(ui, cv2, camera, lambda: (1200,800)) is next(c for c in cameras if str(c['index']) == expected)
     assert closed == [True]
 
 
@@ -517,13 +518,13 @@ async def test_gazekit_screen_coordinates_arrive_in_goz_over_udp():
 
 
 
-def test_continuity_enumeration_keeps_waiting_camera_and_matching_avfoundation_index(monkeypatch):
+def test_continuity_enumeration_keeps_native_identity_without_probing(monkeypatch):
     import backend.gaze_worker as worker
-    # Mac metadata indexes are sorted by device ID, independently of UI ordering.
-    devices = [dict(_name='iPhone Camera', **{'spcamera_unique-id':'Z'}),
-               dict(_name='FaceTime HD Camera', **{'spcamera_unique-id':'A'})]
-    monkeypatch.setattr(worker.subprocess, 'run', lambda *a, **kw: SimpleNamespace(stdout=json.dumps({'SPCameraDataType':devices})))
+    # Native order deliberately differs from sorted UID order; identity is retained.
+    devices = [dict(index=0, name='iPhone Camera', deviceId='Z'),
+               dict(index=1, name='FaceTime HD Camera', deviceId='A')]
+    monkeypatch.setattr('backend.native_camera.list_cameras', lambda: devices)
     camera = SimpleNamespace(list_cameras=lambda **kw: pytest.fail('Do not hide cameras while awaiting their first frame'))
     if sys.platform != 'darwin': pytest.skip('macOS enumeration')
     found = worker.connected_cameras(camera)
-    assert [(c['index'],c['name']) for c in found] == [(0,'FaceTime HD Camera'), (1,'iPhone Camera')]
+    assert found is devices

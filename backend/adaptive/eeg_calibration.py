@@ -28,6 +28,7 @@ def calibration_status(quality):
         'Keep the same wearer baseline and calibrated channels through brief poor signal or packet gaps. '
         'Use only fresh compatible clean EEG for cues; playback and acquisition continue. '
         'Explicit recalibration, reconnect, source or feature setup changes, and 3 seconds of raw-sample silence require a fresh baseline.')
+    result.update(eeg_policy.channel_eligibility(q))
     if not result['supported']:
         result.update(state='unsupported', reason='60-second guided calibration supports direct Muse EEG. Continue with gaze-only for this source.')
         return result
@@ -39,6 +40,8 @@ def calibration_status(quality):
     result['calibrationRetained'] = retained
     if retained and eeg_policy.quality_failure(q) is None:
         result.update(ready=True, signalReady=True, state='ready', reason='A genuine 60-clean-second baseline is ready for this device and channel set.')
+        if result['reduced_redundancy']:
+            result['reason'] += ' Experimental two-clean-channel policy; reduced redundancy.'
     elif retained:
         result.update(state='signal_weak', reason='Calibration saved; waiting for fresh clean signal on the calibrated channels. Playback and EEG streaming continue; EEG cues are unavailable for now.')
     elif q.get('live') is True and not q.get('qualityError') and clean < TARGET_SECONDS:

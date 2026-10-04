@@ -72,7 +72,7 @@ def create(session, clip, source=None):
                 experimental=any(f.get("experimental") for f in frozen.get("track", [])),
                 identityStatus="uncalibrated_color_shape_hypothesis" if previous.get("detectionProvider")=="color" else None),
              eeg=dict(**pick(q, "source confidence calibrated live connectionState"),
-             **pick(eeg, "eligible state action reason applied suppressed_by valid_span_s"),
+             **pick(eeg, "eligible state action reason applied suppressed_by valid_span_s experimental channel_policy selected_channels channel_coverage channel_confidence_ceiling confidence_threshold reduced_redundancy channel_eligibility_reason confidence_basis coverage"),
              quality=pick(q, "qualityVersion cleanSeconds cleanTimeMethod featureAgeSeconds effectiveHistorySeconds selectedChannels excludedChannels channelConfidenceCeiling rejectReasons inputDiagnostics streamMetadata filter"),
              channels={name: pick(value, "usable rejectReasons rawMinUV rawMaxUV rawOffsetUV railFraction hardClipFraction peakToPeakUV filteredPeakToPeakUV gapCount")
                        for name,value in list((q.get("channelQuality") or {}).items())[:4]}),

@@ -97,7 +97,7 @@ $('muse-disconnect').addEventListener('click', async () => {
   try { await post('/api/adaptive/muse/disconnect', {}); } catch (e) { error(e.message); }
 });
 $('gaze-calibration-remove').addEventListener('click', async () => {
-  try { await request('/api/sensors/gaze-calibration', {method:'DELETE'}); } catch (e) { error(e.message); }
+  try { await post('/api/sensors/gaze-recalibrate', {}); } catch (e) { error(e.message); }
 });
 $('stop').addEventListener('click', async () => {
   player.stop(); playingIndex = null; endingIndex = null; ending.clear();
@@ -264,6 +264,7 @@ function render(st) {
   $('sensor-setup').hidden = !setup?.required && !setup?.enabled && setup?.eegMode !== 'muse';
   $('sensor-message').textContent = (setup?.error || setup?.message || '') +
     (setup && (setup.muse.source === 'mindmonitor' || setup.phase === 'calibrating_muse') ? ` (${museProgress(setup.muse)})` : '');
+  if (setup?.camera?.name) $('sensor-message').textContent += ` Camera ${setup.camera.verified ? 'opened and verified' : 'selected; awaiting verification'}: ${setup.camera.name}.`;
   const museState = setup?.museConnection || {state:'disconnected'};
   $('muse-connection-status').textContent = museState.state === 'error' ? `Muse connection error: ${museState.error || 'Unknown error'}` :
     museState.state === 'connecting' ? 'Connecting to Muse 2…' : museState.state === 'connected' ? 'Muse 2 connected.' : 'Muse 2 disconnected. Gaze and playback remain available.';
@@ -350,7 +351,7 @@ function render(st) {
   $('queue-state').textContent=`${playerMode} · ${s.clips.filter(c=>c.status==='ready').length} media ready · future queue limit 1`;
   $('latency').textContent=s.latency?.samples ? `Readiness ${s.latency.readinessS.map(t=>t.toFixed(1)+'s').join(', ')} (n=${s.latency.samples}); adaptation freezes at ${Math.min(3.5,current?.duration ?? s.duration).toFixed(1)}s of playback. Full-clip tracking runs independently.` : 'Waiting for measured readiness.';
   $('latency').textContent += s.playbackMode === 'stream' ? ` Delivery: ${current?.playbackDelivery === 'stream' ? 'progressive MP4' : 'validated download'}; local copy ${current?.localMediaStatus || 'pending'}.` : ' Delivery: fully validated download.';
-  $('mapping-state').textContent=screenMapping.valid(windowKey()) ? `Screen mapping measured (scale ${screenMapping.transform.scale.toFixed(3)}) · eye calibration remains a separate check.` : 'Move the pointer diagonally across the player to measure screen mapping. Eye calibration is checked separately.';
+  $('mapping-state').textContent=screenMapping.valid(windowKey()) ? `Screen mapping measured (scale ${screenMapping.transform.scale.toFixed(3)}) · eye calibration remains a separate check.` : 'After entering/exiting fullscreen or moving/resizing the window, move the pointer diagonally across the player (both horizontal and vertical movement) to measure screen mapping. Eye calibration is checked separately.';
   if (latest) {
     const d = latest.decision;
     $('decision').replaceChildren(el('span', `chip${d.focus ? ' on' : ''}`, `focus: ${d.focus || 'balanced'}`), el('span', `chip${d.tension !== 'same' ? ' on' : ''}`, `tension: ${d.tension}`),

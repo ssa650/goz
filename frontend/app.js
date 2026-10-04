@@ -47,12 +47,13 @@ const {run,config}=controller,completed=run?.clips.filter(c=>c.status==='complet
   element('sensor-setup').hidden=!setup?.required&&!setup?.enabled;
   element('sensor-title').textContent=setup?.phase==='ready'?'Sensors ready':'Sensor setup';
   element('sensor-message').textContent=setup?.error||setup?.message||'';
+  if(setup?.camera?.name) element('sensor-message').textContent+=` Camera ${setup.camera.verified?'opened and verified':'selected; awaiting verification'}: ${setup.camera.name}.`;
   element('sensor-progress').textContent=setup && (setup.muse.source === 'mindmonitor' || setup.phase === 'calibrating_muse')
     ?museProgress(setup.muse):'';
   /** @type {HTMLButtonElement} */ const retry=element('sensor-retry');
   retry.hidden=!setup?.canRetry;retry.disabled=controller.busy;
   element('gaze-calibration-status').textContent=setup?.gaze?.savedCalibration
-    ?'Eye calibration saved · reused on future starts. Remove it to calibrate again.':'';
+    ?'Eye calibration saved. Full eye recalibration lets you choose a camera; the previous calibration stays saved until fresh validation passes.':'';
   /** @type {HTMLButtonElement} */ const remove=element('gaze-calibration-remove');
   remove.hidden=!setup?.gaze?.savedCalibration;remove.disabled=controller.busy;
   if(!run) {
@@ -85,7 +86,7 @@ const {run,config}=controller,completed=run?.clips.filter(c=>c.status==='complet
 }
 const controller=new SequenceController(render,run=>playback.update(run));
 element('sensor-retry').addEventListener('click',()=>void controller.retrySensorSetup());
-element('gaze-calibration-remove').addEventListener('click',()=>void controller.removeGazeCalibration());
+element('gaze-calibration-remove').addEventListener('click',()=>void controller.recalibrateGaze());
 generate.addEventListener('click',()=>void controller.generate());
 regenerate.addEventListener('click',()=>void controller.generate(true));
 download.addEventListener('click',()=>{

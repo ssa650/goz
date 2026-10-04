@@ -12,11 +12,15 @@ Thresholds and cue mappings are experimental controller choices, not validated
 physiological interpretations. Acquisition and calibration stay in the feeds.
 """
 import math
+import os
 import statistics
 
 VERSION = "experimental-eeg-delivery-v1"
 CUMULATIVE_VERSION = "experimental-eeg-cumulative-prior-clips-v2"
 MIN_CONFIDENCE = .6
+CHANNEL_POLICIES = ("strict", "two_clean")
+TWO_CLEAN_CONFIDENCE = .5
+MUSE_CHANNELS = ("TP9", "AF7", "AF8", "TP10")
 MIN_SPAN_S = 1.0
 MAX_GAP_S = .5
 FRESH_S = .75
@@ -36,14 +40,67 @@ def unavailable(reason, source=None):
                 valid_span_s=0.0, samples=0)
 
 
+def channel_eligibility(quality):
+    """Only an attested direct-Muse pair may use the reduced coverage cutoff.
+
+    Confidence remains the feed's coverage/quality heuristic. This does not
+    alter raw acceptance, normalize confidence, or classify a brain state.
+    Unknown modes fail closed. Explicit snapshot metadata takes precedence
+    over the environment so a session can freeze its configured choice.
+    """
+    q = quality if isinstance(quality, dict) else {}
+    mode = q.get("channelPolicy", os.getenv("GOZ_EEG_CHANNEL_POLICY", "strict"))
+    selected = q.get("selectedChannels")
+    available = q.get("availableChannels")
+    def canonical(channels):
+        return (isinstance(channels, (list, tuple)) and
+                all(isinstance(c, str) and c in MUSE_CHANNELS for c in channels) and
+                len(set(channels)) == len(channels))
+    coverage = (len(set(selected) & set(available)) / 4
+                if canonical(selected) and canonical(available) else None)
+    result = dict(channel_policy=mode,
+        selected_channels=list(selected) if canonical(selected) else None,
+        channel_coverage=coverage, channel_confidence_ceiling=q.get("channelConfidenceCeiling"),
+        confidence_threshold=MIN_CONFIDENCE, reduced_redundancy=False,
+        channel_eligibility_reason="Strict feed confidence threshold of 0.6",
+        confidence_basis="feed channel coverage/quality heuristic; not scientific probability")
+    if mode not in CHANNEL_POLICIES:
+        result["channel_eligibility_reason"] = "Unsupported EEG channel policy; abstain"
+        return result
+    if mode == "strict":
+        return result
+    # Import locally: cumulative policy uses this shared quality gate itself.
+    from .cumulative_eeg_policy import compatibility_key
+    diagnostics = q.get("channelQuality")
+    attested_pair = (q.get("source") == "muse" and canonical(selected) and len(selected) == 2
+        and canonical(available) and set(selected).issubset(available)
+        and q.get("qualityVersion") == "raw-validity-causal-sos-v1"
+        and finite(q.get("cleanSeconds")) and q["cleanSeconds"] >= 60
+        and compatibility_key(q) is not None
+        and isinstance(diagnostics, dict)
+        and all(isinstance(diagnostics.get(c), dict) and diagnostics[c].get("usable") is True
+                and diagnostics[c].get("rejectReasons") == [] for c in selected)
+        and finite(q.get("channelConfidenceCeiling")) and q["channelConfidenceCeiling"] == .5
+        and finite(q.get("confidence")) and q["confidence"] <= .5)
+    if attested_pair:
+        result.update(confidence_threshold=TWO_CLEAN_CONFIDENCE, reduced_redundancy=True,
+            channel_eligibility_reason="Experimental reduced redundancy: two calibrated clean Muse channels; coverage threshold 0.5")
+    else:
+        result["channel_eligibility_reason"] = "Two-clean Muse exception not attested; strict threshold of 0.6 remains"
+    return result
+
+
 def quality_failure(quality):
     """Shared live/calibration/raw-quality gates, without feature inference."""
     q = quality if isinstance(quality, dict) else {}
     source = q.get("source")
     if source not in ("muse", "mindmonitor", "sim"):
         return "Validated EEG source metadata unavailable"
+    eligibility = channel_eligibility(q)
+    if eligibility["channel_policy"] not in CHANNEL_POLICIES:
+        return eligibility["channel_eligibility_reason"]
     if (q.get("live") is not True or q.get("calibrated") is not True or q.get("qualityError")
-            or not finite(q.get("confidence")) or q["confidence"] < MIN_CONFIDENCE
+            or not finite(q.get("confidence")) or q["confidence"] < eligibility["confidence_threshold"]
             or q.get("connectionState") not in ("streaming", "simulated")):
         return "EEG quality, calibration or live-sample gate failed"
     if source in ("muse", "sim") and (not finite(q.get("sampleAgeSeconds"))
@@ -68,7 +125,8 @@ def observe(samples, quality=None, window=None):
     """
     q = quality if isinstance(quality, dict) else {}
     source = q.get("source")
-    fail = lambda reason: unavailable(reason, source)
+    eligibility = channel_eligibility(q)
+    fail = lambda reason: dict(unavailable(reason, source), **eligibility)
     failure = quality_failure(q)
     if failure:
         return fail(failure)
@@ -117,7 +175,7 @@ def observe(samples, quality=None, window=None):
                          else "smoothed beta/alpha baseline index"),
                 median_z=round(statistics.median(values), 4), fractions=fractions,
                 valid_span_s=round(span, 4), samples=len(values),
-                confidence=q["confidence"], window=[start, end])
+                confidence=q["confidence"], window=[start, end], **eligibility)
 
 
 def decide(observation, previous=None):

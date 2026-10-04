@@ -164,6 +164,7 @@ class CumulativeEEGHistory:
             raw_support_exclusion_s=FEATURE_SUPPORT_S if q.get("source") in ("muse","sim") else 0.,
             current_effective_count=0,reference_effective_count=0,
             result_ttl_s=RESULT_TTL_S,applied=False)
+        result.update(baseline.channel_eligibility(q))
         def finish(reason):
             result["reason"]=reason
             if result["eligible"]:

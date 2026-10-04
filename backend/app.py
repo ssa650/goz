@@ -189,6 +189,15 @@ def create_app(engine=None):
             await sensors.setup.check_gaze(recenter=body.get("recenter", False))
         return sensors.setup.snapshot()
 
+    @app.post("/api/sensors/gaze-recalibrate", status_code=202)
+    async def sensor_recalibrate_gaze(request: Request):
+        e, sensors = request.app.state.engine, request.app.state.sensors
+        async with e.lock:
+            if e.busy() or sensors.session and sensors.session.status == "running":
+                raise FalError("Stop or finish the current generation before recalibrating gaze.", 409)
+            await sensors.setup.recalibrate_gaze()
+        return sensors.setup.snapshot()
+
     @app.delete("/api/sensors/gaze-calibration", status_code=202)
     async def sensor_remove_gaze(request: Request):
         e, sensors = request.app.state.engine, request.app.state.sensors

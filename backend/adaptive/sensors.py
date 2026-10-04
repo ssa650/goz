@@ -18,7 +18,7 @@ import numpy as np
 
 from .eeg_quality import (CausalEegFilter, MIN_CHANNELS, REASONS, MAX_INTERVAL_S,
                           UniqueCleanTime, channel_diagnostics, muse_metadata)
-from .eeg_policy import MIN_CONFIDENCE
+from .eeg_policy import MIN_CONFIDENCE, channel_eligibility, quality_failure
 
 GAZE_PORT = 5590
 EEG_RATE = 256
@@ -375,7 +375,7 @@ class EegFeed:
                         "recovering" if live and self.calibration else
                         "calibrating" if live and recent else "warming_up" if live else
                         "stale" if sample_age is not None else "waiting_for_samples")
-            return dict(source=self.source, state=self.connection_error or self.state, live=live, deviceId=self.device_id,
+            result = dict(source=self.source, state=self.connection_error or self.state, live=live, deviceId=self.device_id,
                     confidence=round(confidence, 3),
                     connectionState=state, modeLabel="EEG physiological observations available" if confidence else "EEG unavailable — gaze-only mode",
                     interpretation="Exploratory beta/(alpha+theta); not a validated emotion measure; cause and valence unknown",
@@ -399,6 +399,16 @@ class EegFeed:
                     filter=dict(type="causal Butterworth SOS", bandHz=[1, 40], order=4,
                                 notchHz=None, warmupSeconds=EEG_WINDOW_S, preservesRawGates=True),
                     qualityVersion="raw-validity-causal-sos-v1", cleanTimeMethod="unique accepted time intervals after first full clean window")
+            # Presentation only: the feed still owns raw acceptance, confidence,
+            # channel locking and accumulation. Never mutate the saved baseline.
+            quality = dict(result, calibration=self.calibration)
+            result.update(channel_eligibility(quality))
+            result["channelPolicy"] = result["channel_policy"]
+            if self.source == "muse":
+                result["signalReady"] = bool(usable and quality_failure(quality) is None)
+            if result["reduced_redundancy"]:
+                result["qualityWarning"] = "Experimental two-clean-channel policy; reduced redundancy"
+            return result
 
 
 def run_muse(feed, stop):

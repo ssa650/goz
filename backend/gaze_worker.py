@@ -7,13 +7,12 @@ from pathlib import Path
 import sys
 import urllib.request
 import socket
-import subprocess
 import time
 import hashlib
 import importlib.metadata
 
 LANDMARKER_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
-CALIBRATION_SCHEMA = 2
+CALIBRATION_SCHEMA = 3
 
 
 def atomic_json(path, value):
@@ -38,15 +37,27 @@ def model_schema(repo):
 
 def validate_compatibility(report, repo, profile, screen):
     if report.get("schemaVersion") != CALIBRATION_SCHEMA:
-        raise ValueError("Legacy calibration has no verified viewer/camera/schema metadata. Preserve it and run a fresh calibration/check for this viewer.")
+        raise ValueError("Saved calibration predates verified camera capture. Its camera label may be incorrect. Previous calibration is preserved; choose the intended camera and run full eye recalibration.")
     if report.get("profileId") != profile:
         raise ValueError("Saved calibration belongs to another viewer profile. Select the matching GOZ_VIEWER_PROFILE or calibrate this viewer.")
     if report.get("modelSchema") != model_schema(repo):
         raise ValueError("Gazekit feature/model schema changed. Recalibrate before using this saved model.")
     if list(report.get("screen", [])) != list(screen):
         raise ValueError(f"Display geometry changed: saved {report.get('screen')}, current {list(screen)} screen points. Restore the display or recalibrate.")
-    if not report.get("cameraDeviceId") and not report.get("cameraName"):
-        raise ValueError("Saved calibration has no camera identity. Recalibrate with the intended camera.")
+    if (not report.get("cameraDeviceId") or report.get("cameraIdentityVerified") is not True
+            or report.get("cameraBackend") != "avfoundation-uid"):
+        raise ValueError("Saved calibration has no verified camera identity. Previous calibration is preserved; run full eye recalibration with the intended camera.")
+
+
+def open_selected_camera(args, on_wait=None):
+    """The native input's UID, rather than enumeration order, owns identity."""
+    from .native_camera import NativeCapture
+    cap = NativeCapture(args.selected_camera, on_wait=on_wait)
+    opened = cap.identity
+    print("GOZ_CAMERA " + json.dumps(dict(camera=args.camera, name=opened["name"],
+          deviceId=opened["deviceId"], verified=True, backend=opened["backend"], state="opened")), flush=True)
+    args.opened_camera = opened
+    return cap
 
 
 def alignment_values(model):
@@ -80,13 +91,13 @@ def load_predictor(model, screen):
 def stream_gaze(args, model, landmarker, screen):
     """Use Gazekit's tracker/filter with explicit capture time and no clamping."""
     import cv2
-    from gazekit.camera import open_camera, read_mirrored
+    from gazekit.camera import read_mirrored
     from gazekit.tracker import FaceTracker
     from gazekit.filters import GazeSmoother
     from gazekit.live import BlinkGate
     predict, _ = load_predictor(model, screen)
     ax, bx, ay, by = alignment_values(model)
-    cap = open_camera(int(args.camera))
+    cap = open_selected_camera(args)
     tracker = FaceTracker(str(landmarker))
     smoother, gate = GazeSmoother(), BlinkGate()
     started = last_frame = time.monotonic()
@@ -129,12 +140,11 @@ def check_alignment(args, model, landmarker, screen):
     """Fresh probe targets are never training data; optional 3-target recenter."""
     import cv2
     from gazekit import ui
-    from gazekit.camera import open_camera
     from gazekit.tracker import FaceTracker
     from gazekit.calibrate import validate, MARGINAL_FRAC
     from gazekit.live import _quick_align
     predict, ridge = load_predictor(model, screen)
-    cap, tracker = open_camera(int(args.camera)), FaceTracker(str(landmarker))
+    cap, tracker = open_selected_camera(args), FaceTracker(str(landmarker))
     win = ui.FullscreenWindow("goz-gaze-check", screen)
     coefficients = alignment_values(model)
     try:
@@ -182,20 +192,12 @@ def check_alignment(args, model, landmarker, screen):
         cv2.destroyAllWindows()
 
 
-def connected_cameras(camera_module):
-    """Keep Continuity devices visible even before their first frame arrives."""
+def connected_cameras(camera_module=None):
+    """Enumerate native identities without opening/probing any camera."""
     if sys.platform == "darwin":
-        try:
-            result = subprocess.run(["/usr/sbin/system_profiler", "SPCameraDataType", "-json"],
-                                    capture_output=True, text=True, timeout=15)
-            devices = sorted(json.loads(result.stdout).get("SPCameraDataType", []),
-                             key=lambda d: d.get("spcamera_unique-id", ""))
-        except (OSError, ValueError, subprocess.TimeoutExpired):
-            devices = []
-        if devices:
-            return [dict(index=i, name=d.get("_name", f"Camera {i}"),
-                         deviceId=d.get("spcamera_unique-id")) for i, d in enumerate(devices)]
-    return camera_module.list_cameras(max_index=5)
+        from .native_camera import list_cameras
+        return list_cameras()
+    raise ValueError("Verified camera selection currently requires macOS AVFoundation. No camera was opened.")
 
 
 def choose_camera(ui, cv2, camera_module, screen_size):
@@ -215,7 +217,7 @@ def choose_camera(ui, cv2, camera_module, screen_size):
         if event == cv2.EVENT_LBUTTONDOWN:
             row = int((y - win.h * .32 + 24) // 46)
             if 0 <= row < len(choices) and abs(y - (win.h * .32 + row * 46)) < 24:
-                selected = str(choices[row]['index'])
+                selected = choices[row]
     cv2.setMouseCallback(win.name, clicked)
     try:
         scan()
@@ -237,9 +239,9 @@ def choose_camera(ui, cv2, camera_module, screen_size):
             if key in (ord('c'), ord('r')):
                 scan()
             elif key in (10, 13):
-                selected = next((str(c['index']) for c in choices if "iphone" in c['name'].lower()), None)
+                selected = next((c for c in choices if "iphone" in c['name'].lower()), None)
             elif ord('1') <= key < ord('1') + len(choices):
-                selected = str(choices[key - ord('1')]['index'])
+                selected = choices[key - ord('1')]
             if selected is not None:
                 return selected
     finally:
@@ -258,8 +260,17 @@ def saved_camera(cameras, device_id, name):
     matches = ([c for c in cameras if c.get("deviceId") == device_id] if device_id
                else [c for c in cameras if c.get("name") == name])
     if len(matches) != 1:
-        raise ValueError("The saved eye calibration's camera is unavailable. Reconnect it, or remove eye calibration to choose another camera.")
-    return str(matches[0]["index"])
+        raise ValueError("The saved eye calibration's camera is unavailable. Reconnect it, or run full eye recalibration to choose another camera. Previous calibration is preserved.")
+    return matches[0]
+
+
+def resolve_camera(cameras, selection):
+    """Configured numbers are native list ordinals, never OpenCV indices."""
+    matches = [c for c in cameras if (str(c["index"]) == selection if selection.isdigit()
+                                    else selection in (c.get("deviceId"), c.get("name")))]
+    if len(matches) != 1:
+        raise ValueError("Selected camera is unavailable or ambiguous. Reconnect it and refresh the selector; no fallback camera will be opened.")
+    return matches[0]
 
 
 def configure_alignment(stream, model, reuse):
@@ -271,7 +282,7 @@ def configure_alignment(stream, model, reuse):
             if len(values) != 4 or any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
                 raise ValueError("Invalid alignment")
         except (OSError, ValueError, KeyError, TypeError):
-            raise ValueError("Saved gaze alignment is damaged. Remove eye calibration to train again.") from None
+            raise ValueError("Saved gaze alignment is damaged. Run full eye recalibration to train again; previous artifacts are preserved.") from None
         ax, bx, ay, by = values
         original = stream.build_predictor
         def aligned_predictor(*args, **kwargs):
@@ -321,22 +332,25 @@ def main():
         validate_compatibility(metadata, repo, args.profile, screen)
         if args.command == "stream" and metadata.get("verdict") not in ("STABLE", "USABLE"):
             raise ValueError("This model failed gaze validation. Run a passing fresh check or recalibrate before streaming it into the adaptive story.")
-        args.camera_device_id = args.camera_device_id or metadata.get("cameraDeviceId")
-        args.camera_name = args.camera_name or metadata.get("cameraName")
+        if args.camera_device_id and args.camera_device_id != metadata["cameraDeviceId"]:
+            raise ValueError("Requested camera differs from this model's verified camera. Previous calibration is preserved; run full eye recalibration.")
+        args.camera_device_id = metadata["cameraDeviceId"]
+        args.camera_name = metadata.get("cameraName")
         if args.command == "inspect":
             _, ridge = load_predictor(model, screen)
             print("GOZ_MODEL_LOADED " + json.dumps(dict(screen=list(ridge.screen_size), profileId=args.profile, schemaVersion=CALIBRATION_SCHEMA)), flush=True)
             return
-    if args.command in ("stream", "check") and (args.camera_device_id or args.camera_name):
-        from gazekit import camera as camera_module
-        args.camera = saved_camera(connected_cameras(camera_module), args.camera_device_id, args.camera_name)
-    if args.camera == "select":
+    if args.command in ("stream", "check"):
+        args.selected_camera = saved_camera(connected_cameras(), args.camera_device_id, args.camera_name)
+    elif args.camera == "select":
         import cv2
         from gazekit import ui, camera as camera_module
-        args.camera = choose_camera(ui, cv2, camera_module, screen_size)
-        print("GOZ_CAMERA " + json.dumps({"camera": args.camera}), flush=True)
-    elif args.camera.isdigit():
-        print("GOZ_CAMERA " + json.dumps({"camera": args.camera}), flush=True)
+        args.selected_camera = choose_camera(ui, cv2, camera_module, screen_size)
+    else:
+        args.selected_camera = resolve_camera(connected_cameras(), args.camera)
+    args.camera = str(args.selected_camera["index"])
+    print("GOZ_CAMERA " + json.dumps(dict(camera=args.camera, name=args.selected_camera["name"],
+          deviceId=args.selected_camera["deviceId"], verified=False, state="selected")), flush=True)
     landmarker = model.parent.parent / "face_landmarker.task"
     if not landmarker.is_file():
         existing = repo / "models" / "face_landmarker.task"
@@ -351,19 +365,21 @@ def main():
             temporary = landmarker.with_suffix(".download")
             temporary.write_bytes(data)
             temporary.replace(landmarker)
-    if not args.camera.isdigit():
-        raise ValueError("Select a connected external camera, such as iPhone Continuity Camera.")
-    camera = int(args.camera)
     from gazekit import dataset
-    configure_camera(camera, model, dataset)
+    if args.command == "calibrate":
+        configure_camera(args.selected_camera["deviceId"], model, dataset)
     if args.command == "calibrate":
         import gazekit.calibrate as calibration
-        from gazekit import camera as camera_module
-        camera_info = next((c for c in connected_cameras(camera_module) if str(c["index"]) == args.camera), {})
-        metadata = dict(camera=args.camera, cameraName=camera_info.get("name"), cameraDeviceId=camera_info.get("deviceId"),
-                        profileId=args.profile, schemaVersion=CALIBRATION_SCHEMA, modelSchema=model_schema(repo),
+        # Gazekit imported open_camera into this module. Replace that exact
+        # calibration boundary only; the dependency checkout stays untouched.
+        calibration.open_camera = lambda index, on_wait=None: open_selected_camera(args, on_wait)
+        metadata = dict(profileId=args.profile, schemaVersion=CALIBRATION_SCHEMA, modelSchema=model_schema(repo),
                         coordinateSpace="screen-points", validationHeldOut=True,
                         cameraConfiguration=dict(mirrored=True, requestedSize=[1920, 1080]), backend="ridge")
+        def verified_metadata():
+            opened = args.opened_camera
+            return dict(metadata, camera=args.camera, cameraName=opened["name"], cameraDeviceId=opened["deviceId"],
+                        cameraIdentityVerified=True, cameraBackend=opened["backend"])
         original_validate = calibration.validate
         def held_out_validate(*values, **kwargs):
             error, points, _, _ = original_validate(*values, **kwargs)
@@ -374,7 +390,7 @@ def main():
         calibration.validate = held_out_validate
         original_save = calibration.GazeModel.save
         def save_atomically(instance, path, report=None):
-            report = dict(report or {}, **metadata)
+            report = dict(report or {}, **verified_metadata())
             temporary = Path(path).with_name("gaze_model-pending.pkl")
             original_save(instance, temporary, report)
             temporary.chmod(0o600)
@@ -391,10 +407,10 @@ def main():
             else:
                 print("GOZ_CALIBRATION_REJECTED " + json.dumps(report), flush=True)
         calibration.GazeModel.save = save_atomically
-        report = calibration.run(camera_index=camera, model_out=str(model), dataset_root=str(model.parent / "dataset"), landmarker=str(landmarker))
+        report = calibration.run(camera_index=args.selected_camera["deviceId"], model_out=str(model), dataset_root=str(model.parent / "dataset"), landmarker=str(landmarker))
         if not report or report.get("verdict") not in ("STABLE", "USABLE") or not model.is_file():
             raise ValueError("Gazekit calibration was cancelled or did not pass validation.")
-        report.update(metadata)
+        report.update(verified_metadata())
         atomic_json(args.report, report)
     else:
         if args.command == "check":

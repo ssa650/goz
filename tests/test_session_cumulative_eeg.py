@@ -9,12 +9,13 @@ import pytest
 from backend.adaptive import tracking_diagnostics
 from test_adaptive_deadline import clock, setup, tick
 from test_cumulative_eeg_policy import quality
+from test_eeg_two_clean_policy import two_clean_quality
 from test_adaptive import png
 from backend.frames import verify_image
 
 
-def ready_quality(session, monkeypatch):
-    q=quality()
+def ready_quality(session, monkeypatch, q=None):
+    q=quality() if q is None else q
     session.eeg.source='muse'
     session.eeg.calibration=deepcopy(q.pop('calibration'))
     monkeypatch.setattr(session.eeg,'status',lambda:deepcopy(q))
@@ -23,9 +24,10 @@ def ready_quality(session, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('z,cue',[(1.,'quicken'),(-1.,'slowly')])
-async def test_sustained_prior_history_reaches_next_prompt_without_delaying_gaze_deadline(tmp_path,monkeypatch,clock,z,cue):
+@pytest.mark.parametrize('channel_mode', ['strict', 'two_clean'])
+async def test_sustained_prior_history_reaches_next_prompt_without_delaying_gaze_deadline(tmp_path,monkeypatch,clock,z,cue,channel_mode):
     s,first,engine,submitted=setup(tmp_path,monkeypatch,clock)
-    ready_quality(s,monkeypatch)
+    ready_quality(s,monkeypatch, two_clean_quality() if channel_mode == 'two_clean' else quality(channelPolicy='strict'))
     s.max_scenes=4
     def boundary(clip,path):
         s.boundary_frames[clip['id']]=verify_image(png(),'mock-actual-last-frame.png')
@@ -65,6 +67,16 @@ async def test_sustained_prior_history_reaches_next_prompt_without_delaying_gaze
     assert policy['coverage']['current_fraction']>=.8
     assert cue in submitted[-1][0]['prompt']
     assert submitted[-1][0]['observationMs']==3500 and len(submitted)==3
+    if channel_mode == 'two_clean':
+        assert policy['confidence'] == policy['confidence_threshold'] == .5
+        await engine.trace_journal.flush()
+        saved = engine.trace_journal.read(s.id)
+        eligible = [r['evidence']['eeg'] for r in saved if r['evidence']['eeg']['eligible']]
+        assert eligible and eligible[-1]['selected_channels'] == ['AF7', 'AF8']
+        assert eligible[-1]['channel_policy'] == 'two_clean'
+        assert eligible[-1]['channel_coverage'] == eligible[-1]['confidence_threshold'] == .5
+        assert eligible[-1]['reduced_redundancy'] and eligible[-1]['channel_eligibility_reason']
+        assert eligible[-1]['coverage']['prior_clean_s'] >= 12
     clock[0]=start+4
     s.eeg.series.append((clock[0],.6,-z,False))
     s.tick(2,4,True,{},clock[0],clip_id=third['id'])

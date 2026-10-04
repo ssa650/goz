@@ -106,19 +106,19 @@ test('Sensor retry uses only the setup route and never starts a generation',asyn
   assert.equal(controller.pending,null);assert.equal(controller.config.sensorSetup.phase,'connecting_muse');
 });
 
-test('Removing eye calibration updates sensor state and is blocked during generation',async()=>{
+test('Full eye recalibration preserves saved state and is blocked during generation',async()=>{
   const calls=[];
-  const cleared={required:true,generationReady:false,phase:'select_camera',gaze:{savedCalibration:false,reusingCalibration:false}};
+  const cleared={required:true,generationReady:false,phase:'select_camera',gaze:{savedCalibration:true,reusingCalibration:false}};
   const request=async(path,options)=>{
     calls.push([path,options]);return cleared;
   };
   const controller=new SequenceController(()=>{},()=>{},request,storage());
   controller.config={...config,sensorSetup:{...cleared,gaze:{savedCalibration:true,reusingCalibration:true}}};
-  await controller.removeGazeCalibration();
-  assert.deepEqual(calls,[['/api/sensors/gaze-calibration',{method:'DELETE'}]]);
+  await controller.recalibrateGaze();
+  assert.deepEqual(calls,[['/api/sensors/gaze-recalibrate',{method:'POST'}]]);
   assert.equal(controller.generationReady,false);
-  assert.equal(controller.config.sensorSetup.gaze.savedCalibration,false);
+  assert.equal(controller.config.sensorSetup.gaze.savedCalibration,true);
   controller.starting=true;
-  await controller.removeGazeCalibration();
+  await controller.recalibrateGaze();
   assert.equal(calls.length,1);
 });
