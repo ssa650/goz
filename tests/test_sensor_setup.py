@@ -178,11 +178,12 @@ async def test_owned_startup_calibrates_both_then_unblocks_and_cleans_up(tmp_pat
                 sn.eeg.connected('Muse-owned-device')
         elif setup.phase == 'calibrating_muse':
             sn.eeg.calibration_started -= 70
+            sn.eeg.last_eval = 0  # Test capture uses backdated samples.
             wave(sn.eeg, time.time() - 65, 65)
         elif setup.phase == 'starting_gaze':
             assert '--setup-id' in calls[-1]
             sn.gaze.packet(dict(t=time.time(), x=100, y=100, valid=True, face=True, setupId=setup.attempt_dir.name))
-        assert predicate()
+        assert predicate(), setup.phase
     setup.wait_for = wait_for
     await setup.start()
     await setup.task
@@ -197,6 +198,7 @@ async def test_owned_startup_calibrates_both_then_unblocks_and_cleans_up(tmp_pat
         assert calls[1][calls[1].index('--camera') + 1] == '2'
         assert readers == ['started']
         assert (setup.attempt_dir / 'muse.json').exists()
+        assert setup.snapshot()['gaze']['savedCalibration']
         setup.require_ready()
         sn.gaze.last_rx = 0
         assert not setup.snapshot()['generationReady'] and setup.snapshot()['canRetry']
@@ -209,11 +211,38 @@ async def test_owned_startup_calibrates_both_then_unblocks_and_cleans_up(tmp_pat
     bridge = setup.children.get('muse')
     await setup.retry()
     await setup.task
+    if passed:
+        assert sum('calibrate' in argv for argv in calls) == 1
+        assert '--reuse-calibration' in next(argv for argv in reversed(calls) if 'stream' in argv)
+        assert setup.snapshot()['gaze']['reusingCalibration']
     assert setup.children.get('muse') is bridge
     assert sum('muselsl' in argv for argv in calls) == (1 if passed and eeg_mode == 'muse' else 0)
     await setup.close()
     assert not setup.children
     assert bool(signals) is passed
+    if passed:
+        # A new setup object represents a backend restart: reuse the exact model.
+        first_model = setup.saved_gaze()[0]
+        sn = sensors()
+        if eeg_mode == 'mindmonitor':
+            sn.eeg, sn.eeg_mode = MindMonitorFeed(), eeg_mode
+        sn.start_muse_reader = lambda: readers.append('started')
+        setup = SensorSetup(sn, tmp_path, spawn=spawn)
+        setup.wait_for = wait_for
+        await setup.start()
+        await setup.task
+        assert setup.phase == 'ready' and setup.reusing_gaze, setup.error
+        assert setup.saved_gaze()[0] == first_model
+        assert sum('calibrate' in argv for argv in calls) == 1
+        assert setup.snapshot()['generationReady']
+        # Removal immediately invalidates gaze and starts a fresh calibration.
+        await setup.remove_gaze_calibration()
+        assert not setup.gaze_calibrated and not setup.saved_gaze_path.exists()
+        await setup.task
+        assert setup.phase == 'ready' and not setup.reusing_gaze
+        assert sum('calibrate' in argv for argv in calls) == 2
+        assert setup.saved_gaze()[0] != first_model
+        await setup.close()
 
 
 @pytest.mark.asyncio
@@ -249,6 +278,65 @@ async def test_server_sensor_status_and_retry_busy_guard(tmp_path):
         engine.new_job(dict(mode='text', prompt='Existing', duration=5, resolution='480P'))
         response = await client.post('/api/sensors/setup')
         assert response.status_code == 409
+        response = await client.delete('/api/sensors/gaze-calibration')
+        assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_remove_eye_calibration_api_clears_saved_state(tmp_path):
+    async with harness(tmp_path) as (_, _, client):
+        setup = client._transport.app.state.sensors.setup
+        model = setup.directory / 'calibration' / 'validated' / 'gaze_model.pkl'
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b'validated model')
+        setup.save_gaze(model, dict(verdict='STABLE', camera='2'))
+        assert (await client.get('/api/sensors')).json()['gaze']['savedCalibration']
+        response = await client.delete('/api/sensors/gaze-calibration')
+        assert response.status_code == 202
+        assert not response.json()['gaze']['savedCalibration']
+        assert SensorSetup(sensors(), setup.directory).saved_gaze() is None
+
+
+@pytest.mark.parametrize('damage', ['model', 'metadata', 'outside'])
+def test_damaged_saved_calibration_requires_explicit_removal(tmp_path, damage):
+    setup = SensorSetup(sensors(), tmp_path)
+    model = tmp_path / 'calibration' / 'validated' / 'gaze_model.pkl'
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b'validated model')
+    setup.save_gaze(model, dict(verdict='USABLE', camera='1'))
+    if damage == 'model':
+        model.write_bytes(b'changed')
+    elif damage == 'metadata':
+        setup.saved_gaze_path.write_text('{broken')
+    else:
+        data = json.loads(setup.saved_gaze_path.read_text())
+        data['model'] = '../outside.pkl'
+        setup.saved_gaze_path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match='Remove eye calibration'):
+        SensorSetup(sensors(), tmp_path).saved_gaze()
+    assert setup.saved_gaze_path.exists()  # Never silently replace saved state.
+
+
+def test_saved_camera_follows_device_when_indexes_change():
+    from backend.gaze_worker import saved_camera
+    cameras = [dict(index=0, name='Other', deviceId='other'), dict(index=3, name='iPhone Camera', deviceId='phone')]
+    assert saved_camera(cameras, 'phone', 'iPhone Camera') == '3'
+    assert saved_camera(cameras, None, 'iPhone Camera') == '3'
+    with pytest.raises(ValueError, match='Reconnect'):
+        saved_camera(cameras, 'missing', 'iPhone Camera')
+
+
+def test_alignment_survives_restart_without_opening_targets(tmp_path):
+    from backend.gaze_worker import configure_alignment
+    model = tmp_path / 'gaze_model.pkl'
+    initial = SimpleNamespace(_quick_align=lambda *a: (1.2, 10., .8, -5.))
+    assert configure_alignment(initial, model, False)
+    initial._quick_align(None)
+    resumed = SimpleNamespace(build_predictor=lambda *a: (lambda obs: None if obs is None else (100., 50.), 'ridge', 'active'))
+    assert not configure_alignment(resumed, model, True)
+    predict, ridge, active = resumed.build_predictor()
+    assert predict('face') == (130., 35.) and predict(None) is None
+    assert ridge == 'ridge' and active == 'active'
 
 
 def test_external_camera_reference_is_shared_with_dataset(tmp_path, monkeypatch):

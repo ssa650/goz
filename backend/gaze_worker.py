@@ -1,6 +1,7 @@
 """Run Gazekit's existing calibration/streaming in a camera-owning child."""
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -79,10 +80,49 @@ def choose_camera(ui, cv2, camera_module, screen_size):
 
 def configure_camera(camera, model, dataset):
     camera_config = model.parent / "camera.json"
-    if not camera_config.exists():
-        camera_config.write_text(json.dumps({"camera": str(camera)}))
+    camera_config.write_text(json.dumps({"camera": str(camera)}))
     dataset.CONFIG_PATH = camera_config
     os.chdir(model.parent)
+
+
+def saved_camera(cameras, device_id, name):
+    matches = ([c for c in cameras if c.get("deviceId") == device_id] if device_id
+               else [c for c in cameras if c.get("name") == name])
+    if len(matches) != 1:
+        raise ValueError("The saved eye calibration's camera is unavailable. Reconnect it, or remove eye calibration to choose another camera.")
+    return str(matches[0]["index"])
+
+
+def configure_alignment(stream, model, reuse):
+    """Persist the first alignment, then apply it without a target window."""
+    path = model.parent / "gaze_alignment.json"
+    if reuse:
+        try:
+            values = json.loads(path.read_text())["coefficients"] if path.exists() else [1., 0., 1., 0.]
+            if len(values) != 4 or any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
+                raise ValueError("Invalid alignment")
+        except (OSError, ValueError, KeyError, TypeError):
+            raise ValueError("Saved gaze alignment is damaged. Remove eye calibration to train again.") from None
+        ax, bx, ay, by = values
+        original = stream.build_predictor
+        def aligned_predictor(*args, **kwargs):
+            predict, ridge, active = original(*args, **kwargs)
+            def predict_saved(observation):
+                point = predict(observation)
+                return None if point is None else (ax * float(point[0]) + bx, ay * float(point[1]) + by)
+            return predict_saved, ridge, active
+        stream.build_predictor = aligned_predictor
+        return False
+    original = stream._quick_align
+    def save_alignment(*args, **kwargs):
+        values = original(*args, **kwargs)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"coefficients": [float(v) for v in values]}))
+        temporary.chmod(0o600)
+        temporary.replace(path)
+        return values
+    stream._quick_align = save_alignment
+    return True
 
 def main():
     parser = argparse.ArgumentParser()
@@ -93,17 +133,25 @@ def main():
     parser.add_argument("--report")
     parser.add_argument("--port", type=int, default=5590)
     parser.add_argument("--setup-id")
+    parser.add_argument("--camera-device-id")
+    parser.add_argument("--camera-name")
+    parser.add_argument("--reuse-calibration", action="store_true")
     args = parser.parse_args()
     repo, model = Path(args.repo).resolve(), Path(args.model).resolve()
     sys.path.insert(0, str(repo))
     # Relative Gazekit assets/config always resolve to its checkout; calibration
     # recordings and trained models stay inside this GOZ attempt's data folder.
     os.chdir(repo)
+    if args.command == "stream" and (args.camera_device_id or args.camera_name):
+        from gazekit import camera as camera_module
+        args.camera = saved_camera(connected_cameras(camera_module), args.camera_device_id, args.camera_name)
     if args.camera == "select":
         import cv2
         from gazekit import ui, camera as camera_module
         from gazekit.screen import screen_size
         args.camera = choose_camera(ui, cv2, camera_module, screen_size)
+        print("GOZ_CAMERA " + json.dumps({"camera": args.camera}), flush=True)
+    elif args.command == "stream":
         print("GOZ_CAMERA " + json.dumps({"camera": args.camera}), flush=True)
     landmarker = model.parent.parent / "face_landmarker.task"
     if not landmarker.is_file():
@@ -126,10 +174,12 @@ def main():
     configure_camera(camera, model, dataset)
     if args.command == "calibrate":
         from gazekit.calibrate import run
+        from gazekit import camera as camera_module
+        camera_info = next((c for c in connected_cameras(camera_module) if str(c["index"]) == args.camera), {})
         report = run(camera_index=camera, model_out=str(model), dataset_root=str(model.parent / "dataset"), landmarker=str(landmarker))
         if not report or report.get("verdict") not in ("STABLE", "USABLE") or not model.is_file():
             raise ValueError("Gazekit calibration was cancelled or did not pass validation.")
-        report.update(camera=args.camera)
+        report.update(camera=args.camera, cameraName=camera_info.get("name"), cameraDeviceId=camera_info.get("deviceId"))
         Path(args.report).write_text(json.dumps(report, indent=2))
         Path(args.report).chmod(0o600)
     else:
@@ -144,7 +194,8 @@ def main():
                 return self.sock.sendto(json.dumps(sample).encode(), destination)
             def close(self): self.sock.close()
         stream.socket = SimpleNamespace(socket=TaggedSocket, AF_INET=socket.AF_INET, SOCK_DGRAM=socket.SOCK_DGRAM)
-        stream.run(camera_index=camera, model_path=str(model), port=args.port, align=True, landmarker=str(landmarker))
+        align = configure_alignment(stream, model, args.reuse_calibration)
+        stream.run(camera_index=camera, model_path=str(model), port=args.port, align=align, landmarker=str(landmarker))
 
 
 if __name__ == "__main__":

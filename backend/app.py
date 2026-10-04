@@ -175,6 +175,15 @@ def create_app(engine=None):
             await sensors.setup.retry()
         return sensors.setup.snapshot()
 
+    @app.delete("/api/sensors/gaze-calibration", status_code=202)
+    async def sensor_remove_gaze(request: Request):
+        e, sensors = request.app.state.engine, request.app.state.sensors
+        async with e.lock:
+            if e.busy() or sensors.session and sensors.session.status == "running":
+                raise FalError("Stop or finish the current generation before removing eye calibration.", 409)
+            await sensors.setup.remove_gaze_calibration()
+        return sensors.setup.snapshot()
+
     @app.post("/api/key")
     async def key(request: Request):
         e = request.app.state.engine

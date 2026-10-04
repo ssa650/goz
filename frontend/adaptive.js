@@ -46,6 +46,9 @@ $('setup').addEventListener('submit', async event => {
 $('sensor-retry').addEventListener('click', async () => {
   try { await request('/api/sensors/setup', {method:'POST'}); } catch (e) { error(e.message); }
 });
+$('gaze-calibration-remove').addEventListener('click', async () => {
+  try { await request('/api/sensors/gaze-calibration', {method:'DELETE'}); } catch (e) { error(e.message); }
+});
 $('stop').addEventListener('click', async () => { try { await post('/api/adaptive/stop', {}); } catch (e) { error(e.message); } });
 $('sound').addEventListener('click', () => { sound = !sound; video.muted = !sound; $('sound').textContent = sound ? 'Mute sound' : 'Enable sound'; });
 
@@ -145,6 +148,10 @@ function render(st) {
   $('sensor-message').textContent = (setup?.error || setup?.message || '') +
     (setup && (setup.muse.source === 'mindmonitor' || setup.phase === 'calibrating_muse') ? ` (${museProgress(setup.muse)})` : '');
   $('sensor-retry').hidden = !setup?.canRetry; $('sensor-retry').disabled = s?.status === 'running';
+  $('gaze-calibration-status').textContent = setup?.gaze?.savedCalibration
+    ? 'Eye calibration saved · reused on future starts. Remove it to calibrate again.' : '';
+  $('gaze-calibration-remove').hidden = !setup?.gaze?.savedCalibration;
+  $('gaze-calibration-remove').disabled = submitting || s?.status === 'running';
   $('start').disabled = submitting || !providerConfigured || !setup?.generationReady;
   const gz = st.gaze, ee = st.eeg;
   pill('gaze-source', gz.error ? 'port busy' : gz.source === 'sim' ? 'SIM' : gz.live ? 'gazekit live' : 'no gaze', gz.source === 'sim' ? 'sim' : gz.live ? 'live' : 'off');

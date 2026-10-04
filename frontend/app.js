@@ -51,6 +51,10 @@ const {run,config}=controller,completed=run?.clips.filter(c=>c.status==='complet
     ?museProgress(setup.muse):'';
   /** @type {HTMLButtonElement} */ const retry=element('sensor-retry');
   retry.hidden=!setup?.canRetry;retry.disabled=controller.busy;
+  element('gaze-calibration-status').textContent=setup?.gaze?.savedCalibration
+    ?'Eye calibration saved · reused on future starts. Remove it to calibrate again.':'';
+  /** @type {HTMLButtonElement} */ const remove=element('gaze-calibration-remove');
+  remove.hidden=!setup?.gaze?.savedCalibration;remove.disabled=controller.busy;
   if(!run) {
     element('overlay-message').textContent=controller.generationReady?'Your sequence is ready. Click Generate.':'Complete sensor setup to begin.';
     element('playback-status').textContent=`${controller.clips.length} clips · playback starts as soon as clip 1 is ready.`;
@@ -81,6 +85,7 @@ const {run,config}=controller,completed=run?.clips.filter(c=>c.status==='complet
 }
 const controller=new SequenceController(render,run=>playback.update(run));
 element('sensor-retry').addEventListener('click',()=>void controller.retrySensorSetup());
+element('gaze-calibration-remove').addEventListener('click',()=>void controller.removeGazeCalibration());
 generate.addEventListener('click',()=>void controller.generate());
 regenerate.addEventListener('click',()=>void controller.generate(true));
 download.addEventListener('click',()=>{

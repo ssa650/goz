@@ -1,5 +1,6 @@
 """Own sensor child processes and gate new generations on calibrated live data."""
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -31,6 +32,32 @@ class SensorSetup:
         self.readers = {}
         self.stopping = False
         self.selected_camera = None
+        self.saved_gaze_path = self.directory / "calibration" / "saved-gaze.json"
+        self.reusing_gaze = False
+
+    def saved_gaze(self):
+        if not self.saved_gaze_path.exists():
+            return None
+        try:
+            saved = json.loads(self.saved_gaze_path.read_text())
+            model = (self.directory / saved["model"]).resolve()
+            report = saved["report"]
+            if (saved.get("version") != 1 or not model.is_relative_to(self.directory / "calibration")
+                    or not model.is_file() or report.get("verdict") not in ("STABLE", "USABLE")
+                    or not isinstance(report.get("camera"), str) or not report["camera"].isdigit()
+                    or hashlib.sha256(model.read_bytes()).hexdigest() != saved["sha256"]):
+                raise ValueError("Invalid saved gaze model")
+            return model, report
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            raise ValueError("Saved eye calibration is unavailable or damaged. Remove eye calibration to train a new one.") from None
+
+    def save_gaze(self, model, report):
+        saved = dict(version=1, model=str(model.relative_to(self.directory)), report=report,
+                     sha256=hashlib.sha256(model.read_bytes()).hexdigest(), savedAt=time.time())
+        temporary = self.saved_gaze_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(saved, indent=2))
+        temporary.chmod(0o600)
+        temporary.replace(self.saved_gaze_path)
 
     def snapshot(self):
         eeg, gaze = self.sensors.eeg, self.sensors.gaze
@@ -54,7 +81,8 @@ class SensorSetup:
                     message=message, error=self.error, canRetry=self.required and (self.phase == "failed" or self.phase == "ready" and not ready),
                     camera=dict(source=self.selected_camera),
                     muse=muse, gaze=dict(**gaze.status(), calibrated=self.gaze_calibrated,
-                                        valid=gaze_live, report=self.gaze_report))
+                                        valid=gaze_live, report=self.gaze_report,
+                                        savedCalibration=self.saved_gaze_path.is_file(), reusingCalibration=self.reusing_gaze))
 
     def require_ready(self):
         state = self.snapshot()
@@ -100,12 +128,13 @@ class SensorSetup:
                 value = line.decode(errors="replace").strip()
                 if name == "gaze_calibration" and value == "GOZ_CAMERA_WINDOW ready":
                     self.message = "Gazekit’s camera window is open. Select iPhone Camera (Continuity Camera). Keep the phone locked with its rear cameras facing you. Press R to refresh. Muse starts after gaze calibration."
-                if name == "gaze_calibration" and value.startswith("GOZ_CAMERA "):
+                if name in ("gaze_calibration", "gaze") and value.startswith("GOZ_CAMERA "):
                     try:
                         camera = json.loads(value[len("GOZ_CAMERA "):])["camera"]
                         if isinstance(camera, str) and camera.isdigit():
                             self.selected_camera = camera
-                            self.set_phase("calibrating_gaze", "Camera selected. Follow Gazekit's calibration targets and dismiss its results screen. Muse calibration comes next.")
+                            if name == "gaze_calibration":
+                                self.set_phase("calibrating_gaze", "Camera selected. Follow Gazekit's calibration targets and dismiss its results screen. Your eye calibration will be saved automatically.")
                     except (ValueError, KeyError, TypeError):
                         pass
                 self.logs[name].append(value[:400])
@@ -118,6 +147,7 @@ class SensorSetup:
             self.error = None
             self.gaze_calibrated = False
             self.gaze_report = None
+            self.reusing_gaze = False
             if self.sensors.gaze_mode != "gazekit" or self.sensors.eeg_mode not in ("muse", "mindmonitor"):
                 raise ValueError("Live generation requires GOZ_GAZE=gazekit and GOZ_EEG=mindmonitor (or muse). Use GOZ_DEMO=1 for a rehearsal.")
             if self.sensors.gaze_error:
@@ -132,32 +162,46 @@ class SensorSetup:
                 raise ValueError("Gazekit was not found. Set GOZ_GAZEKIT_DIR to its checkout.")
             if not gaze_python.is_file():
                 raise ValueError("Gazekit Python was not found. Set GOZ_GAZEKIT_PYTHON to its interpreter.")
-            self.set_phase("select_camera", "Gazekit is opening automatically. Select your iPhone Camera in its native window, then follow the calibration targets. Keep the iPhone locked, with its rear cameras facing you. Muse comes afterward.")
             worker = [gaze_python, "-u", "-m", "backend.gaze_worker"]
             model = self.attempt_dir / "gaze_model.pkl"
             report_path = self.attempt_dir / "gaze_ready.json"
-            calibration = await self.launch("gaze_calibration", [*worker, "calibrate", "--repo", gaze_repo,
+            saved = self.saved_gaze()
+            if saved:
+                model, self.gaze_report = saved
+                self.reusing_gaze = True
+            else:
+                self.set_phase("select_camera", "Gazekit is opening automatically. Select your iPhone Camera in its native window, then follow the calibration targets. Keep the iPhone locked, with its rear cameras facing you. Your eye calibration will be saved for future starts.")
+                calibration = await self.launch("gaze_calibration", [*worker, "calibrate", "--repo", gaze_repo,
                                                     "--camera", "select", "--model", model, "--report", report_path], ROOT)
-            try:
-                code = await asyncio.wait_for(calibration.wait(), timeout=900)
-            except TimeoutError:
-                raise ValueError("Gaze calibration timed out. Follow all targets and dismiss the results screen; then retry.") from None
-            await self.readers["gaze_calibration"]
-            if code != 0 or not report_path.is_file() or not model.is_file():
-                raise ValueError("Gaze calibration did not pass. " + self.log_tail(calibration))
-            self.gaze_report = json.loads(report_path.read_text())
+                try:
+                    code = await asyncio.wait_for(calibration.wait(), timeout=900)
+                except TimeoutError:
+                    raise ValueError("Gaze calibration timed out. Follow all targets and dismiss the results screen; then retry.") from None
+                await self.readers["gaze_calibration"]
+                if code != 0 or not report_path.is_file() or not model.is_file():
+                    raise ValueError("Gaze calibration did not pass. " + self.log_tail(calibration))
+                self.gaze_report = json.loads(report_path.read_text())
             if self.gaze_report.get("verdict") not in ("STABLE", "USABLE"):
                 raise ValueError("Gaze calibration was poor. Retry in better lighting while facing the camera.")
             camera = self.gaze_report.get("camera")
             if not isinstance(camera, str) or not camera.isdigit():
                 raise ValueError("Gazekit did not report the selected camera. Retry calibration.")
             self.selected_camera = camera
+            if not saved:
+                self.save_gaze(model, self.gaze_report)
             self.gaze_calibrated = True
-            self.set_phase("starting_gaze", "Gaze calibrated. Complete Gazekit's quick alignment; waiting for valid gaze samples…")
+            self.set_phase("starting_gaze", "Using your saved eye calibration and alignment. Waiting for live gaze…" if saved
+                           else "Eye calibration saved. Complete Gazekit's first alignment; this adjustment will also be saved.")
             # Old samples from an unrelated external producer cannot unlock setup.
             self.sensors.gaze.samples.clear()
             self.sensors.gaze.last_rx = 0
-            stream = await self.launch("gaze", [*worker, "stream", "--repo", gaze_repo, "--camera", camera,
+            camera_args = []
+            if saved:
+                camera_args.append("--reuse-calibration")
+            for option, field in (("--camera-device-id", "cameraDeviceId"), ("--camera-name", "cameraName")):
+                if self.gaze_report.get(field):
+                    camera_args += [option, self.gaze_report[field]]
+            stream = await self.launch("gaze", [*worker, "stream", "--repo", gaze_repo, "--camera", camera, *camera_args,
                                       "--model", model, "--setup-id", self.attempt_dir.name,
                                       "--port", str(os.getenv("GOZ_GAZE_PORT", "5590"))], ROOT)
             await self.wait_for(lambda: any(s.get("valid") for s in self.sensors.gaze.window(time.time() - 1, time.time())), 90, stream)
@@ -230,3 +274,20 @@ class SensorSetup:
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
         await self.stop_children()
+
+    async def remove_gaze_calibration(self):
+        if self.task and not self.task.done():
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
+        await self.stop_children(keep_muse=True)
+        self.saved_gaze_path.unlink(missing_ok=True)
+        self.gaze_calibrated = False
+        self.reusing_gaze = False
+        self.gaze_report = None
+        self.sensors.gaze.samples.clear()
+        self.sensors.gaze.last_rx = 0
+        self.sensors.gaze.expected_setup_id = "removed-" + str(uuid4())
+        self.sensors.eeg.reset_calibration()
+        self.selected_camera = None
+        self.set_phase("waiting", "Eye calibration removed. Starting a fresh calibration…")
+        await self.start()

@@ -3,7 +3,7 @@ import { api, jsonRequest, sequenceFor } from './clip-state.js';
 /** @typedef {import('./clip-state.js').ClipRecord} ClipRecord */
 /** @typedef {import('./clip-state.js').SequenceRequest} SequenceRequest */
 /** @typedef {import('./clip-state.js').SequenceRun} SequenceRun */
-/** @typedef {{required:boolean,generationReady:boolean,phase:string,message:string,error:string|null,canRetry:boolean,muse:{source?:string,startupSamples?:number,targetSamples?:number,goodChannels?:string[],cleanSeconds:number,targetSeconds:number,qualityError:string}}} SensorSetupState */
+/** @typedef {{required:boolean,generationReady:boolean,phase:string,message:string,error:string|null,canRetry:boolean,gaze?:{savedCalibration:boolean,reusingCalibration:boolean},muse:{source?:string,startupSamples?:number,targetSamples?:number,goodChannels?:string[],cleanSeconds:number,targetSeconds:number,qualityError:string}}} SensorSetupState */
 /** @typedef {{configured:boolean,demo:boolean,pollMs:number,sensorSetup?:SensorSetupState}} PlayerConfig */
 /** @typedef {{getItem:(key:string)=>string|null,setItem:(key:string,value:string)=>void,removeItem:(key:string)=>void}} RequestStorage */
 
@@ -49,6 +49,15 @@ export class SequenceController {
     if(this.busy) return;
     try {
       const state=await this.request('/api/sensors/setup',{method:'POST'});
+      if(this.config) this.config.sensorSetup=state;
+      this.error='';
+    } catch(error) {this.error=error instanceof Error?error.message:String(error);}
+    this.changed(this);
+  }
+  async removeGazeCalibration() {
+    if(this.busy) return;
+    try {
+      const state=await this.request('/api/sensors/gaze-calibration',{method:'DELETE'});
       if(this.config) this.config.sensorSetup=state;
       this.error='';
     } catch(error) {this.error=error instanceof Error?error.message:String(error);}

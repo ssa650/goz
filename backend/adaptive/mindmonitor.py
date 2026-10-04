@@ -45,6 +45,7 @@ class MindMonitorFeed(EegFeed):
 
     def _reset(self):
         self.bands.clear()
+        self.used_at = 0.0
         self.ema = None
         self.readings = 0
         self.calibration = None
