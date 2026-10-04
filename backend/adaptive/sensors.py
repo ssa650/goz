@@ -2,7 +2,7 @@
 
 Gaze: `gazekit stream` UDP datagrams (gazekit docs/STREAM_PROTOCOL.md).
 EEG:  Muse 2 via `muselsl stream` (Lab Streaming Layer), reduced to a
-      beta/(alpha+theta) engagement index z-scored against a rolling baseline.
+      exploratory beta/(alpha+theta) feature relative to a clean baseline.
 Both have explicit simulators for rehearsal; the dashboard labels them SIM.
 """
 import asyncio
@@ -15,6 +15,9 @@ import time
 from collections import deque
 
 import numpy as np
+
+from .eeg_quality import (CausalEegFilter, MIN_CHANNELS, REASONS, MAX_INTERVAL_S,
+                          UniqueCleanTime, channel_diagnostics, muse_metadata)
 
 GAZE_PORT = 5590
 EEG_RATE = 256
@@ -105,7 +108,7 @@ def band_powers(window):
 
 
 class EegFeed:
-    """Engagement series [(t, engagement, z, artifact)] from raw EEG chunks."""
+    """Exploratory feature series [(t, ratio, z, artifact)] from raw EEG chunks."""
 
     def __init__(self):
         self.raw = deque(maxlen=int(EEG_RATE * 10))
@@ -124,13 +127,37 @@ class EegFeed:
         self.samples_received = 0
         self.channel_quality = {}
         self.acquisition_phase = "off"
+        self.filtered = deque(maxlen=self.raw.maxlen)
+        self.filter = CausalEegFilter()
+        self.clean_time = UniqueCleanTime()
+        self.selected_channels = ()
+        self.channel_calibration_samples = []
+        self.feature_history = deque(maxlen=self.series.maxlen)
+        self.reject_reasons = []
+        self.invalid_until = float("-inf")
+        self.input_diagnostics = dict(duplicateSamples=0, outOfOrderSamples=0,
+                                      conflictingSamples=0, invalidSamples=0, mismatchedChunks=0,
+                                      gapCount=0, missingSamples=0, lastGapSeconds=0.0)
+        self.stream_metadata = muse_metadata(None, None)
+        self.metadata_error = False
 
-    def _clear_baseline(self):
-        self.raw.clear()
+    def _reset_feature_baseline(self):
         self.series.clear()
-        self.last_eval = 0.0
+        self.feature_history.clear()
         self.calibration = None
         self.calibration_samples = []
+        self.channel_calibration_samples = []
+        self.clean_time = UniqueCleanTime()
+
+    def _clear_baseline(self):
+        self._reset_feature_baseline()
+        self.filtered.clear()
+        self.filter.reset()
+        self.selected_channels = ()
+        self.reject_reasons = []
+        self.invalid_until = float("-inf")
+        self.raw.clear()
+        self.last_eval = 0.0
         self.channel_quality = {}
 
     def begin_calibration(self, seconds=60.0):
@@ -140,10 +167,12 @@ class EegFeed:
             self.calibration_started = time.time()
             self.quality_error = "Collecting a fresh 2-second EEG window."
 
-    def connected(self, identity):
+    def connected(self, identity, metadata=None):
         with self.lock:
             self.acquisition_phase = "waiting_for_samples"
             self.device_id = identity
+            self.stream_metadata = metadata or muse_metadata(None, identity)
+            self.metadata_error = not self.stream_metadata["valid"]
             self.connection_error = None
             self._clear_baseline()
             self.last_sample_at = None
@@ -167,19 +196,44 @@ class EegFeed:
 
     def push(self, samples, stamps):
         with self.lock:
+            if len(samples) != len(stamps):
+                self.input_diagnostics["mismatchedChunks"] += 1
+                self.quality_error = "Mismatched EEG samples and timestamps."
+                self.reject_reasons = ["invalid_input"]
+                self.invalid_until = (self.last_sample_at or time.time()) + EEG_WINDOW_S
+                return
             for s, t in zip(samples, stamps):
-                if len(s) < 4 or not np.isfinite(s[:4]).all() or not math.isfinite(t):
+                try:
+                    x = np.asarray(s[:4], dtype=float)
+                    t = float(t)
+                    valid = len(x) == 4 and np.isfinite(x).all() and math.isfinite(t)
+                except (TypeError, ValueError, OverflowError):
+                    valid = False
+                if not valid:
+                    self.input_diagnostics["invalidSamples"] += 1
                     self.quality_error = "Invalid EEG samples."
-                    continue
-                t = float(t)
-                if self.raw and t <= self.raw[-1][0]:
+                    self.reject_reasons = ["invalid_input"]
+                    self.invalid_until = (self.last_sample_at or time.time()) + EEG_WINDOW_S
                     continue
                 if self.last_sample_at is not None and t <= self.last_sample_at:
+                    key = "duplicateSamples" if t == self.last_sample_at else "outOfOrderSamples"
+                    self.input_diagnostics[key] += 1
+                    if self.raw and t == self.raw[-1][0] and not np.array_equal(x, self.raw[-1][1]):
+                        self.input_diagnostics["conflictingSamples"] += 1
+                        self.invalid_until = self.last_sample_at + EEG_WINDOW_S
+                        self.quality_error = "Conflicting EEG samples at one timestamp."
+                        self.reject_reasons = ["invalid_input"]
                     continue
-                if self.last_sample_at is not None and t - self.last_sample_at > 1:
+                if self.last_sample_at is not None and t - self.last_sample_at > MAX_INTERVAL_S:
+                    interval = t - self.last_sample_at
+                    self.input_diagnostics["gapCount"] += 1
+                    self.input_diagnostics["missingSamples"] += max(1, round(interval * EEG_RATE) - 1)
+                    self.input_diagnostics["lastGapSeconds"] = round(interval - 1 / EEG_RATE, 6)
+                    # A dropped packet breaks causal state and all duration evidence.
                     self._clear_baseline()
                     self.calibration_started = t
                     self.quality_error = "EEG sample gap; collecting a fresh baseline."
+                    self.reject_reasons = ["sample_gap"]
                 if self.device_id and self.calibration is None and self.calibration_started is None:
                     self.calibration_started = t
                 self.last_sample_at = t
@@ -187,7 +241,8 @@ class EegFeed:
                 self.connection_error = None
                 if self.source == "muse":
                     self.state = "Muse EEG samples arriving"
-                self.raw.append((t, s[:4]))
+                self.raw.append((t, x))
+                self.filtered.append(self.filter.process(x[None, :])[0])
                 if t - self.last_eval >= EEG_STEP_S:
                     self.last_eval = t
                     self._evaluate(t)
@@ -196,45 +251,57 @@ class EegFeed:
         n = int(EEG_RATE * EEG_WINDOW_S)
         if len(self.raw) < n:
             return
-        window = np.array([s for _, s in list(self.raw)[-n:]], dtype=float)
-        spread, variation = np.ptp(window, axis=0), np.std(window, axis=0)
-        spectrum = np.abs(np.fft.rfft((window - window.mean(axis=0)) * np.hanning(n)[:, None], axis=0)) ** 2
-        frequencies = np.fft.rfftfreq(n, 1 / EEG_RATE)
-        line_mask = ((frequencies >= 49) & (frequencies <= 51)) | ((frequencies >= 59) & (frequencies <= 61))
-        line_fraction = spectrum[line_mask].sum(axis=0) / np.maximum(spectrum[frequencies >= 1].sum(axis=0), 1e-9)
-        self.channel_quality = {name: dict(peakToPeakUV=round(float(spread[i]), 2),
-            stdUV=round(float(variation[i]), 2), peakAbsUV=round(float(np.abs(window[:, i]).max()), 2),
-            lineNoiseFraction=round(float(line_fraction[i]), 3)) for i, name in enumerate(EEG_CHANNELS)}
-        problems = []
-        if not 1.8 <= t - self.raw[-n][0] <= 2.2: problems.append("EEG packets missing or irregular")
-        if spread.max() > ARTIFACT_UV: problems.append("movement or poor contact")
-        if variation.min() < 0.05: problems.append("flat sensor channel")
-        if np.abs(window).max() >= 950: problems.append("clipped sensor channel")
-        if line_fraction.max() > 0.35: problems.append("50/60 Hz interference")
-        artifact = bool(problems)
-        self.quality_error = "; ".join(problems) if problems else ""
-        bp = band_powers(window)
-        engagement = bp["beta"] / max(bp["alpha"] + bp["theta"], 1e-9)
-        if (self.calibration_started is not None and t >= self.calibration_started + EEG_WINDOW_S
-                and not artifact and self.calibration is None):
-            self.calibration_samples.append((t, engagement))
-            if len(self.calibration_samples) * EEG_STEP_S >= self.calibration_seconds:
-                values = np.array([value for _, value in self.calibration_samples])
-                median = float(np.median(values))
-                scale = max(float(np.median(np.abs(values - median))) * 1.4826, 1e-6)
-                self.calibration = dict(deviceId=self.device_id, median=median, scale=scale,
-                                        cleanSeconds=round(len(values) * EEG_STEP_S, 2), calibratedAt=t)
-                self.calibration_started = None
-        base = [e for (tt, e, _, a) in self.series if not a and t - tt <= BASELINE_S]
-        if self.calibration:
-            z = (engagement - self.calibration["median"]) / self.calibration["scale"]
-        elif len(base) >= 8:
-            median = float(np.median(base))
-            mad = float(np.median(np.abs(np.array(base) - median))) * 1.4826 or 1e-6
-            z = (engagement - median) / mad
-        else:
-            z = 0.0
-        # Before a real-device baseline is ready, these rows are not response evidence.
+        rows = list(self.raw)[-n:]
+        window = np.array([s for _, s in rows], dtype=float)
+        filtered = np.array(list(self.filtered)[-n:], dtype=float)
+        stamps = np.array([tt for tt, _ in rows])
+        self.channel_quality = channel_diagnostics(window, filtered, stamps, ARTIFACT_UV)
+        selected = tuple(i for i, name in enumerate(EEG_CHANNELS) if self.channel_quality[name]["usable"])
+        if selected != self.selected_channels:
+            # A new spatial mixture must never use the old mixture's baseline.
+            self._reset_feature_baseline()
+            self.selected_channels = selected
+            self.calibration_started = t if self.device_id else self.calibration_started
+        reasons = []
+        if len(selected) < MIN_CHANNELS:
+            reasons = list(dict.fromkeys(reason for q in self.channel_quality.values() for reason in q["rejectReasons"]))
+            reasons.append("insufficient_channels")
+        if t < self.invalid_until: reasons.append("invalid_input")
+        if self.metadata_error: reasons.append("metadata")
+        self.reject_reasons = reasons
+        artifact = bool(reasons)
+        self.quality_error = "; ".join(REASONS[reason] for reason in reasons)
+        # Unusable rows retain a finite placeholder only for tuple compatibility;
+        # artifact=True excludes them from every consumer and from the baseline.
+        engagement, z = 0.0, 0.0
+        if not artifact:
+            ratios = [band_powers(filtered[:, i:i+1]) for i in selected]
+            values = np.array([bp["beta"] / max(bp["alpha"] + bp["theta"], 1e-9) for bp in ratios])
+            engagement = float(np.median(values))
+            if self.calibration is None:
+                self.calibration_samples.append((t, engagement))
+                self.channel_calibration_samples.append(values)
+                clean_seconds = self.clean_time.add(stamps[0], t)
+                if clean_seconds + 1e-6 >= self.calibration_seconds:
+                    per_channel = np.array(self.channel_calibration_samples)
+                    medians = np.median(per_channel, axis=0)
+                    scales = np.maximum(np.median(np.abs(per_channel - medians), axis=0) * 1.4826, 1e-6)
+                    median = float(np.median([value for _, value in self.calibration_samples]))
+                    self.calibration = dict(deviceId=self.device_id, median=median,
+                        scale=max(float(np.median(np.abs(np.array([v for _, v in self.calibration_samples]) - median))) * 1.4826, 1e-6),
+                        channels=[EEG_CHANNELS[i] for i in selected],
+                        channelMedians=medians.tolist(), channelScales=scales.tolist(),
+                        cleanSeconds=round(clean_seconds, 6), calibratedAt=t)
+                    self.calibration_started = None
+            if self.calibration:
+                z = float(np.median((values - self.calibration["channelMedians"]) / self.calibration["channelScales"]))
+            else:
+                base = [v for tt, v in self.feature_history if t - tt <= BASELINE_S]
+                if len(base) >= 8:
+                    medians = np.median(base, axis=0)
+                    scales = np.maximum(np.median(np.abs(np.array(base) - medians), axis=0) * 1.4826, 1e-6)
+                    z = float(np.median((values - medians) / scales))
+            self.feature_history.append((t, values))
         self.series.append((t, engagement, float(np.clip(z, -5, 5)),
                             artifact or self.source == "muse" and self.calibration is None))
 
@@ -258,7 +325,7 @@ class EegFeed:
             recent = [p for p in self.series if now - EEG_FRESH_S <= p[0] <= now + 0.5]
             usable = bool(live and recent and not recent[-1][3] and not self.quality_error
                           and (self.calibration or self.source == "sim"))
-            confidence = sum(not row[3] for row in recent) / len(recent) if usable else 0.0
+            confidence = (sum(not row[3] for row in recent) / len(recent) * len(self.selected_channels) / 4) if usable else 0.0
             state = ("simulated" if self.source == "sim" else "error" if self.connection_error else
                      "poor_signal" if live and self.channel_quality and self.quality_error else "streaming" if live else
                      "stale" if sample_age is not None else "connecting" if self.device_id or self.source == "muse" else "disconnected")
@@ -268,14 +335,25 @@ class EegFeed:
             return dict(source=self.source, state=self.connection_error or self.state, live=live, deviceId=self.device_id,
                     confidence=round(confidence, 3),
                     connectionState=state, modeLabel="EEG physiological observations available" if confidence else "EEG unavailable — gaze-only mode",
-                    interpretation="Physiological variation; cause and valence unknown",
+                    interpretation="Exploratory beta/(alpha+theta); not a validated emotion measure; cause and valence unknown",
                     calibrated=bool(self.calibration) and live, qualityError=self.quality_error,
-                    cleanSeconds=round(min(len(self.calibration_samples) * EEG_STEP_S, self.calibration_seconds), 1),
+                    cleanSeconds=round(min(self.clean_time.seconds, self.calibration_seconds), 3),
                     targetSeconds=self.calibration_seconds, outletAvailable=bool(self.device_id),
                     samplingState=sampling, samplesReceived=self.samples_received,
                     acquisitionPhase=self.acquisition_phase,
                     lastSampleAt=self.last_sample_at, sampleAgeSeconds=None if sample_age is None else round(sample_age, 3),
-                    channelQuality=dict(self.channel_quality))
+                    channelQuality=dict(self.channel_quality), rejectReasons=list(self.reject_reasons),
+                    selectedChannels=[EEG_CHANNELS[i] for i in self.selected_channels],
+                    qualityWarning=(f"{len(self.selected_channels)} of 4 clean channels; reduced confidence" if usable and len(self.selected_channels) < 4 else ""),
+                    channelConfidenceCeiling=round(len(self.selected_channels) / 4, 3),
+                    excludedChannels=[name for i, name in enumerate(EEG_CHANNELS) if i not in self.selected_channels],
+                    streamMetadata=dict(self.stream_metadata), inputDiagnostics=dict(self.input_diagnostics),
+                    featureWindowSeconds=EEG_WINDOW_S,
+                    effectiveHistorySeconds=round(min(EEG_WINDOW_S, self.raw[-1][0] - self.raw[0][0] + 1 / EEG_RATE), 6) if self.raw else 0.0,
+                    featureAgeSeconds=round(now - self.series[-1][0], 3) if self.series else None,
+                    filter=dict(type="causal Butterworth SOS", bandHz=[1, 40], order=4,
+                                notchHz=None, warmupSeconds=EEG_WINDOW_S, preservesRawGates=True),
+                    qualityVersion="raw-validity-causal-sos-v1", cleanTimeMethod="unique accepted time intervals after first full clean window")
 
 
 def run_muse(feed, stop):
@@ -347,7 +425,11 @@ def _consume_muse(feed, stop, pylsl):
             inlet = pylsl.StreamInlet(streams[0], max_buflen=5, max_chunklen=12, recover=False)
             if stop.is_set():
                 break
+            metadata_info = inlet.info(timeout=.5) if hasattr(inlet, "info") else streams[0]
             feed.connected(pinned)
+            metadata = muse_metadata(metadata_info, pinned)
+            feed.metadata_error = not metadata["valid"]
+            feed.stream_metadata = metadata
             feed.state = "Muse LSL outlet advertised; waiting for EEG samples"
             idle = time.time()
             initial_clock_attempt = True

@@ -9,6 +9,8 @@ pillow==12.3.0
 # adaptive story: EEG band powers, person detection, Muse 2 over LSL
 numpy>=1.26
 scikit-learn>=1.4
+# Stateful EEG SOS filters (also used transitively by scikit-learn)
+scipy>=1.11,<2
 opencv-contrib-python>=4.10
 # 1.0.1 aborts in model init on macOS
 mediapipe>=1.0.0,!=1.0.1

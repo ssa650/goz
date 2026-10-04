@@ -113,7 +113,7 @@ async def test_decoded_full_clip_has_t0_tail_tags_thread_limits_and_progress(tmp
 
 
 @pytest.mark.asyncio
-async def test_local_worker_cancel_terminates_child_and_releases_gate(tmp_path):
+async def test_local_worker_cancel_cooperatively_exits_and_releases_gate(tmp_path):
     video=tmp_path/'long.mp4'
     await ffmpeg('-loop','1','-i',ROOT/'presets/secret-box/frames/00-30.jpg','-t','30',
                  '-vf','scale=640:400','-r','8','-pix_fmt','yuv420p',video)
@@ -121,7 +121,7 @@ async def test_local_worker_cancel_terminates_child_and_releases_gate(tmp_path):
     observed=asyncio.Event()
     task=asyncio.create_task(local_tracker.detect_local(video,CAST,clip_id='clip',session_id='session',
         on_progress=lambda result:observed.set()))
-    await asyncio.wait_for(observed.wait(),5)
+    await asyncio.wait_for(observed.wait(),local_tracker.MAX_WALL_SECONDS)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task,2)
@@ -139,6 +139,11 @@ async def test_worker_timeout_is_bounded_and_keeps_partial_progress(tmp_path,mon
     monkeypatch.setattr(local_tracker,'MAX_WALL_SECONDS',.01)
     with pytest.raises(TimeoutError):
         await local_tracker.detect_local(video,CAST,clip_id='clip',session_id='session')
+    # Cooperative startup cancellation may outlive the caller by a bounded startup
+    # interval. The slot stays occupied until the child actually exits.
+    deadline=time.monotonic()+5
+    while {p.pid for p in multiprocessing.active_children()} != baseline and time.monotonic()<deadline:
+        await asyncio.sleep(.05)
     assert {p.pid for p in multiprocessing.active_children()}==baseline
 
 

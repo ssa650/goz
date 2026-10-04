@@ -15,6 +15,7 @@ from starlette.datastructures import UploadFile
 from .sensors import EegFeed, GazeFeed, Simulator, run_muse, GAZE_PORT
 from .mindmonitor import MindMonitorFeed, run_mindmonitor
 from .session import AdaptiveSession, MAX_SCENES
+from . import tracks
 from ..sensor_setup import SensorSetup
 
 MAX_CHARACTERS = 4
@@ -113,6 +114,12 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
             raise ValueError("No adaptive session.")
         return s
 
+    @app.get("/api/adaptive/decision-traces")
+    async def decision_traces(request: Request, session_id: str | None = None):
+        journal = request.app.state.engine.trace_journal
+        records = await asyncio.to_thread(journal.read, session_id)
+        return dict(records=records, warning=journal.error)
+
     @app.post("/api/adaptive/sessions", status_code=202)
     async def start(request: Request):
         e, sn = request.app.state.engine, sensors(request)
@@ -140,6 +147,10 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
                 raise ValueError("Character and object names must be unique.")
             from .tracks import tracking_provider
             tracker = tracking_provider(str(form["tracker"]) if "tracker" in form else None)
+            if tracker == "yoloe":
+                availability = tracks.yoloe_availability()
+                if not availability["available"]:
+                    raise ValueError("YOLOE unavailable: " + availability["reason"])
             timeline = str(form.get("timeline", ""))[:20000]
             use_sequence = str(form.get("use_saved_sequence", "0")) == "1"
             bundles = None
@@ -201,12 +212,22 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
         visible = body.get("visible_rect")
         if visible is not None:
             visible = {k: number(visible.get(k), -1e5, 1e5) for k in ("x", "y", "w", "h")}
+        mapping = body.get("mapping")
+        if mapping is not None:
+            if not isinstance(mapping, dict) or type(mapping.get("valid")) is not bool:
+                raise ValueError("Mapping validity must be a boolean.")
+            mapping = dict(valid=mapping["valid"], **{k: str(mapping[k])[:120] if mapping.get(k) is not None else None
+                for k in ("method", "coordinateSpace", "reason")})
+            for key in ("scale", "devicePixelRatio", "screenWidth", "screenHeight"):
+                value = body["mapping"].get(key)
+                mapping[key] = number(value, 0, 1e5) if value is not None else None
         if type(body.get("playing")) is not bool:
             raise ValueError("Playing must be a boolean.")
         session(request).tick(int(number(body.get("clip"), 0, 100)), number(body.get("video_t"), 0, 600),
                               body["playing"], rect, number(body.get("wall"), 0, 1e13) / 1000,
                               clip_id=body.get("clip_id"), epoch=int(number(body.get("epoch", 0), 0, 1e10)),
-                              playback_rate=number(body.get("playback_rate", 1), .1, 4), visible_rect=visible)
+                              playback_rate=number(body.get("playback_rate", 1), .1, 4), visible_rect=visible,
+                              mapping=mapping)
         return {"ok": True}
 
     @app.post("/api/adaptive/ended")
@@ -280,6 +301,7 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
                                       eeg_confidence=sn.eeg.status().get("confidence", 0))
         return dict(
             session=s.public() if s else None,
+            trackerAvailability=dict(yoloe=tracks.yoloe_availability()),
             response=response,
             setup=sn.setup.snapshot(),
             gaze=dict(**sn.gaze.status(), error=sn.gaze_error, point=s.live_gaze() if s else None,

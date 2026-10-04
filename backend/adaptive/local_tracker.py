@@ -2,12 +2,13 @@
 
 Five existing episode crops are exemplars, not a trained character model.
 Recognition supplies identity; optical flow can only preserve that identity for
-0.8 seconds. A separate, single-threaded process makes cancellation enforceable.
+0.8 seconds. A separate, single-threaded process cooperatively stops between native calls.
 """
 import asyncio
 import multiprocessing
 import os
 import queue
+import threading
 import time
 import weakref
 
@@ -17,7 +18,60 @@ RECOGNITION_FPS = 2
 MAX_SECONDS = 120
 MAX_WALL_SECONDS = 30
 IDENTITY_TTL = .8
+OUTPUT_CAPACITY = 2
+LIVE_MAX_AGE_S = .25
 _gates = weakref.WeakKeyDictionary()
+_worker_slot = threading.BoundedSemaphore(1)
+
+
+class LatestFrameSlot:
+    """One pending live input; replace old work rather than accumulating latency.
+
+    Not used for offline whole-clip history. Callers own a single inference worker;
+    pending inputs and in-flight publication are guarded separately by provenance.
+    """
+    def __init__(self):
+        self.pending = None
+        self.dropped = 0
+        self.provenance = None
+
+    def offer(self, frame, media_t, provenance):
+        if provenance != self.provenance:
+            self.pending = None
+            self.provenance = provenance
+        if self.pending is not None:
+            self.dropped += 1
+        self.pending = (frame, media_t, provenance)
+
+    def take(self, media_t):
+        item, self.pending = self.pending, None
+        if item is not None and (item[2] != self.provenance or media_t-item[1] > LIVE_MAX_AGE_S or item[1] > media_t+.001):
+            self.dropped += 1
+            return None
+        return item
+
+    def cancel(self):
+        self.provenance = None
+        self.pending = None
+
+    def publishable(self, item, media_t):
+        return (item is not None and item[2] == self.provenance and self.provenance is not None
+                and -.001 <= media_t-item[1] <= LIVE_MAX_AGE_S)
+
+
+def playback_target(state, now):
+    """Extrapolate only recent presented media, never pauses, seeks or old ticks."""
+    if not state or not state.get("playing") or not state.get("current", True):
+        return None
+    age = now-state["at"]
+    if not 0 <= age <= .6:
+        return None
+    return state["media_t"] + age*state.get("rate", 1)
+
+
+def inference_due(media_t, state, now):
+    target = playback_target(state, now)
+    return target is None or media_t >= target-LIVE_MAX_AGE_S
 
 
 def reference_regions(pixels, names):
@@ -169,7 +223,32 @@ class ReferenceTracker:
             coordinate_space="video-normalized", provider_confidence_available=False)
 
 
-def _worker(video, names, tags, output):
+
+def _new_tracker(names, tags, provider):
+    if provider == "color":
+        from .color_detector import ColorCharacterDetector
+        return ColorCharacterDetector(names, clip_id=tags["clip_id"], session_id=tags["session_id"],
+            generation_id=tags.get("generation_id"))
+    if provider != "opencv":
+        raise ValueError("Local worker provider must be color or opencv")
+    return ReferenceTracker(names)
+
+def _emit(output, record, stop):
+    while not stop.is_set():
+        try:
+            output.put(record, timeout=.05)
+            return True
+        except queue.Full:
+            continue
+    return False
+
+
+def _worker(video, names, tags, output, stop, playback=None, provider="opencv"):
+    cpu_started, wall_started = time.process_time(), time.perf_counter()
+    if stop.is_set():
+        output.cancel_join_thread()
+        output.close()
+        return
     for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
         os.environ[key] = "1"
     import cv2
@@ -189,75 +268,163 @@ def _worker(video, names, tags, output):
         finally:
             metadata.close()
         sw, sh = meta["size"]
-        height = max(2, int(round(sh*WIDTH/sw/2))*2)
+        width = min(WIDTH, max(2, int(round(WIDTH*sw/sh/2))*2)) if provider == "color" else WIDTH
+        height = max(2, int(round(sh*width/sw/2))*2)
+        fps = 4 if provider == "color" else FLOW_FPS
         if height > 1280:
             raise ValueError("Local tracking rejects extreme portrait aspect ratios.")
         reader = imageio_ffmpeg.read_frames(video, input_params=["-threads","1"],
-            output_params=["-threads","1","-vf",f"fps={FLOW_FPS},scale={WIDTH}:{height}","-t",str(MAX_SECONDS)])
+            output_params=["-threads","1","-vf",f"fps={fps},scale={width}:{height}","-t",str(MAX_SECONDS)])
         next(reader)
-        tracker = ReferenceTracker(names)
+        tracker = _new_tracker(names, tags, provider)
+        dropped = 0
+        epoch = None
         for i, raw in enumerate(reader):
-            if i >= MAX_SECONDS*FLOW_FPS:
+            if stop.is_set() or i >= MAX_SECONDS*fps or time.perf_counter()-wall_started >= MAX_WALL_SECONDS:
                 break
-            pixels = np.frombuffer(raw,np.uint8).reshape(height,WIDTH,3)
-            record = tracker.step(pixels,i/FLOW_FPS)
+            pixels = np.frombuffer(raw,np.uint8).reshape(height,width,3)
+            t = i/fps
+            state = None
+            if playback is not None:
+                with playback.get_lock():
+                    media_t, at, playing, current, current_epoch, rate = playback[:]
+                state = dict(media_t=media_t, at=at, playing=bool(playing), current=bool(current), epoch=current_epoch, rate=rate)
+                # A seek cannot carry optical flow or previous-shot identity.
+                if epoch is not None and current_epoch != epoch:
+                    tracker = _new_tracker(names, tags, provider)
+                epoch = current_epoch
+            inference_started = time.perf_counter()
+            if inference_due(t, state, time.monotonic()):
+                record = tracker.step(pixels,t)
+            else:
+                dropped += 1
+                tracker = _new_tracker(names, tags, provider)
+                record = dict(t=t, media_timestamp_s=t, boxes={}, regions=[], unknown=list(names),
+                    source="opencv_color_shape_demo" if provider == "color" else "opencv_reference_flow", coordinate_space="video-normalized", status="unavailable",
+                    abstention_reason="stale_work_skipped_for_playback", cut=True, valid_until=t,
+                    provider_confidence_available=False)
+            record["scheduling"] = dict(mode="playback_priority" if playback is not None else "offline_full_clip",
+                dropped_stale_inputs=dropped, queue_capacity=OUTPUT_CAPACITY,
+                inference_ms=round((time.perf_counter()-inference_started)*1000,3),
+                worker_cpu_scope="opencv_python_process_excludes_ffmpeg",
+                worker_cpu_s=round(time.process_time()-cpu_started,4),
+                worker_wall_s=round(time.perf_counter()-wall_started,4))
             record.update(**tags, resources=dict(opencv_threads=cv2.getNumThreads(),decode_threads=1,
-                width=WIDTH,flow_fps=FLOW_FPS,recognition_fps=RECOGNITION_FPS))
-            output.put(record,timeout=2)
-        output.put(None,timeout=2)
+                width=width,flow_fps=fps,recognition_fps=fps if provider == "color" else RECOGNITION_FPS))
+            if not _emit(output, record, stop):
+                break
+        _emit(output, None, stop)
     except Exception as error:
-        output.put(dict(worker_error=type(error).__name__, message=str(error)[:200]),timeout=2)
+        _emit(output, dict(worker_error=type(error).__name__, message=str(error)[:200]), stop)
     finally:
         if reader is not None:
             reader.close()
+        if stop.is_set():
+            output.cancel_join_thread()
         output.close()
-        output.join_thread()
+        if not stop.is_set():
+            output.join_thread()
+
 
 
 def _dispose(process, output):
-    if process.is_alive():
-        process.terminate()
-    process.join(.3)
-    if process.is_alive():
-        process.kill()
-        process.join(.3)
+    """Cooperatively owned worker exits; never terminate/kill a process."""
+    process.join()
     output.close()
     process.close()
 
 
-async def detect_local(video, names, *, clip_id, session_id, generation_id=None, on_progress=None):
-    """One local worker globally per event loop; bounded queue/CPU/time/cancel."""
+def _retire(process, output, gate, loop, completion, keepalive):
+    # keepalive retains spawn synchronization handles until actual child exit.
+    def finished():
+        gate.release()
+        if not completion.done():
+            completion.set_result(None)
+    try:
+        _dispose(process, output)
+    finally:
+        _worker_slot.release()
+        try:
+            loop.call_soon_threadsafe(finished)
+        except RuntimeError:
+            pass  # This loop is closed; the host-wide slot has still been released.
+
+
+async def detect_local(video, names, *, clip_id, session_id, generation_id=None, on_progress=None, playback_state=None, provider="opencv"):
+    """Offline full coverage or playback stale-work skipping, one CPU worker.
+
+    Playback/generation never await tracking. Cancellation signals stop between
+    native calls and returns within one second; a stuck native call retains the
+    worker slot until it exits. No process termination is authorized or attempted.
+    """
     loop = asyncio.get_running_loop()
     gate = _gates.setdefault(loop, asyncio.Semaphore(1))
-    async with gate:
-        context = multiprocessing.get_context("spawn")
-        output = context.Queue(maxsize=32)
-        process = context.Process(target=_worker, args=(str(video),list(names),
-            dict(clip_id=clip_id,session_id=session_id,generation_id=generation_id),output),daemon=True)
+    await gate.acquire()
+    try:
+        while not _worker_slot.acquire(blocking=False):
+            await asyncio.sleep(.02)
+    except BaseException:
+        gate.release()
+        raise
+    context = multiprocessing.get_context("spawn")
+    output = context.Queue(maxsize=OUTPUT_CAPACITY)
+    stop = context.Event()
+    playback = context.Array("d", [0, 0, 0, 0, 0, 1]) if playback_state else None
+    process = context.Process(target=_worker, args=(str(video),list(names),
+        dict(clip_id=clip_id,session_id=session_id,generation_id=generation_id),output,stop,playback,provider),daemon=True)
+    try:
         process.start()
-        result = []
-        try:
-            async with asyncio.timeout(MAX_WALL_SECONDS):
-                while True:
-                    received = False
-                    for _ in range(32):
-                        try:
-                            record = output.get_nowait()
-                        except queue.Empty:
-                            break
-                        if record is None:
-                            if on_progress:
-                                on_progress(list(result))
-                            return result
-                        if "worker_error" in record:
-                            raise RuntimeError(f"OpenCV worker {record['worker_error']}: {record['message']}")
-                        result.append(record)
-                        received = True
-                    if received and on_progress:
-                        on_progress(list(result))
-                    if not process.is_alive() and not received:
+    except BaseException:
+        output.close()
+        gate.release()
+        _worker_slot.release()
+        raise
+    result = []
+    try:
+        async with asyncio.timeout(MAX_WALL_SECONDS):
+            while True:
+                if playback is not None:
+                    state = playback_state()
+                    with playback.get_lock():
+                        playback[:] = ([state["media_t"], state["at"], state.get("playing", False),
+                            state.get("current", True), state.get("epoch", 0), state.get("rate", 1)]
+                            if state else [0, 0, 0, 0, 0, 1])
+                received = False
+                for _ in range(OUTPUT_CAPACITY):
+                    try:
+                        record = output.get_nowait()
+                    except queue.Empty:
+                        break
+                    if record is None:
+                        if on_progress:
+                            on_progress(list(result))
+                        return result
+                    if "worker_error" in record:
+                        raise RuntimeError(f"OpenCV worker {record['worker_error']}: {record['message']}")
+                    record["received_at"] = time.time()
+                    result.append(record)
+                    received = True
+                if received and on_progress:
+                    on_progress(list(result))
+                # Queue feeder can deliver completion just after process exit.
+                if not process.is_alive() and not received:
+                    try:
+                        final = await asyncio.to_thread(output.get, True, .1)
+                    except queue.Empty:
                         raise RuntimeError("OpenCV worker exited without a completion record.")
-                    await asyncio.sleep(.02)
-        finally:
-            # Shield cleanup: cancellation must never leave unbounded CPU work.
-            await asyncio.shield(asyncio.to_thread(_dispose,process,output))
+                    if final is None:
+                        return result
+                    if "worker_error" in final:
+                        raise RuntimeError(f"OpenCV worker {final['worker_error']}: {final['message']}")
+                    result.append(final)
+                await asyncio.sleep(.02)
+    finally:
+        stop.set()
+        # Retirement owns the slot even if a native call outlives cancellation.
+        cleanup = loop.create_future()
+        threading.Thread(target=_retire, args=(process, output, gate, loop, cleanup, (stop, playback)),
+            name="opencv-cooperative-reaper", daemon=True).start()
+        try:
+            await asyncio.wait_for(asyncio.shield(cleanup), 1)
+        except TimeoutError:
+            pass

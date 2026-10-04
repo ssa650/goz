@@ -13,6 +13,7 @@ from .frames import download_video, extract_last_frame, video_url, media_metadat
 from .fal_adapter import FalError
 from .prompts import plan
 from .clip_settings import random_seed, build_h3_request, ReferenceFrame
+from .adaptive import decision_trace
 from .clips import ClipService
 from .bundle_sequence import BundleSequenceService
 
@@ -39,6 +40,7 @@ class Engine:
         self.extractor = extractor
         self.jobs = self.load("history.json")
         self.sequences = self.load("sequences.json")
+        self.trace_journal = decision_trace.Journal(self.directory)
         self.clips = ClipService(self)
         self.bundles = BundleSequenceService(self)
         self.lock = asyncio.Lock()
@@ -112,6 +114,9 @@ class Engine:
 
     def update(self, record, **patch):
         record.update(patch)
+        decision_trace.refresh(record, getattr(self.adapter, "key", None))
+        if record.get("decisionTrace"):
+            self.trace_journal.schedule(record["decisionTrace"])
         if record.get("sequenceId"):
             sequence = self.sequences[record["sequenceId"]]
             if sequence["status"] not in SEQUENCE_TERMINAL:
@@ -132,6 +137,8 @@ class Engine:
             options.setdefault("promptExpansionMode", "disabled")
         job = dict(id=str(uuid4()), **options, **metadata, model=MODELS[options["mode"]], status="uploading", startedAt=now())
         self.jobs[job["id"]] = job
+        if job.get("decisionTrace"):
+            self.trace_journal.schedule(job["decisionTrace"])
         self.persist()
         return job
 
@@ -196,6 +203,9 @@ class Engine:
                         payloadConstructionMs=round((time.perf_counter()-prompt_started)*1000, 3),
                         apiStartedAt=now(), status="submitting")
             submission_started = time.perf_counter()
+            decision_trace.attempted(job, payload, now(), getattr(self.adapter, "key", None))
+            if job.get("decisionTrace"):
+                self.trace_journal.schedule(job["decisionTrace"])
             submitted = await self.adapter.submit(job["model"], payload)
             job["submissionMs"] = round((time.perf_counter()-submission_started)*1000, 3)
             if not submitted.get("request_id"):
@@ -468,4 +478,5 @@ class Engine:
         for task in (*self.tasks, *self.uploads.values()):
             task.cancel()
         await asyncio.gather(*self.tasks, *self.uploads.values(), return_exceptions=True)
+        await self.trace_journal.flush()
         await self.adapter.close()

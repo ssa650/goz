@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import json
 import math
+from functools import lru_cache
 from pathlib import Path
 
 import httpx
@@ -116,15 +117,43 @@ FAL_FPS = 0.5
 FAL_CONCURRENCY = 2
 MAX_DETECTION_AGE_S = 0.8
 CACHE_SCHEMA = 5
-TRACKING_PROVIDERS = {"fal", "opencv", "people"}
+TRACKING_PROVIDERS = {"color", "fal", "opencv", "people", "yoloe"}
 
 
 def tracking_provider(value=None):
     import os
-    value = os.getenv("GOZ_TRACKER", "fal") if value is None else value
+    value = os.getenv("GOZ_TRACKER", "color") if value is None else value
     if value not in TRACKING_PROVIDERS:
-        raise ValueError("Tracking provider must be fal, opencv or people.")
+        raise ValueError("Tracking provider must be color, fal, opencv, people or yoloe.")
     return value
+
+
+
+def yoloe_config():
+    """Explicit local experiment config. Never download/install on selection."""
+    import os
+    from .yoloe_detector import DetectorConfig
+    options = dict(weights=os.getenv("GOZ_YOLOE_WEIGHTS", ""),
+        weights_sha256=os.getenv("GOZ_YOLOE_SHA256", ""),
+        license_reviewed=os.getenv("GOZ_YOLOE_LICENSE_REVIEWED") == "1",
+        device=os.getenv("GOZ_YOLOE_DEVICE", "cpu"), fps=2, queue_size=2)
+    # External isolated interpreter is optional in the provider's evolving contract.
+    runtime = os.getenv("GOZ_YOLOE_PYTHON", "")
+    if runtime:
+        if "runtime_python" not in DetectorConfig.__dataclass_fields__:
+            raise RuntimeError("YOLOE isolated runtime adapter is not available yet")
+        options["runtime_python"] = runtime
+    return DetectorConfig(**options)
+
+
+def yoloe_availability():
+    """Offline experiment only: held-out wrong labels must not drive gaze."""
+    return dict(available=False, experimental=True,
+        reason="held-out identity check failed; offline only",
+        benchmark=dict(labelled_frames=24, visible_instances=35, true_positive=11,
+            false_positive=5, false_negative=24, wrong_identity_labels=4,
+            precision=.6875, recall=.3143,
+            annotation_quality="Codex-reviewed approximate boxes; not independent human gold"))
 
 
 def failure_details(error, key=""):
@@ -283,7 +312,6 @@ def _reference_features():
     return result
 
 
-from functools import lru_cache
 _reference_features = lru_cache(maxsize=1)(_reference_features)
 
 

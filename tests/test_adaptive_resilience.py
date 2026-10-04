@@ -132,7 +132,7 @@ async def test_controller_and_florence_failures_still_produce_playable_clip(tmp_
         return path
     monkeypatch.setattr(engine, 'run_job', complete)
     monkeypatch.setattr(engine, 'media_path', local_media)
-    s = new_session(engine)
+    s = new_session(engine, tracker='fal')  # Explicit rollback provider under test.
     await s.make_scene({}, s.opening, None, [])
     assert s.status == 'running' and s.clips[0]['status'] == 'ready'
     assert s.clips[0]['track'] == [] and s.clips[0]['writer'] == 'template-fallback'

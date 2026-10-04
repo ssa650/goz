@@ -15,7 +15,7 @@ from copy import deepcopy
 from pathlib import Path
 from uuid import uuid4
 
-from . import director, fusion, profile as profiles, tracks
+from . import director, fusion, profile as profiles, tracks, decision_trace, gaze_audit
 from ..frames import ffmpeg
 from ..clip_settings import generation_options
 
@@ -77,9 +77,11 @@ class AdaptiveSession:
         self.log("stage", stage=stage)
 
     def public(self):
-        clips = [{k: v for k, v in c.items() if k not in ("ticks", "timeline", "image", "frozenEvidence")} for c in self.clips]
+        clips = [{k: v for k, v in c.items() if k not in ("ticks", "timeline", "image", "frozenEvidence", "decisionTrace")} for c in self.clips]
         for clip in clips:
             if job := self.engine.jobs.get(clip.get("jobId")):
+                trace = job.get("decisionTrace") or {}
+                clip["decisionTrace"] = {k: trace.get(k) for k in ("submission", "promptExact", "changed")}
                 clip["generationInput"] = job.get("generationInput")
                 clip["generationStatus"] = job.get("status")
                 clip["queuePosition"] = job.get("queuePosition")
@@ -87,6 +89,7 @@ class AdaptiveSession:
         return dict(id=self.id, status=self.status, stage=self.stage, error=self.error, names=self.target_names,
                     story=self.story, profile=self.profile, clips=clips, playing=self.playing,
                     duration=self.duration, demo=self.engine.adapter.demo, maxScenes=self.max_scenes, tracker=self.tracker,
+                    trackerAvailability=dict(yoloe=tracks.yoloe_availability()),
                     events=self.events[-20:], warnings=self.warnings[-6:],
                     latency=dict(samples=len(self.readiness_samples), readinessS=self.readiness_samples,
                                  estimateS=self.readiness_estimate()),
@@ -134,6 +137,7 @@ class AdaptiveSession:
         return self.frame_tasks[clip["id"]]
 
     def freeze_evidence(self, clip, end):
+        freeze_started = time.perf_counter()
         start = clip.get("playStartedAt", end)
         # Bound delayed HTTP/task processing to the opening playback window.
         end = min(end, start + self.analyze_at(clip))
@@ -156,6 +160,8 @@ class AdaptiveSession:
         clip["frozenEvidence"] = deepcopy(dict(start=start, end=end, ticks=ticks, track=track,
             gaze=read(self.gaze), eeg=read(self.eeg), quality=quality,
             detectionStatus=clip.get("detectionStatus", "unavailable"), frozenAt=time.time()))
+        clip["frozenEvidence"]["freezeWorkMs"] = round((time.perf_counter()-freeze_started)*1000,3)
+        clip["frozenEvidence"]["trackingTiming"] = deepcopy(clip.get("trackingTiming", {}))
         clip["analysisStarted"] = True
         self.log("observation_frozen", clip=clip["index"], clipId=clip["id"],
                  start=start, end=end, detectionStatus=clip.get("detectionStatus"),
@@ -172,7 +178,7 @@ class AdaptiveSession:
         tick = clip["ticks"][-1]
         if not tick["playing"] or time.time() - tick["wall"] > 1.0:
             return None
-        return tick["video_t"] + (time.time() - tick["wall"])
+        return tick["video_t"] + (time.time() - tick["wall"]) * tick.get("playbackRate", 1)
 
     def live_boxes(self):
         clip, t = self.current_clip(), self.live_video_time()
@@ -182,7 +188,7 @@ class AdaptiveSession:
 
     def live_gaze(self):
         clip, sample = self.current_clip(), self.gaze.latest()
-        if not clip or not sample or sample["t"] < self.started or time.time() - sample["t"] > .5:
+        if not clip or not sample or sample["t"] < self.started or not 0 <= time.time() - sample["t"] <= .5:
             return None
         labelled = fusion.label([sample], clip["ticks"][-3:], clip.get("track") or [])
         return labelled[0] if labelled else None
@@ -192,7 +198,7 @@ class AdaptiveSession:
         return g["target"] if g else None
 
     # -- browser playback reports -------------------------------------------
-    def tick(self, index, video_t, playing, rect, wall, clip_id=None, epoch=0, playback_rate=1.0, visible_rect=None):
+    def tick(self, index, video_t, playing, rect, wall, clip_id=None, epoch=0, playback_rate=1.0, visible_rect=None, mapping=None):
         if not 0 <= index < len(self.clips):
             raise ValueError("Unknown clip.")
         if self.playing is not None and index < self.playing:
@@ -208,7 +214,9 @@ class AdaptiveSession:
             raise ValueError("Playback timestamp is outside this clip or the server clock.")
         if clip["ticks"] and wall <= clip["ticks"][-1]["wall"]:
             return
-        tick = dict(wall=wall, video_t=video_t, playing=playing, rect=rect, visible_rect=visible_rect,
+        if mapping is not None and not mapping.get("valid"):
+            rect, visible_rect = None, None
+        tick = dict(mapping=deepcopy(mapping), wall=wall, video_t=video_t, playing=playing, rect=rect, visible_rect=visible_rect,
                     sessionId=self.id, clipId=clip.get("id"), epoch=epoch, playbackRate=playback_rate)
         clip["ticks"].append(tick)
         if self.playing is not None and index > self.playing:
@@ -295,6 +303,11 @@ class AdaptiveSession:
             clip = dict(id=str(uuid4()), sessionId=self.id, decisionId=decision.get("id"), index=0, status="tracking", decision=decision, changes=[], plan=plan, writer="predefined",
                         duration=seconds, ticks=[], seeds=None, createdAt=time.time(), path=str(path))
             self.clips.append(clip)
+            clip["decisionId"] = decision.get("id") or str(uuid4())
+            clip["decisionTrace"] = decision_trace.create(self, clip)
+            clip["decisionTrace"]["writer"]["outputReference"] = None
+            clip["decisionTrace"]["generationStatus"] = "predefined"
+            self.engine.trace_journal.schedule(clip["decisionTrace"])
             self.story["scenes"].append(dict(title=plan["scene_title"], summary=plan["summary"]))
             clip["track"] = []
             self.start_detection(clip, path, None, None, seconds)
@@ -310,6 +323,15 @@ class AdaptiveSession:
             self.set_stage("scene 1 ready")
         except Exception as error:
             self.fail(error)
+
+    def tracking_playback(self, clip):
+        if not clip or not clip.get("ticks") or self.status != "running":
+            return None
+        tick = clip["ticks"][-1]
+        # Convert epoch wall time to a monotonic age without changing capture time.
+        return dict(media_t=tick["video_t"], at=time.monotonic()-(time.time()-tick["wall"]),
+            playing=tick["playing"], current=self.current_clip() is clip,
+            epoch=tick.get("epoch", 0), rate=tick.get("playbackRate", 1))
 
     async def track(self, path, seeds, focus, seconds=None, clip_id=None, on_progress=None):
         if self.engine.adapter.demo:
@@ -331,10 +353,18 @@ class AdaptiveSession:
                 local = result
                 publish()
             try:
-                local = await detect_local(path,self.target_names,clip_id=clip_id,session_id=self.id,
-                    generation_id=generation_id,on_progress=progress)
+                if self.tracker == "yoloe":
+                    from .yoloe_detector import detect_yoloe
+                    config = tracks.yoloe_config()
+                    local = await detect_yoloe(path,self.target_names,clip_id=clip_id,session_id=self.id,
+                        generation_id=generation_id,on_progress=progress,config=config)
+                else:
+                    local = await detect_local(path,self.target_names,clip_id=clip_id,session_id=self.id,
+                        generation_id=generation_id,on_progress=progress,
+                        playback_state=lambda: self.tracking_playback(clip),
+                        provider="color" if self.tracker == "color" else "opencv")
             except Exception as error:
-                self.warn("OpenCV",error)
+                self.warn("YOLOE" if self.tracker == "yoloe" else "Color/shape" if self.tracker == "color" else "OpenCV",error)
                 clip["localTrackingError"] = self.engine.error(error)
         async def run_cloud():
             nonlocal cloud
@@ -387,6 +417,7 @@ class AdaptiveSession:
             clip["track"] = self.demo_track(focus, seconds)
             clip["detectionStatus"] = "synthetic"
             return
+        self.cancel_detection(clip)
         clip["detectionStatus"] = "processing"
         clip["detectionProvider"] = self.tracker
         clip["detectionLifecycle"] = "active"
@@ -395,7 +426,8 @@ class AdaptiveSession:
         async def work():
             started = time.perf_counter()
             def publish(result):
-                if (self.status != "running" or not any(c is clip for c in self.clips)
+                if (clip.get("trackingGenerationId") != generation_id
+                        or self.status != "running" or not any(c is clip for c in self.clips)
                         or clip.get("endedAt") is not None
                         or (self.playing is not None and clip["index"] < self.playing)):
                     return
@@ -404,13 +436,23 @@ class AdaptiveSession:
                     and f.get("session_id", self.id) in (None, self.id)
                     and f.get("generation_id",generation_id) == generation_id])
                 clip["detected"] = sum(bool(f["boxes"]) for f in clip["track"])
+                timing = clip.setdefault("trackingTiming", {})
+                if clip["track"]:
+                    timing.setdefault("firstRecordMs", round((time.perf_counter()-started)*1000,3))
+                    if clip["detected"]:
+                        timing.setdefault("firstNamedMs", round((time.perf_counter()-started)*1000,3))
+                    timing["throughMediaS"] = max(f["t"] for f in clip["track"])
+                    latest = max(clip["track"], key=lambda f:f["t"])
+                    timing["scheduling"] = deepcopy(latest.get("scheduling", {}))
             try:
                 result = await self.track(path, seeds, focus, seconds, clip["id"], publish)
             except asyncio.CancelledError:
-                clip["detectionLifecycle"] = "cancelled"
-                self.dump(f"clip-{clip['id']}_detections.json",clip.get("track",[]))
+                if clip.get("trackingGenerationId") == generation_id:
+                    clip["detectionLifecycle"] = "cancelled"
+                    self.dump(f"clip-{clip['id']}_detections.json",clip.get("track",[]))
                 raise
-            if (self.status != "running" or clip.get("endedAt") is not None or not any(c is clip for c in self.clips)
+            if (clip.get("trackingGenerationId") != generation_id
+                    or self.status != "running" or clip.get("endedAt") is not None or not any(c is clip for c in self.clips)
                     or (self.playing is not None and clip["index"] < self.playing)):
                 return
             publish(result)
@@ -444,6 +486,7 @@ class AdaptiveSession:
             analysis = fusion.analyze(timeline, eeg, track, self.names, clip.get("plan"), confidence,
                                       eeg_quality=frozen["quality"], eeg_window=(t0,t1))
             analysis["detection_status_at_deadline"] = frozen["detectionStatus"]
+            analysis["gaze_audit"] = gaze_audit.summarize(samples, ticks, timeline)
             # Story objects have dwell but never stand in for another character
             # when establishing a comparative character preference.
             object_names = [o["name"] for o in self.objects]
@@ -508,7 +551,6 @@ class AdaptiveSession:
                 return
             if index and self.clips[-1]["status"] not in ("playing", "watched"):
                 return
-            self.engine.generation_guard()
             bundle = self.clip_bundles[index] if self.clip_bundles else None
             duration = bundle["duration"] if bundle else self.duration
             self.story["next_prompt"] = bundle["prompt"] if bundle else director.continuation(self.story)
@@ -530,13 +572,15 @@ class AdaptiveSession:
             composition_ms = round((time.perf_counter()-composed_at)*1000, 2)
             if not self.source_current(source):
                 return
-            self.engine.generation_guard()
             clip = dict(id=str(uuid4()), sessionId=self.id, decisionId=decision["id"], observationWindow=decision.get("observationWindow"),
                         compositionMs=composition_ms, frameExtractionMs=frame_extraction_ms,
                         decisionMs=source_decision.get("decisionMs", 0), index=index, status="generating", decision=decision, changes=changes, plan=plan,
                         writer=writer, duration=duration, ticks=[], seeds=seeds, createdAt=time.time(),
                         bundle=deepcopy(bundle), basePrompt=plan["base_prompt"])
+            clip["decisionTrace"] = decision_trace.create(self, clip, source)
             self.clips.append(clip)
+            self.engine.trace_journal.schedule(clip["decisionTrace"])
+            self.engine.generation_guard()
             self.log("decision", clip=index, decision=decision, writer=writer, change_note=plan["change_note"])
             self.set_stage(f"generating scene {index + 1}")
             if bundle:
@@ -546,7 +590,7 @@ class AdaptiveSession:
             else:
                 options = dict(mode="frames" if image else "text", prompt=plan["video_prompt"], duration=duration, resolution=self.resolution)
                 images = {"start": [image]} if image else {}
-            job = self.engine.new_job(options, adaptiveSession=self.id, sceneIndex=index,
+            job = self.engine.new_job(options, decisionTrace=clip["decisionTrace"], adaptiveSession=self.id, sceneIndex=index,
                                       clipId=bundle["id"] if bundle else None,
                                       sourceClipId=bundle["id"] if bundle else None,
                                       basePrompt=plan["base_prompt"], engagementDecision=decision, decisionId=decision["id"],
@@ -585,7 +629,7 @@ class AdaptiveSession:
                 timing["observationToReadyMs"] = max(0, (time.time()-window["start"])*1000)
                 if job.get("apiStartedAt") is not None:
                     timing["observationToSubmitMs"] = max(0, job["apiStartedAt"]-window["start"]*1000)
-            self.engine.update(job, **timing)
+            self.engine.update(job, continuationReadyAt=time.time(), **timing)
             clip.update(path=str(path), url=f"/api/jobs/{job['id']}/video", status="ready",
                         continuationReadyMs=continuation_ms, generatedS=round(continuation_ms/1000, 3), readyAt=time.time(),
                         generationInput=job.get("generationInput"),
@@ -608,6 +652,9 @@ class AdaptiveSession:
     async def fallback_clip(self, clip, error):
         """Keep the last displayed frame; never advance the story with a replay."""
         self.warn("Generation", error)
+        if clip.get("decisionTrace"):
+            clip["decisionTrace"]["generationStatus"] = "failed"
+            self.engine.trace_journal.schedule(clip["decisionTrace"])
         clip.update(status="failed", fallback=True, track=[],
                     fallbackReason="Generation failed. Holding the previous frame; this adaptation was not generated.")
         self.fail(error)

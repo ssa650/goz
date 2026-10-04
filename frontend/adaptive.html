@@ -55,10 +55,12 @@
         <button id="add-character" class="secondary" type="button">Add character</button>
         <label>Important objects <span class="hint">Optional · up to two, separated by commas (for example: small brown secret box)</span><input id="objects" maxlength="400" placeholder="small brown secret box"></label>
         <label>Scene recognition and tracking <select id="tracker">
-          <option value="fal">Florence + local reference tracking (default)</option>
+          <option value="color">Experimental color + shape (test default)</option>
+          <option value="fal">Florence + local reference tracking</option>
           <option value="opencv">Local OpenCV reference tracking</option>
+          <option value="yoloe" disabled>YOLOE experiment (runtime unavailable)</option>
         </select></label>
-        <p class="hint">Local mode uses existing SpongeBob/Patrick reference poses with geometric matching and short-lived motion tracking. New poses, occlusion and other identities may remain unknown. Choose before Start; select Florence on the next run to roll back.</p>
+        <p class="hint">The experimental test default uses yellow/pink regions and shape checks for SpongeBob/Patrick. It can miss or mislabel characters; uncertain scenes stay unknown. OpenCV uses existing reference poses with geometric matching and short-lived motion tracking. New poses, occlusion and other identities may remain unknown. Choose before Start; select Florence on the next run to roll back.</p>
         <div class="settings">
           <label>Seconds per scene <select id="duration"></select></label>
           <label>Resolution <select id="resolution"><option value="480P">480p</option><option value="768P">768p</option><option value="1080P">1080p</option></select></label>
@@ -90,12 +92,20 @@
       </div>
       <div class="card decision">
         <h3>Intended story state</h3><p id="story-state" class="hint">Waiting for the opening scene.</p>
-        <div class="card-head"><h3>Latest submitted adaptation</h3><span id="writer" class="pill">—</span></div>
+        <div class="card-head"><h3>Latest planned adaptation</h3><span id="writer" class="pill">—</span></div>
         <div id="decision" class="chips"></div>
         <ul id="reasons" class="reasons"></ul>
         <p id="change-note" class="note"></p>
-        <details><summary id="next-title">Next scene prompt</summary><pre id="next-prompt"></pre></details><details><summary>Actual prompt changes</summary><pre id="prompt-changes"></pre></details><details><summary>Exact provider request</summary><pre id="request-payload"></pre></details>
+        <details><summary id="next-title">Next scene prompt</summary><pre id="next-prompt"></pre></details><details><summary>Actual prompt changes</summary><pre id="prompt-changes"></pre></details><details><summary>Provider submission status</summary><pre id="request-payload"></pre></details>
       </div>
+      <details id="trace-panel" class="card">
+        <summary>Decision trace debug history</summary>
+        <label>Run <select aria-label="Filter decision traces by run"><option value="">All runs</option></select></label>
+        <button type="button" data-trace-refresh>Refresh</button>
+        <button type="button" data-trace-download>Download local JSON</button>
+        <p role="status" class="hint"></p>
+        <div data-trace-list></div>
+      </details>
     </aside>
   </div>
 </main></body></html>
