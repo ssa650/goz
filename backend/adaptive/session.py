@@ -15,7 +15,8 @@ from copy import deepcopy
 from pathlib import Path
 from uuid import uuid4
 
-from . import director, fusion, profile as profiles, tracks, decision_trace, gaze_audit
+from . import director, fusion, profile as profiles, tracks, decision_trace, gaze_audit, tracking_diagnostics
+from .cumulative_eeg_policy import CumulativeEEGHistory, RUN_MODE as CUMULATIVE_EEG_MODE
 from ..frames import ffmpeg
 from ..clip_settings import generation_options
 
@@ -27,11 +28,22 @@ DEMO_COLORS = ["0xe07a5f", "0x3d85c6", "0x81b29a", "0xf2cc8f"]
 
 class AdaptiveSession:
     def __init__(self, engine, gaze, eeg, directory, premise, characters, duration, resolution, opening,
-                 opening_video=None, timeline="", clip_bundles=None, objects=None, tracker=None):
+                 opening_video=None, timeline="", clip_bundles=None, objects=None, tracker=None, playback_mode="download", eeg_run_mode=CUMULATIVE_EEG_MODE, eeg_gaze_only=False):
+        if playback_mode not in ("download", "stream"):
+            raise ValueError("Choose download or stream playback.")
+        self.playback_mode = playback_mode
+        self.local_media_tasks = {}
         self.engine, self.gaze, self.eeg = engine, gaze, eeg
         self.id = str(uuid4())
         self.dir = Path(directory)/"adaptive"/self.id
         self.dir.mkdir(parents=True, exist_ok=True)
+        if eeg_run_mode not in ("baseline", CUMULATIVE_EEG_MODE):
+            raise ValueError("Choose baseline or cumulative_prior_clips EEG policy.")
+        if not isinstance(eeg_gaze_only,bool):
+            raise ValueError("EEG gaze-only choice must be a boolean.")
+        self.eeg_gaze_only = eeg_gaze_only  # Snapshot the setup choice once per run.
+        self.eeg_run_mode = eeg_run_mode
+        self.eeg_history = CumulativeEEGHistory(self.id)
         self.names = [c["name"] for c in characters]
         self.objects = objects or []
         self.target_names = self.names + [o["name"] for o in self.objects]
@@ -50,12 +62,16 @@ class AdaptiveSession:
         self.generation_degraded = False
         self.generation_lock = asyncio.Lock()
         self.tracker = tracks.tracking_provider(tracker)
+        self.local_worker = None
+        self.local_worker_close_task = None
+        self.tracking_readiness = dict(state="not_started" if self.tracker in ("color","opencv","fal") and not self.engine.adapter.demo else "not_required")
         self.detection_tasks = set()
         self.detection_by_clip = {}
         self.readiness_samples = []
         self.frame_tasks = {}
         self.boundary_frames = {}
         self.adaptation_source = None
+        self.dump("session.json", dict(id=self.id,startedAt=self.started,playbackMode=self.playback_mode,eegRunMode=self.eeg_run_mode,eegGazeOnly=self.eeg_gaze_only))
 
     def warn(self, component, error):
         message = self.engine.error(error)
@@ -86,9 +102,9 @@ class AdaptiveSession:
                 clip["generationStatus"] = job.get("status")
                 clip["queuePosition"] = job.get("queuePosition")
                 clip["timing"] = {k:v for k,v in job.items() if k.endswith("Ms") or k in ("providerMetrics", "timings")}
-        return dict(id=self.id, status=self.status, stage=self.stage, error=self.error, names=self.target_names,
+        return dict(id=self.id, status=self.status, stage=self.stage, error=self.error, names=self.target_names, playbackMode=self.playback_mode, eegRunMode=self.eeg_run_mode, eegGazeOnly=self.eeg_gaze_only,
                     story=self.story, profile=self.profile, clips=clips, playing=self.playing,
-                    duration=self.duration, demo=self.engine.adapter.demo, maxScenes=self.max_scenes, tracker=self.tracker,
+                    duration=self.duration, demo=self.engine.adapter.demo, maxScenes=self.max_scenes, tracker=self.tracker, trackingReadiness=deepcopy(self.tracking_readiness),
                     trackerAvailability=dict(yoloe=tracks.yoloe_availability()),
                     events=self.events[-20:], warnings=self.warnings[-6:],
                     latency=dict(samples=len(self.readiness_samples), readinessS=self.readiness_samples,
@@ -136,6 +152,33 @@ class AdaptiveSession:
             self.frame_tasks[clip["id"]] = self.engine.spawn(work())
         return self.frame_tasks[clip["id"]]
 
+    def eeg_quality_snapshot(self):
+        # Copy feed identity, never mutate acquisition/calibration. A concurrent
+        # channel change produces an incompatible snapshot and abstention.
+        quality = deepcopy(self.eeg.status())
+        quality["calibration"] = deepcopy(getattr(self.eeg, "calibration", None) or {})
+        quality["gazeOnly"] = self.eeg_gaze_only
+        if self.eeg_gaze_only:
+            quality.update(measuredLive=quality.get("live"),measuredConfidence=quality.get("confidence"),
+                live=False,confidence=0.0,policyOverrideReason="Explicit gaze-only choice for this run")
+        return quality
+
+    def collect_viewing_eeg(self, clip, observed_at):
+        if self.eeg_run_mode != CUMULATIVE_EEG_MODE or not clip.get("eegHistoryStarted"):
+            return
+        # Current quality cannot be applied retroactively to delayed HTTP ticks.
+        if not 0 <= time.time()-observed_at <= .75:
+            return
+        try:
+            samples = self.eeg.window(max(clip["playStartedAt"],observed_at-.75), observed_at)
+            added = self.eeg_history.collect(self.id,clip["id"],samples,self.eeg_quality_snapshot(),
+                observed_at=observed_at)
+            if added:
+                tracking_diagnostics.for_clip(self,clip).record("eeg_history_collection",
+                    runMode=self.eeg_run_mode,observedAt=observed_at,rowsAdded=added)
+        except Exception as error:
+            self.warn("EEG cumulative history",error)
+
     def freeze_evidence(self, clip, end):
         freeze_started = time.perf_counter()
         start = clip.get("playStartedAt", end)
@@ -153,16 +196,23 @@ class AdaptiveSession:
                 self.warn("Observation", error)
                 return []
         try:
-            quality = self.eeg.status()
+            quality = self.eeg_quality_snapshot()
         except Exception as error:
             self.warn("EEG status", error)
             quality = {}
         clip["frozenEvidence"] = deepcopy(dict(start=start, end=end, ticks=ticks, track=track,
             gaze=read(self.gaze), eeg=read(self.eeg), quality=quality,
             detectionStatus=clip.get("detectionStatus", "unavailable"), frozenAt=time.time()))
+        if self.eeg_run_mode == CUMULATIVE_EEG_MODE:
+            frozen = clip["frozenEvidence"]
+            frozen["eegPolicy"] = self.eeg_history.compare(frozen["eeg"],quality,(start,end))
+            tracking_diagnostics.for_clip(self,clip).record("eeg_cumulative_frozen",
+                runMode=self.eeg_run_mode,policy=frozen["eegPolicy"])
         clip["frozenEvidence"]["freezeWorkMs"] = round((time.perf_counter()-freeze_started)*1000,3)
         clip["frozenEvidence"]["trackingTiming"] = deepcopy(clip.get("trackingTiming", {}))
         clip["analysisStarted"] = True
+        tracking_diagnostics.for_clip(self,clip).record("evidence_frozen", start=start,end=end,
+            **tracking_diagnostics.publication_evidence(track), trackingTiming=clip.get("trackingTiming",{}))
         self.log("observation_frozen", clip=clip["index"], clipId=clip["id"],
                  start=start, end=end, detectionStatus=clip.get("detectionStatus"),
                  observationMs=max(0, (end-start)*1000))
@@ -237,7 +287,12 @@ class AdaptiveSession:
         self.playing, self.rect = index, rect
         if clip["status"] == "ready" and playing:
             clip.update(status="playing", playStartedAt=clip.get("firstPresentedAt", wall - video_t / playback_rate))
+            if self.eeg_run_mode == CUMULATIVE_EEG_MODE:
+                self.eeg_history.start_clip(clip["id"],clip["playStartedAt"],clip["duration"])
+                clip["eegHistoryStarted"] = True
             self.log("play", clip=index, clipId=clip.get("id"), decisionId=clip.get("decisionId"))
+        if playing:
+            self.collect_viewing_eeg(clip,wall)
         if (playing and video_t >= self.analyze_at(clip) and not clip.get("analysisStarted")
                 and self.status == "running"):
             self.freeze_evidence(clip, wall)
@@ -247,7 +302,11 @@ class AdaptiveSession:
         if self.status in ("stopped", "failed"):
             return
         if 0 <= index < len(self.clips):
-            self.clips[index].setdefault("endedAt", time.time())
+            clip = self.clips[index]
+            now = time.time()
+            if clip.get("ticks") and clip["ticks"][-1]["playing"] and 0 <= now-clip["ticks"][-1]["wall"] <= .75:
+                self.collect_viewing_eeg(clip, min(now,clip.get("playStartedAt",now)+clip["duration"]))
+            self.clips[index].setdefault("endedAt", now)
             if not self.clips[index].get("finalLogStarted"):
                 self.clips[index]["finalLogStarted"] = True
                 self.engine.spawn(self.finalize_signals(index))
@@ -259,6 +318,7 @@ class AdaptiveSession:
             elif index == self.max_scenes - 1 and self.clips[index].get("analysis"):
                 self.status = "finished"
                 self.set_stage(f"finished: {self.max_scenes} scenes watched")
+                self.close_local_worker()
             self.cancel_detection(self.clips[index])
 
     async def finalize_signals(self, index):
@@ -281,10 +341,47 @@ class AdaptiveSession:
     async def start(self):
         decision = dict(id=str(uuid4()), observationWindow=None, focus=None, tension="same", dialogue="same", pacing="same", tone=None, event=False,
                         reasons=["Opening scene: no viewer data yet"])
+        self.task = self.engine.spawn(self.prepare_tracking_and_begin(decision))
+
+    async def prepare_tracking_and_begin(self, decision):
+        # Startup is the only warm-up wait. Later decisions and transitions
+        # reuse this process without awaiting tracking readiness or inference.
+        if self.tracking_readiness["state"] == "not_started":
+            from .local_tracker import prewarm_local_tracker
+            provider = "color" if self.tracker == "color" else "opencv"
+            def readiness(event):
+                state = {"warming":"warming","warm_ready":"ready","warm_failed":"failed"}.get(event.get("diagnostic_event"))
+                if state:
+                    self.tracking_readiness = dict(event,state=state)
+                    self.log("tracking_readiness",**deepcopy(self.tracking_readiness))
+            self.set_stage("preparing local tracking")
+            try:
+                self.local_worker = await prewarm_local_tracker(provider,on_diagnostic=readiness)
+            except asyncio.CancelledError:
+                self.tracking_readiness["state"] = "cancelled"
+                raise
+            except Exception as error:
+                self.tracking_readiness.update(state="failed",error=self.engine.error(error))
+                self.warn("Local tracking warm-up",error)
+        if self.status != "running":
+            self.close_local_worker()
+            return
         if self.opening_video:
-            self.task = self.engine.spawn(self.predefined_scene(decision))
+            await self.predefined_scene(decision)
         else:
-            self.task = self.engine.spawn(self.make_scene(decision, self.opening, seeds=None, changes=[]))
+            await self.make_scene(decision, self.opening, seeds=None, changes=[])
+
+    def close_local_worker(self):
+        # Cancellation/native retirement owns its slot until cleanup finishes.
+        # Request shutdown synchronously; never wait at playback boundaries.
+        worker = self.local_worker
+        if worker is None or self.local_worker_close_task is not None:
+            return
+        worker.request_close()
+        for task in list(self.detection_tasks):
+            task.cancel()
+        self.tracking_readiness["state"] = "closed"
+        self.local_worker_close_task = self.engine.spawn(worker.close())
 
     async def predefined_scene(self, decision):
         """Scene 1 is the uploaded episode segment; only the rest is generated."""
@@ -359,10 +456,12 @@ class AdaptiveSession:
                     local = await detect_yoloe(path,self.target_names,clip_id=clip_id,session_id=self.id,
                         generation_id=generation_id,on_progress=progress,config=config)
                 else:
+                    if self.tracking_readiness["state"] in ("warming","failed","cancelled","closed"):
+                        raise RuntimeError("Local tracking is unavailable for this run; no cold worker is started during playback.")
                     local = await detect_local(path,self.target_names,clip_id=clip_id,session_id=self.id,
                         generation_id=generation_id,on_progress=progress,
                         playback_state=lambda: self.tracking_playback(clip),
-                        provider="color" if self.tracker == "color" else "opencv")
+                        provider="color" if self.tracker == "color" else "opencv",warm_worker=self.local_worker)
             except Exception as error:
                 self.warn("YOLOE" if self.tracker == "yoloe" else "Color/shape" if self.tracker == "color" else "OpenCV",error)
                 clip["localTrackingError"] = self.engine.error(error)
@@ -423,6 +522,8 @@ class AdaptiveSession:
         clip["detectionLifecycle"] = "active"
         generation_id = clip.get("jobId") or clip.get("decisionId") or clip["id"]
         clip["trackingGenerationId"] = generation_id
+        diagnostic = tracking_diagnostics.for_clip(self,clip)
+        diagnostic.record("tracking_started",provider=self.tracker)
         async def work():
             started = time.perf_counter()
             def publish(result):
@@ -430,12 +531,20 @@ class AdaptiveSession:
                         or self.status != "running" or not any(c is clip for c in self.clips)
                         or clip.get("endedAt") is not None
                         or (self.playing is not None and clip["index"] < self.playing)):
+                    diagnostic.record("publication_rejected",reason="inactive_clip_or_generation",
+                        records=len(result))
                     return
+                rejected = sum(f.get("clip_id",clip["id"]) != clip["id"]
+                    or f.get("session_id",self.id) not in (None,self.id)
+                    or f.get("generation_id",generation_id) != generation_id for f in result)
+                if rejected:
+                    diagnostic.record("publication_rejected",reason="provenance_mismatch",records=rejected)
                 clip["track"] = deepcopy([dict(f, generation_id=generation_id) for f in result
                     if f.get("clip_id", clip["id"]) == clip["id"]
                     and f.get("session_id", self.id) in (None, self.id)
                     and f.get("generation_id",generation_id) == generation_id])
                 clip["detected"] = sum(bool(f["boxes"]) for f in clip["track"])
+                diagnostic.record("publication_accepted",**tracking_diagnostics.publication_evidence(clip["track"]))
                 timing = clip.setdefault("trackingTiming", {})
                 if clip["track"]:
                     timing.setdefault("firstRecordMs", round((time.perf_counter()-started)*1000,3))
@@ -485,6 +594,9 @@ class AdaptiveSession:
             confidence = frozen["quality"].get("confidence", 1.0 if self.eeg.source == "sim" else 0.0)
             analysis = fusion.analyze(timeline, eeg, track, self.names, clip.get("plan"), confidence,
                                       eeg_quality=frozen["quality"], eeg_window=(t0,t1))
+            if self.eeg_run_mode == CUMULATIVE_EEG_MODE:
+                analysis["eeg_policy"] = deepcopy(frozen["eegPolicy"])
+            analysis["eeg_run_mode"] = self.eeg_run_mode
             analysis["detection_status_at_deadline"] = frozen["detectionStatus"]
             analysis["gaze_audit"] = gaze_audit.summarize(samples, ticks, timeline)
             # Story objects have dwell but never stand in for another character
@@ -496,6 +608,10 @@ class AdaptiveSession:
             if self.eeg.source == "mindmonitor":
                 analysis.update(eeg_method="alpha-beta-relative-baseline", eeg_unit="index")
             clip.update(analysis=analysis, timeline=timeline)
+            tracking_diagnostics.for_clip(self,clip).record("frozen_gaze_analysis",
+                validGazeSeconds=analysis.get("valid_gaze_s"), confidence=analysis.get("gaze_confidence"),
+                comparisonSeconds=analysis.get("comparison_s"), characters=analysis.get("characters"),
+                gazeAudit=analysis.get("gaze_audit"))
             self.dump(f"scene{index + 1}_signals.json", dict(gaze=samples, eeg=eeg, ticks=ticks, track=track,
                                                               timeline=timeline, analysis=analysis))
             self.profile, changes = profiles.update(self.profile, analysis)
@@ -506,6 +622,7 @@ class AdaptiveSession:
                 self.set_stage(f"final scene: {self.max_scenes}-scene limit reached")
                 if clip["status"] == "watched":
                     self.status = "finished"
+                    self.close_local_worker()
                 return
             self.story["viewer_analysis"] = analysis
             # Keep a local decision ready if the remote controller fails.
@@ -518,6 +635,13 @@ class AdaptiveSession:
             extraction_started = time.perf_counter()
             image = None
             if not self.clip_bundles:
+                local = self.local_media_tasks.get(clip["id"])
+                if local:
+                    await asyncio.shield(local)
+                if not self.source_current(source):
+                    return
+                if not clip.get("path"):
+                    raise ValueError("The local video is unavailable for actual final-frame continuation.")
                 boundary = self.prepare_boundary(clip, clip["path"])
                 if boundary:
                     await asyncio.shield(boundary)
@@ -533,6 +657,39 @@ class AdaptiveSession:
 
         except Exception as error:
             self.fail(error)
+
+    async def prepare_local_media(self, clip, job, decision, duration, continuation_started):
+        """Independent local validation/tracking/boundary work for a streaming clip."""
+        clip["localMediaStatus"] = "downloading"
+        try:
+            path = await self.engine.media_path(job)
+            if self.status in ("stopped", "failed"):
+                return None
+            if self.engine.adapter.demo:
+                await self.demo_render(path, decision.get("focus"), duration)
+            clip.update(path=str(path),localMediaStatus="validated",mediaReadiness="fully_validated",fullyValidatedAt=time.time())
+            self.log("full_media_ready",clip=clip["index"],clipId=clip["id"],jobId=job["id"],
+                     playbackMode=self.playback_mode,fullyValidatedAt=clip["fullyValidatedAt"],
+                     timing={k:v for k,v in job.items() if k.endswith("Ms")})
+            if self.status == "running" and clip["status"] != "watched":
+                self.start_detection(clip, path, None, decision.get("focus"), duration)
+            boundary = self.prepare_boundary(clip, path)
+            if boundary:
+                await asyncio.shield(boundary)
+                if clip.get("boundaryFrameStatus") == "failed":
+                    raise ValueError("Could not prepare the actual final frame for continuation.")
+            if self.status != "running":
+                return None
+            clip["boundaryReadyAt"] = time.time() if clip.get("boundaryFrameStatus") == "ready" else None
+            self.engine.update(job,continuationReadyAt=time.time(),
+                               continuationReadyMs=round((time.perf_counter()-continuation_started)*1000,2))
+            return path
+        except asyncio.CancelledError:
+            clip["localMediaStatus"] = "cancelled"
+            raise
+        except Exception:
+            clip["localMediaStatus"] = "failed"
+            raise
 
     async def make_scene(self, decision, image, seeds, changes, *, frame_extraction_ms=0, continuation_started=None, source=None):
         if continuation_started is None:
@@ -590,7 +747,7 @@ class AdaptiveSession:
             else:
                 options = dict(mode="frames" if image else "text", prompt=plan["video_prompt"], duration=duration, resolution=self.resolution)
                 images = {"start": [image]} if image else {}
-            job = self.engine.new_job(options, decisionTrace=clip["decisionTrace"], adaptiveSession=self.id, sceneIndex=index,
+            job = self.engine.new_job(options, decisionTrace=clip["decisionTrace"], adaptiveSession=self.id, sceneIndex=index, playbackMode=self.playback_mode,
                                       clipId=bundle["id"] if bundle else None,
                                       sourceClipId=bundle["id"] if bundle else None,
                                       basePrompt=plan["base_prompt"], engagementDecision=decision, decisionId=decision["id"],
@@ -609,35 +766,56 @@ class AdaptiveSession:
                 return
             if job["status"] != "completed":
                 raise ValueError(job.get("error", "Generation did not complete."))
-            path = await self.engine.media_path(job)
-            if self.engine.adapter.demo:
-                await self.demo_render(path, decision.get("focus"), duration)
-            if not self.source_current(source):
-                return
             clip["track"] = []
-            self.start_detection(clip, path, None, decision.get("focus"), duration)
-            boundary = self.prepare_boundary(clip, path)
-            if boundary:
-                await asyncio.shield(boundary)
-                if clip.get("boundaryFrameStatus") == "failed":
-                    raise ValueError("Could not prepare the actual final frame for continuation.")
+            delivery = "download"
+            path = None
+            if self.playback_mode == "stream" and not self.engine.adapter.demo:
+                from ..progressive_media import probe_video
+                clip["localMediaStatus"] = "downloading"
+                local = self.engine.spawn(self.prepare_local_media(clip,job,decision,duration,continuation_started))
+                self.local_media_tasks[clip["id"]] = local
+                def local_finished(task):
+                    if task.cancelled(): return
+                    error = task.exception()
+                    if error and self.status == "running":
+                        self.warn("Local media", error)
+                        self.fail(error)
+                local.add_done_callback(local_finished)
+                probe_started = time.perf_counter()
+                try:
+                    clip["streamMetadata"] = await probe_video(job["video"]["url"])
+                    delivery = "stream"
+                    clip["streamReadyAt"] = time.time()
+                    self.engine.update(job,streamReadyAt=clip["streamReadyAt"],
+                                       streamProbeMs=round((time.perf_counter()-probe_started)*1000,3))
+                except Exception as error:
+                    clip["streamFallbackReason"] = self.engine.error(error)
+                    self.log("stream_unavailable",clip=index,clipId=clip["id"],reason=clip["streamFallbackReason"])
+                    path = await asyncio.shield(local)
+            else:
+                path = await self.prepare_local_media(clip,job,decision,duration,continuation_started)
             if not self.source_current(source):
                 return
             continuation_ms = round((time.perf_counter()-continuation_started)*1000, 2)
-            timing = dict(continuationReadyMs=continuation_ms)
+            timing = dict(playbackReadyMs=continuation_ms,**({"continuationReadyMs":continuation_ms} if delivery == "download" else {}))
             if window:
                 timing["observationToReadyMs"] = max(0, (time.time()-window["start"])*1000)
                 if job.get("apiStartedAt") is not None:
                     timing["observationToSubmitMs"] = max(0, job["apiStartedAt"]-window["start"]*1000)
-            self.engine.update(job, continuationReadyAt=time.time(), **timing)
-            clip.update(path=str(path), url=f"/api/jobs/{job['id']}/video", status="ready",
-                        continuationReadyMs=continuation_ms, generatedS=round(continuation_ms/1000, 3), readyAt=time.time(),
+            self.engine.update(job, playbackReadyAt=time.time(), playbackDelivery=delivery, **(
+                {"continuationReadyAt":time.time()} if delivery == "download" else {}), **timing)
+            clip.update(url=f"/api/adaptive/clips/{self.id}/{index}/stream" if delivery == "stream" else f"/api/jobs/{job['id']}/video",
+                        fallbackUrl=f"/api/adaptive/clips/{self.id}/{index}/validated" if delivery == "stream" else None,
+                        playbackDelivery=delivery,mediaReadiness="progressive_available" if delivery == "stream" and clip.get("localMediaStatus") != "validated" else "fully_validated",
+                        detectionStatus=clip.get("detectionStatus","awaiting_local_media"),status="ready",
+                        playbackReadyMs=continuation_ms, continuationReadyMs=job.get("continuationReadyMs"), generatedS=round(continuation_ms/1000, 3), readyAt=time.time(),
                         generationInput=job.get("generationInput"),
                         timing={k:v for k,v in job.items() if k.endswith("Ms") or k in ("providerMetrics", "timings")},
                         detected=sum(1 for f in clip["track"] if f["boxes"]))
             self.readiness_samples.append(continuation_ms/1000)
-            self.log("media_ready", clip=index, clipId=clip["id"], decisionId=clip["decisionId"],
-                     readinessS=continuation_ms/1000, readinessScope="decision-boundary wait + composition + validated media + next actual-end-frame preparation",
+            self.log("stream_ready" if delivery == "stream" else "media_ready", clip=index, clipId=clip["id"], decisionId=clip["decisionId"],
+                     playbackMode=self.playback_mode,delivery=delivery,
+                     readinessS=continuation_ms/1000, readinessScope="completed provider MP4 + early metadata/range gate; local validation pending" if delivery == "stream" else "decision-boundary wait + composition + validated media + next actual-end-frame preparation",
                      timing=clip["timing"])
             self.story["scenes"].append(dict(title=plan["scene_title"], summary=plan["summary"]))
             self.dump("story.json", self.story)
@@ -691,14 +869,18 @@ class AdaptiveSession:
         self.error = self.engine.error(error)
         self.status = "failed"
         self.set_stage("stopped")
+        self.close_local_worker()
 
     def stop(self):
         if self.status == "running":
             self.status = "stopped"
             self.set_stage("stopped by viewer")
+            self.close_local_worker()
             if self.task and not self.task.done():
                 self.task.cancel()
-            for task in list(self.detection_tasks) + list(self.frame_tasks.values()):
+            for clip in self.clips:
+                if clip.get("localMediaStatus") == "downloading": clip["localMediaStatus"] = "cancelled"
+            for task in list(self.detection_tasks) + list(self.frame_tasks.values()) + list(self.local_media_tasks.values()):
                 task.cancel()
             for clip in self.clips:
                 job = self.engine.jobs.get(clip.get("jobId"))

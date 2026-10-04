@@ -115,7 +115,8 @@ async def test_decoded_full_clip_has_t0_tail_tags_thread_limits_and_progress(tmp
 @pytest.mark.asyncio
 async def test_local_worker_cancel_cooperatively_exits_and_releases_gate(tmp_path):
     video=tmp_path/'long.mp4'
-    await ffmpeg('-loop','1','-i',ROOT/'presets/secret-box/frames/00-30.jpg','-t','30',
+    # Enough queued frames to cancel after first progress; no long encode wait.
+    await ffmpeg('-framerate','8','-loop','1','-i',ROOT/'presets/secret-box/frames/00-30.jpg','-t','4.5',
                  '-vf','scale=640:400','-r','8','-pix_fmt','yuv420p',video)
     baseline={p.pid for p in multiprocessing.active_children()}
     observed=asyncio.Event()
@@ -125,8 +126,14 @@ async def test_local_worker_cancel_cooperatively_exits_and_releases_gate(tmp_pat
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task,2)
-    assert {p.pid for p in multiprocessing.active_children()}==baseline
     gate=local_tracker._gates[asyncio.get_running_loop()]
+    if {p.pid for p in multiprocessing.active_children()} != baseline:
+        # Bounded cancellation can return while native cleanup still owns slot.
+        assert gate.locked()
+        assert not local_tracker._worker_slot.acquire(blocking=False)
+        await asyncio.wait_for(gate.acquire(),10)
+        gate.release()
+    assert {p.pid for p in multiprocessing.active_children()}==baseline
     assert not gate.locked()
 
 

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { filteredTraces, renderTraces } from '../frontend/decision-trace.js';
+import { filteredTraces, renderTraces, withTrackingDiagnostics } from '../frontend/decision-trace.js';
 
 class Element {
   constructor(tag) { this.tag = tag; this.children = []; this.textContent = ''; }
@@ -26,4 +26,15 @@ test('session filter separates reloaded runs and allows all-runs export', () => 
   assert.deepEqual(filteredTraces(records, 'old'), [records[0]]);
   assert.deepEqual(filteredTraces(records, ''), records);
   assert.deepEqual(filteredTraces(records, 'missing'), []);
+});
+
+
+test('saved detector history attaches only to the decision clip and its source in the same session', () => {
+  const decisions=[{sessionId:'new',clipId:'next',references:{sourceClipId:'source'}}];
+  const events=[{sessionId:'new',clipId:'source'}, {sessionId:'new',clipId:'next'},
+    {sessionId:'old',clipId:'source'}, {sessionId:'new',clipId:'unrelated'}];
+  const result=withTrackingDiagnostics(decisions,events);
+  assert.deepEqual(result[0].trackingDiagnostics.records,events.slice(0,2));
+  assert.match(result[0].trackingDiagnostics.note,/after the decision freeze/);
+  assert.equal(decisions[0].trackingDiagnostics,undefined);
 });

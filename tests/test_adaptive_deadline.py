@@ -23,10 +23,10 @@ def clock(monkeypatch):
     return clock
 
 
-def setup(tmp_path, monkeypatch, clock, *, final=False):
+def setup(tmp_path, monkeypatch, clock, *, final=False, eeg_run_mode="cumulative_prior_clips", eeg_gaze_only=False):
     engine = Engine(FakeAdapter(), tmp_path, poll_seconds=.001)
     s = AdaptiveSession(engine, GazeFeed(), EegFeed(), tmp_path, 'Two explorers find a box.',
-                        [dict(name='Ana'), dict(name='Bea')], 15, '480P', verify_image(png()))
+                        [dict(name='Ana'), dict(name='Bea')], 15, '480P', verify_image(png()),eeg_run_mode=eeg_run_mode,eeg_gaze_only=eeg_gaze_only)
     s.max_scenes = 1 if final else 2
     clip = dict(id='source', sessionId=s.id, index=0, status='ready', duration=15,
                 ticks=[], track=[], detectionStatus='processing', path='source.mp4', plan=dict(beats=[]))

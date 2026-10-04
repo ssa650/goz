@@ -83,7 +83,7 @@ def create(session, clip, source=None):
              events="events.jsonl", analysis=f"scene{source[0]+1}_signals.json#analysis" if source else None,
              storedClipId=safe_id((clip.get("bundle") or {}).get("id")), firstFrame=None, endFrame=None, settings=None),
         timing=dict(frozenAt=frozen.get("frozenAt"), submitAttemptAt=None, submittedAt=None, readyAt=None,
-                    freezeToSubmitMs=None, freezeToReadyMs=None,
+                    freezeToAttemptMs=None, freezeToSubmitMs=None, freezeToReadyMs=None,
                     freezeWorkMs=frozen.get("freezeWorkMs"), trackingAtFreeze=frozen.get("trackingTiming"))), (secret,))
 
 
@@ -97,7 +97,8 @@ def attempted(job, payload, at, key=None):
                  providerModelId=job.get("model"), changed=prompt != job.get("basePrompt") if prompt is not None else None)
     trace["timing"]["submitAttemptAt"] = at / 1000
     frozen = trace["timing"]["frozenAt"]
-    trace["timing"]["freezeToSubmitMs"] = max(0, at-frozen*1000) if frozen is not None else None
+    trace["timing"]["freezeToAttemptMs"] = max(0, at-frozen*1000) if frozen is not None else None
+    trace["timing"]["freezeToSubmitMs"] = None
 
 
 def safe_id(value):
@@ -112,6 +113,9 @@ def refresh(job, key=None):
     if job.get("requestId"):
         trace["submission"] = "confirmed"
         trace["timing"]["submittedAt"] = job["submittedAt"]/1000 if job.get("submittedAt") is not None else None
+        frozen = trace["timing"].get("frozenAt")
+        submitted = trace["timing"]["submittedAt"]
+        trace["timing"]["freezeToSubmitMs"] = max(0, (submitted-frozen)*1000) if submitted is not None and frozen is not None else None
     elif trace["submission"] == "attempted_unconfirmed" and job.get("status") == "failed":
         trace["submission"] = "failed_unconfirmed" if job.get("requestUncertain") else "rejected"
     trace["references"].update(firstFrame=safe_id(job.get("firstFrame")), endFrame=safe_id(job.get("endFrame")),
@@ -119,6 +123,10 @@ def refresh(job, key=None):
     if job.get("expandedPrompt") is not None or job.get("video"):
         trace["returnedOutput"] = dict(expandedPrompt=clean(job["expandedPrompt"], (key,)) if isinstance(job.get("expandedPrompt"), str) else None,
             videoReference=f"/api/jobs/{job['id']}/video" if job.get("video") else None)
+    trace["timing"].update(playbackMode=job.get("playbackMode","download"),
+        streamReadyAt=job.get("streamReadyAt"), playbackReadyAt=job.get("playbackReadyAt"),
+        fullyValidatedAt=job["mediaReadyAt"]/1000 if job.get("mediaReadyAt") is not None else None,
+        firstPresentedAt=job.get("firstPresentedAt"),firstPresentationDelivery=job.get("firstPresentationDelivery"))
     if job.get("continuationReadyAt") is not None:
         ready = job["continuationReadyAt"]
         trace["timing"]["readyAt"] = ready
@@ -126,8 +134,20 @@ def refresh(job, key=None):
         trace["timing"]["freezeToReadyMs"] = max(0, (ready-frozen)*1000) if frozen is not None else None
 
 
+def submission_timing(trace):
+    """Derive attempt/confirmed timings from timestamps, including old rows."""
+    timing = trace.get("timing")
+    if not isinstance(timing, dict):
+        return trace
+    frozen = timing.get("frozenAt")
+    for timestamp, field in (("submitAttemptAt", "freezeToAttemptMs"), ("submittedAt", "freezeToSubmitMs")):
+        at = timing.get(timestamp)
+        timing[field] = round(max(0, (at-frozen)*1000), 3) if type(at) in (int, float) and type(frozen) in (int, float) else None
+    return trace
+
+
 def prepared(trace):
-    trace = clean(deepcopy(trace))
+    trace = submission_timing(clean(deepcopy(trace)))
     trace["recordedAt"] = time.time()
     prompt = trace.get("submittedPrompt")
     if prompt is not None:
@@ -197,7 +217,7 @@ class Journal:
                         row = json.loads(line)
                         key = (row["sessionId"], row["clipId"], row["id"])
                         if session_id is None or row["sessionId"] == session_id:
-                            latest[key] = row
+                            latest[key] = submission_timing(row)
                     except (ValueError, KeyError, TypeError):
                         continue
         return list(latest.values())

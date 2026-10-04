@@ -1,5 +1,6 @@
 """Own sensor child processes and gate new generations on calibrated live data."""
 import asyncio
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ from uuid import uuid4
 import shlex
 
 from .fal_adapter import FalError
+from .adaptive.eeg_calibration import calibration_status
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -79,6 +81,10 @@ class SensorSetup:
     def snapshot(self):
         eeg, gaze = self.sensors.eeg, self.sensors.gaze
         muse = eeg.status()
+        quality = deepcopy(muse)
+        quality["calibration"] = deepcopy(getattr(eeg,"calibration",None) or {})
+        guided = calibration_status(quality)
+        gaze_only = bool(getattr(self.sensors,"eeg_gaze_only",False))
         gaze_live = gaze.status()["live"] and any(s.get("valid") and s.get("face", True)
                         for s in gaze.window(time.time() - 2, time.time()))
         latest = eeg.latest()
@@ -88,15 +94,18 @@ class SensorSetup:
         stream = self.children.get("gaze")
         gaze_alive = stream is not None and stream.returncode is None
         ready = not self.required or (self.phase == "ready" and self.gaze_calibrated and gaze_live and gaze_alive
-                                     and muse_live and muse["calibrated"])
-        message = self.message
+                                     and (gaze_only or muse_live and muse["calibrated"]
+                                          and (muse.get("source") != "muse" or guided["ready"])))
+        message = "Gaze-only selected; EEG pacing is disabled for new runs." if gaze_only else self.message
         if self.required and self.phase == "ready" and not ready:
-            message = ("Muse EEG: " + muse["qualityError"] if muse["qualityError"]
+            message = ("Gaze signal lost. Face the camera; retry gaze setup if needed." if gaze_only
+                       else "Muse EEG: " + muse["qualityError"] if muse["qualityError"]
                        else f"Muse baseline incomplete: {muse['cleanSeconds']}/{muse['targetSeconds']} clean seconds." if not muse["calibrated"]
                        else "Muse samples stopped. Retry sensor setup to collect a fresh baseline." if not muse_live
                        else "Gaze signal lost. Face the camera; retry setup if the camera stopped.")
         return dict(required=self.required, enabled=self.enabled, eegMode=self.sensors.eeg_mode, generationReady=bool(ready), phase=self.phase,
                     message=message, error=self.error, canRetry=self.enabled and (self.phase == "failed" or self.phase == "ready" and (not gaze_live or self.required and not ready)),
+                    gazeOnly=gaze_only, eegCalibration=dict(guided,gazeOnly=gaze_only),
                     museConnection=dict(state=self.manual_muse_state, error=self.manual_muse_error),
                     camera=dict(source=self.selected_camera),
                     muse=muse, gaze=dict(**gaze.status(), calibrated=self.gaze_calibrated,

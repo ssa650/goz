@@ -128,7 +128,12 @@ async def test_sequence_exposes_completed_clips_while_later_clips_are_generating
 
 @pytest.mark.asyncio
 async def test_reorder_delete_duplicate_and_reload_preserve_whole_objects(tmp_path,fake_stitch):
-    async with harness(tmp_path,WireAdapter()) as (e,a,c):
+    completion_gate=asyncio.Event()
+    class PendingWireAdapter(WireAdapter):
+        async def status(self,model,request_id):
+            await completion_gate.wait()
+            return await super().status(model,request_id)
+    async with harness(tmp_path,PendingWireAdapter()) as (e,a,c):
         clips=await make_clips(c,'both')
         ids=[clip['id'] for clip in clips]
         reordered=[ids[0],ids[2],ids[1],ids[3]]
@@ -160,9 +165,14 @@ async def test_reorder_delete_duplicate_and_reload_preserve_whole_objects(tmp_pa
         response=await c.post('/api/sequences',json=dict(id=str(uuid4()),clips=list(reversed(ordered))))
         assert response.status_code==202,response.text
         run=e.sequences[response.json()['id']]
-        assert (await c.post('/api/clips/order',json={'clipIds':list(reversed([x['id'] for x in latest]))})).status_code==409
-        assert (await c.patch(f"/api/clips/{ids[0]}",json={'prompt':'Do not mutate the snapshot'})).status_code==409
-        assert (await c.post('/api/clips',json={'prompt':'extra'})).status_code==409
+        # Keep the provider pending until all runtime mutation guards are checked.
+        # HTTP scheduling must not let the short mock run finish between requests.
+        try:
+            assert (await c.post('/api/clips/order',json={'clipIds':list(reversed([x['id'] for x in latest]))})).status_code==409
+            assert (await c.patch(f"/api/clips/{ids[0]}",json={'prompt':'Do not mutate the snapshot'})).status_code==409
+            assert (await c.post('/api/clips',json={'prompt':'extra'})).status_code==409
+        finally:
+            completion_gate.set()
         await until(lambda:run['status']=='completed')
         assert [x['clipId'] for x in fake_stitch[0]]==[x['id'] for x in ordered]
     restored=Engine(FakeAdapter(),tmp_path)

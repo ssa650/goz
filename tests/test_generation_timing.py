@@ -93,3 +93,49 @@ async def test_html_returned_as_video_is_rejected_before_ready(tmp_path, monkeyp
     assert 'mediaReadyAt' not in job and not (engine.media/f"{job['id']}.mp4").exists()
     assert not list(engine.media.glob('*.part'))
     await engine.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('frame', [None, b'partial'])
+async def test_container_header_without_a_complete_decoded_frame_never_becomes_ready(tmp_path, monkeypatch, frame):
+    import backend.engine as engine_module
+    import backend.frames as frames
+    def reader(*args, **kwargs):
+        assert '-frames:v' in kwargs['output_params']
+        assert '-threads' in kwargs['input_params']
+        yield dict(size=(64,64),duration=15)
+        if frame is not None:
+            yield frame
+    async def download(url, path):
+        path.write_bytes(b'container-with-truncated-frame')
+    monkeypatch.setattr(frames.imageio_ffmpeg, 'read_frames', reader)
+    monkeypatch.setattr(engine_module, 'download_video', download)
+    engine=Engine(FakeAdapter(),tmp_path,poll_seconds=.001)
+    job=engine.new_job(dict(mode='text',prompt='test',duration=15,resolution='480P'))
+    await engine.run_job(job,{})
+    with pytest.raises(ValueError,match='video frame'):
+        await engine.media_path(job)
+    assert job['mediaStatus']=='failed'
+    assert job['mediaFailedAt']>=job['mediaDownloadStartedAt']
+    assert 'mediaReadyAt' not in job and 'actualDuration' not in job
+    assert not (engine.media/f"{job['id']}.mp4").exists()
+    assert not list(engine.media.glob('*.part'))
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_download_records_phase_and_removes_partial_without_resubmission(tmp_path, monkeypatch):
+    import backend.engine as engine_module
+    entered=asyncio.Event()
+    async def download(url,path):
+        path.write_bytes(b'partial'); entered.set(); await asyncio.Event().wait()
+    monkeypatch.setattr(engine_module,'download_video',download)
+    engine=Engine(FakeAdapter(),tmp_path,poll_seconds=.001)
+    job=engine.new_job(dict(mode='text',prompt='test',duration=15,resolution='480P'))
+    await engine.run_job(job,{})
+    task=asyncio.create_task(engine.media_path(job)); await entered.wait(); task.cancel()
+    with pytest.raises(asyncio.CancelledError): await task
+    assert job['mediaStatus']=='cancelled' and 'mediaReadyAt' not in job
+    assert not list(engine.media.glob('*.part'))
+    assert len(engine.adapter.submissions)==1
+    await engine.close()

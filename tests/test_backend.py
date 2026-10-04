@@ -316,7 +316,19 @@ async def test_cancel_during_extraction_stops_next_submission(tmp_path):
 @pytest.mark.asyncio
 async def test_prompt_file_splitting_and_video_byte_ranges(tmp_path):
     from backend.demo import DemoAdapter
-    adapter=DemoAdapter(tmp_path/'demo')
+    # This is a prompt/HTTP Range contract test, not a render-latency test.
+    # Generate one real MP4 before polling, then complete the fake provider
+    # instantly. Real DemoAdapter/FFmpeg end-to-end tests remain separate.
+    source = tmp_path/'range-contract.mp4'
+    await ffmpeg('-f','lavfi','-i','color=green:s=64x64:r=8','-t','0.5',
+                 '-c:v','libx264','-threads','2','-pix_fmt','yuv420p','-movflags','+faststart',source)
+    class ContractAdapter(DemoAdapter):
+        async def status(self, model, request_id):
+            return {'status':'COMPLETED'}
+        async def result(self, model, request_id):
+            (self.directory/f'{request_id}.mp4').write_bytes(source.read_bytes())
+            return {'video':{'url':'demo:'+request_id}}
+    adapter=ContractAdapter(tmp_path/'demo')
     async with harness(tmp_path,adapter) as (e,a,c):
         data,files=sequence_body()
         del data['prompts']

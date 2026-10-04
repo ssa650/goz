@@ -150,7 +150,7 @@ def decide(profile, analysis):
     decision["evidence"] = dict(e, eeg=eeg)
     if eeg["applied"]:
         decision["reasons"].append(eeg["reason"])
-        decision["policy"] = "local-gaze-v3+experimental-eeg-delivery-v1"
+        decision["policy"] = "local-gaze-v3+" + eeg["policy"]
     if not decision["reasons"]:
         decision["reasons"].append("Insufficient comparative gaze evidence; continue the story evenly")
     return decision

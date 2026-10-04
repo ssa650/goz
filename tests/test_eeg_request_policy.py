@@ -149,7 +149,7 @@ async def test_frozen_eeg_reaches_exact_mocked_request_at_playback_deadline(tmp_
     """Full existing acquisition->freeze->fusion->policy->provider request path."""
     payloads = []
     for z in (1.5, -1.5):
-        s, clip, engine, _ = setup(tmp_path/str(z), monkeypatch, clock)
+        s, clip, engine, _ = setup(tmp_path/str(z), monkeypatch, clock,eeg_run_mode="baseline")
         s.names=NAMES; s.target_names=NAMES; s.profile=profile.new_profile(NAMES)
         s.story.update(premise=BASE, characters=[dict(name=n) for n in NAMES])
         boxes={"SpongeBob":[.05,.15,.4,.9], "Patrick":[.6,.15,.95,.9]}

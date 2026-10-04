@@ -388,6 +388,7 @@ class Engine:
                 return path
             temporary = path.with_suffix(".part")
             download_started = time.perf_counter()
+            self.update(job, mediaStatus='downloading', mediaDownloadStartedAt=now())
             try:
                 if self.adapter.demo:
                     request_id = job["video"]["url"].removeprefix("demo:")
@@ -398,17 +399,20 @@ class Engine:
                     await download_video(job["video"]["url"], temporary)
                 download_ms = round((time.perf_counter()-download_started)*1000, 3)
                 check_started = time.perf_counter()
+                self.update(job, mediaStatus='validating', mediaDownloadMs=download_ms, mediaDownloadedAt=now())
                 metadata = await asyncio.to_thread(media_metadata, temporary)
                 if not metadata.get("size") or not metadata.get("duration", 0):
                     raise ValueError("Downloaded provider result has no playable video stream.")
                 os.replace(temporary, path)
-                self.update(job, mediaDownloadMs=download_ms,
+                self.update(job, mediaStatus='ready', mediaDownloadMs=download_ms,
                             mediaValidationMs=round((time.perf_counter()-check_started)*1000, 3),
                             mediaReadyAt=now(), mediaReadyElapsedMs=now()-job["startedAt"],
                             actualDuration=metadata["duration"],
                             hasAudio=bool(metadata.get("audio_codec")))
-            except BaseException:
+            except BaseException as error:
                 temporary.unlink(missing_ok=True)
+                self.update(job, mediaStatus='cancelled' if isinstance(error, asyncio.CancelledError) else 'failed',
+                            mediaError=self.error(error), mediaFailedAt=now())
                 raise
         return path
 

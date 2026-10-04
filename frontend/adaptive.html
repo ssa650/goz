@@ -17,6 +17,14 @@
         <p id="muse-connection-status" role="status" aria-live="polite"></p>
         <button id="muse-connect" class="secondary" type="button">Connect Muse 2</button>
         <button id="muse-disconnect" class="secondary" type="button" hidden>Disconnect Muse 2</button>
+        <section aria-label="Guided EEG calibration">
+          <p id="eeg-calibration-instructions">Keep your eyes open in the same screen and viewing setup. Relax your jaw and breathe naturally. Clean signal time counts toward 60 seconds; invalid signal pauses progress.</p>
+          <progress id="eeg-calibration-progress" max="60" value="0" aria-label="Unique clean EEG seconds"></progress>
+          <p id="eeg-calibration-status" role="status" aria-live="polite"></p>
+          <button id="eeg-calibration-start" class="secondary" type="button">Start 60-second EEG calibration</button>
+          <button id="eeg-gaze-only" class="secondary" type="button">Continue with gaze only</button>
+          <p class="hint">Recalibrate for a different wearer, seating, display or contact setup. Wearer changes are not detected automatically. The same stable setup can reuse a still-valid baseline across generation runs. EEG measures physiological variation; this experimental policy does not identify liking, focus or emotion.</p>
+        </section>
         <p id="gaze-calibration-status"></p><details><summary>Calibration diagnostics</summary><pre id="calibration-details"></pre></details>
         <button id="gaze-check" class="secondary" type="button" hidden>Check gaze</button><button id="gaze-recenter" class="secondary" type="button" hidden>Recenter &amp; check</button>
         <button id="gaze-calibration-remove" class="secondary" type="button" hidden>Remove eye calibration</button>
@@ -46,6 +54,13 @@
         <div class="panel-heading"><h2>Opening scene</h2><span class="eyebrow">SETUP</span></div>
         <label class="check"><input id="use-sequence" type="checkbox" checked> Use the saved ordered prompts and frame pairs</label>
         <p class="hint">Each next prompt keeps its seed, initial frame, end frame and settings. Observed comparative attention can change the main shot between the fixed boundary frames. An optional opening video plays in place of Clip 1.</p>
+        <label>EEG comparison <select id="eeg-run-mode">
+          <option value="cumulative_prior_clips" selected>Experimental sustained EEG comparison (12 seconds)</option>
+          <option value="baseline">Calibrated baseline comparison</option>
+        </select></label>
+        <p class="hint">Gaze decisions remain fast. EEG requires a sustained clean window and a separate prior viewing reference, so early clips may receive no EEG cue. Generation continues without waiting for EEG.</p>
+        <label class="check"><input id="stream-playback" type="checkbox"> Stream completed videos while downloading</label>
+        <p class="hint">Starts after Fal finishes. A local copy downloads for tracking and continuation. If streaming is unavailable, playback uses the validated download. Uncheck to download fully before playback.</p>
         <label>Optional opening episode clip or frame <input id="opening" type="file" accept="video/mp4,video/quicktime,video/webm,image/png,image/jpeg,image/webp"></label>
         <label>Story premise <textarea id="premise" rows="3" required placeholder="A normal day at the Krusty Krab turns chaotic when…"></textarea></label>
         <label>Opening clip timeline <span class="hint">(optional · one line per moment · "Name: line" marks who speaks · #humor #action #suspense)</span>

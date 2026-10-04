@@ -145,7 +145,8 @@ def test_frozen_session_evidence_and_timing_reference_measured_inputs():
     job = dict(decisionTrace=row, basePrompt=plan['base_prompt'], model='model', continuationReadyAt=104)
     trace.attempted(job, {'prompt':plan['video_prompt']}, 102000)
     trace.refresh(job)
-    assert row['timing']['freezeToSubmitMs'] == 2000
+    assert row['timing']['freezeToAttemptMs'] == 2000
+    assert row['timing']['freezeToSubmitMs'] is None
     assert row['timing']['freezeToReadyMs'] == 4000
 
 
@@ -161,3 +162,29 @@ async def test_runtime_provider_key_redacted_in_actual_payload_trace(tmp_path):
     await engine.trace_journal.flush()
     assert adapter.key not in engine.trace_journal.path.read_text()
     await engine.close()
+
+
+def test_attempt_and_confirmed_submission_are_distinct_and_old_journal_rows_are_corrected(tmp_path):
+    row, plan = record()
+    row['timing']['frozenAt'] = 100
+    job = dict(decisionTrace=row, basePrompt=plan['base_prompt'], model='model')
+    trace.attempted(job, dict(prompt=plan['video_prompt']), 101000)
+    assert row['timing']['freezeToAttemptMs'] == 1000
+    assert row['timing']['freezeToSubmitMs'] is None
+    job.update(requestId='confirmed', submittedAt=105000)
+    trace.refresh(job)
+    assert row['timing']['freezeToSubmitMs'] == 5000
+    assert row['timing']['freezeToAttemptMs'] == 1000
+    # Existing v1 records mislabeled the attempt duration as submit time.
+    old = json.loads(json.dumps(row))
+    old['timing'].pop('freezeToAttemptMs')
+    old['timing']['freezeToSubmitMs'] = 1000
+    journal = trace.Journal(tmp_path)
+    journal.path.parent.mkdir(parents=True)
+    journal.path.write_text(json.dumps(old)+'\n')
+    corrected = journal.read()[0]
+    assert corrected['timing']['freezeToAttemptMs'] == 1000
+    assert corrected['timing']['freezeToSubmitMs'] == 5000
+    assert json.loads(journal.path.read_text()) == old, 'Historical journal bytes stay intact'
+    old['timing']['submittedAt'] = None
+    assert trace.prepared(old)['timing']['freezeToSubmitMs'] is None

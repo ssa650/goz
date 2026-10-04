@@ -15,6 +15,7 @@ import math
 import statistics
 
 VERSION = "experimental-eeg-delivery-v1"
+CUMULATIVE_VERSION = "experimental-eeg-cumulative-prior-clips-v2"
 MIN_CONFIDENCE = .6
 MIN_SPAN_S = 1.0
 MAX_GAP_S = .5
@@ -30,9 +31,32 @@ def finite(value):
 
 
 def unavailable(reason, source=None):
-    return dict(policy=VERSION, experimental=True, eligible=False, state="unknown",
+    return dict(policy=VERSION, run_mode="baseline", experimental=True, eligible=False, state="unknown",
                 action="keep", reason=reason, source=source, median_z=None,
                 valid_span_s=0.0, samples=0)
+
+
+def quality_failure(quality):
+    """Shared live/calibration/raw-quality gates, without feature inference."""
+    q = quality if isinstance(quality, dict) else {}
+    source = q.get("source")
+    if source not in ("muse", "mindmonitor", "sim"):
+        return "Validated EEG source metadata unavailable"
+    if (q.get("live") is not True or q.get("calibrated") is not True or q.get("qualityError")
+            or not finite(q.get("confidence")) or q["confidence"] < MIN_CONFIDENCE
+            or q.get("connectionState") not in ("streaming", "simulated")):
+        return "EEG quality, calibration or live-sample gate failed"
+    if source in ("muse", "sim") and (not finite(q.get("sampleAgeSeconds"))
+            or not -.5 <= q["sampleAgeSeconds"] < 3):
+        return "EEG raw samples stale or timestamp unavailable"
+    if source == "mindmonitor":
+        # Contacts alone cannot rule out clipped/raw movement artifacts.
+        if q.get("artifactCoverage") != "raw clipping/movement and contacts":
+            return "Mind Monitor raw artifact checks unavailable"
+        if any(not finite(q.get(k)) or not 0 <= q[k] < 3
+               for k in ("contactAgeSeconds", "alphaAgeSeconds", "betaAgeSeconds")):
+            return "Mind Monitor contact or band samples stale"
+    return None
 
 
 def observe(samples, quality=None, window=None):
@@ -45,22 +69,9 @@ def observe(samples, quality=None, window=None):
     q = quality if isinstance(quality, dict) else {}
     source = q.get("source")
     fail = lambda reason: unavailable(reason, source)
-    if source not in ("muse", "mindmonitor", "sim"):
-        return fail("Validated EEG source metadata unavailable")
-    if (q.get("live") is not True or q.get("calibrated") is not True or q.get("qualityError")
-            or not finite(q.get("confidence")) or q["confidence"] < MIN_CONFIDENCE
-            or q.get("connectionState") not in ("streaming", "simulated")):
-        return fail("EEG quality, calibration or live-sample gate failed")
-    if source in ("muse", "sim") and (not finite(q.get("sampleAgeSeconds"))
-            or not -.5 <= q["sampleAgeSeconds"] < 3):
-        return fail("EEG raw samples stale or timestamp unavailable")
-    if source == "mindmonitor":
-        # Contacts alone cannot rule out clipped/raw movement artifacts.
-        if q.get("artifactCoverage") != "raw clipping/movement and contacts":
-            return fail("Mind Monitor raw artifact checks unavailable")
-        if any(not finite(q.get(k)) or not 0 <= q[k] < 3
-               for k in ("contactAgeSeconds", "alphaAgeSeconds", "betaAgeSeconds")):
-            return fail("Mind Monitor contact or band samples stale")
+    failure = quality_failure(q)
+    if failure:
+        return fail(failure)
     if (not isinstance(window, (tuple, list)) or len(window) != 2
             or not all(finite(t) for t in window) or window[1] <= window[0]):
         return fail("Frozen EEG observation window unavailable")
@@ -101,7 +112,7 @@ def observe(samples, quality=None, window=None):
                  for name, sign, threshold in (("above_enter", 1, ENTER_Z),
                      ("below_enter", -1, ENTER_Z), ("above_retain", 1, RETAIN_Z),
                      ("below_retain", -1, RETAIN_Z))}
-    return dict(policy=VERSION, experimental=True, eligible=True, source=source,
+    return dict(policy=VERSION, run_mode="baseline", experimental=True, eligible=True, source=source,
                 feature=("beta/(alpha+theta) robust z" if source in ("muse", "sim")
                          else "smoothed beta/alpha baseline index"),
                 median_z=round(statistics.median(values), 4), fractions=fractions,
@@ -114,6 +125,8 @@ def decide(observation, previous=None):
     if not isinstance(observation, dict) or not observation.get("eligible"):
         return dict(observation) if isinstance(observation, dict) else unavailable("EEG evidence unavailable")
     result = dict(observation)
+    if result.get("policy") == CUMULATIVE_VERSION:
+        return result  # Cumulative comparison is already frozen and has no hysteresis.
     state, action = "near_baseline", "keep"
     fractions = result["fractions"]
     for label, action_name, prefix in (("above_baseline", "faster_pacing", "above"),
@@ -132,7 +145,7 @@ def decide(observation, previous=None):
 
 def delivery_cue(policy, pacing="same"):
     """At most one EEG cue; current gaze readability pacing has precedence."""
-    if (not isinstance(policy, dict) or policy.get("policy") != VERSION
+    if (not isinstance(policy, dict) or policy.get("policy") not in (VERSION, CUMULATIVE_VERSION)
             or not policy.get("eligible") or policy.get("suppressed_by")
             or pacing in ("faster", "slower")):
         return ""

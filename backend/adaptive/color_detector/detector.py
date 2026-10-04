@@ -162,18 +162,25 @@ class ColorCharacterDetector:
                 accepted.sort(key=lambda r:(r['verification']['area_fraction'],r['verification']['score']+.025*r['verification']['continuity_iou']),reverse=True)
                 if len(accepted) > 1:
                     best = accepted[0]
-                    ambiguous = any(not self._same_location(best['box'],r['box']) and abs(best['verification']['score']-r['verification']['score']) <= .08 for r in accepted[1:])
+                    ambiguous = any(not self._same_location(best['box'],r['box'])
+                        and r['verification']['area_fraction'] >= .35*best['verification']['area_fraction']
+                        and abs(best['verification']['score']-r['verification']['score']) <= .08 for r in accepted[1:])
                     for r in accepted if ambiguous else accepted[1:]:
                         r.update(identity=None,identity_status="ambiguous_color_locations" if ambiguous else "suppressed_duplicate")
                 regions.extend(candidates)
             boxes = {r['identity']:r['box'] for r in regions if r['identity']}
         self.previous_boxes = dict(boxes)
         status = "blank_frame" if blank else "observed" if boxes else "unavailable"
+        candidate_counts = {}
+        for region in regions:
+            reason = region["identity_status"]
+            candidate_counts[reason] = candidate_counts.get(reason,0)+1
         return dict(t=round(t,6),media_timestamp_s=round(t,6),boxes=boxes,regions=regions,
             unknown=[n for n in self.names if n not in boxes],shot_id=self.shot,cut=bool(cut),
             valid_until=round(t+min(.5,1/self.config.fps),6),source="opencv_color_shape_demo",status=status,
             abstention_reason=None if boxes else "blank_frame" if blank else "no_unambiguous_color_shape_match",
             coordinate_space="video-normalized",provider_confidence_available=False,experimental=True,
+            candidate_counts=candidate_counts,
             clip_id=self.clip_id,session_id=self.session_id,generation_id=self.generation_id,
             inference_seconds=round(time.perf_counter()-started,6),
             resources=dict(device="cpu",recognition_fps=self.config.fps,image_size=self.config.image_size,

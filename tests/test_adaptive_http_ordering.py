@@ -134,3 +134,62 @@ async def test_wrong_clip_identity_is_rejected_before_recording_tick_or_event(tm
             assert response.status_code == 400, response.text
         assert session.clips == before
         assert engine.tasks == set()
+
+
+def diagnostic_body(session, destination=1, source=0, phase='state', epoch=1):
+    anchor=min(destination,len(session.clips)-1)
+    body=event_body(session,anchor,'diagnostic',time.time())
+    body['diagnostic']=dict(phase=phase,index=destination,previousIndex=source,epoch=epoch,
+        elapsedMs=50,holdMs=100,readyState=1,networkState=2,videoTime=0,mediaErrorCode=None,
+        reason='buffering' if phase=='state' else None,
+        sourceClipId=session.clips[source]['id'] if source is not None else None,
+        targetClipId=session.clips[destination]['id'] if destination<len(session.clips) else None)
+    return body
+
+
+@pytest.mark.asyncio
+async def test_transition_diagnostics_preserve_source_destination_and_do_not_count_as_viewing(tmp_path, monkeypatch):
+    import json
+    async with local_session(tmp_path,monkeypatch) as (session,engine,adapter,client):
+        before=copy.deepcopy(session.clips)
+        body=diagnostic_body(session)
+        body['diagnostic']['url']='https://unexpected.example/private'
+        response=await client.post('/api/adaptive/playback-event',json=body)
+        assert response.status_code==200,response.text
+        assert response.json()['recorded']
+        row=json.loads((session.dir/'events.jsonl').read_text().splitlines()[-1])
+        assert row['kind']=='browser_transition' and row['sourceClipId']==session.clips[0]['id']
+        assert row['destinationClipId']==session.clips[1]['id'] and row['destinationIndex']==1
+        assert 'url' not in row and 'https://' not in json.dumps(row)
+        assert session.clips==before and engine.tasks==set()
+        # No destination clip has been created yet: preserve the predecessor identity.
+        absent=diagnostic_body(session,destination=2,source=1)
+        assert (await client.post('/api/adaptive/playback-event',json=absent)).status_code==200
+        assert session.events[-1]['destinationClipId'] is None
+        assert session.events[-1]['sourceClipId']==session.clips[1]['id']
+        assert session.events[-1]['clientDestinationKnown'] is False
+        assert session.clips==before and adapter.submissions==[]
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_ingestion_is_bounded_across_retries_and_client_epochs(tmp_path, monkeypatch):
+    async with local_session(tmp_path,monkeypatch) as (session,_,_,client):
+        body=diagnostic_body(session)
+        for _ in range(3): assert (await client.post('/api/adaptive/playback-event',json=body)).status_code==200
+        assert len(session.events)==1
+        for epoch in range(2,50):
+            body['diagnostic']['epoch']=epoch
+            assert (await client.post('/api/adaptive/playback-event',json=body)).status_code==200
+        assert len(session.events)==24
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('change', [dict(sourceClipId='wrong'),dict(targetClipId='wrong'),dict(phase='fake'),
+    dict(index=100),dict(index=.5),dict(holdMs=-1),dict(networkState=5),dict(epoch=True),dict(errorName='https://private')])
+async def test_malformed_transition_diagnostic_never_mutates_session(tmp_path,monkeypatch,change):
+    async with local_session(tmp_path,monkeypatch) as (session,engine,_,client):
+        body=diagnostic_body(session); body['diagnostic'].update(change)
+        before=copy.deepcopy(session.clips)
+        response=await client.post('/api/adaptive/playback-event',json=body)
+        assert response.status_code==400,response.text
+        assert session.clips==before and not session.events and engine.tasks==set()

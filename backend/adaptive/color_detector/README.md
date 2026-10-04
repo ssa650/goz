@@ -1,5 +1,9 @@
 # Experimental two-character color detector
 
+2026-10-04 targeted integration fix: a disjoint accepted candidate must have at least 35% of the main torso skin area before it can make that identity ambiguous. This addresses a tiny yellow background patch suppressing a larger supported SpongeBob torso in session `93ddda15-47d4-4da3-abcd-bb07565c293a`. Comparable disjoint bodies still abstain. Archived benchmark hashes below describe the earlier version; they do not establish live accuracy of this revision.
+
+The host now logs decoder startup, loaded function code fingerprints, candidate features and rejection statuses, frame timestamps/expiry, publication, 3.5-second frozen evidence, and browser overlay coordinates to per-clip `_tracking.jsonl` files. Select a run and Refresh in the existing decision trace panel to inspect/export that history. Browser history is reported geometry and may arrive after a decision freeze. Streaming can begin before a complete local copy exists; tracking starts only when the bridge supplies that copy and never extends the observation window.
+
 `from backend.adaptive.color_detector import ColorCharacterDetector, ColorDetectorConfig`
 
 ```python

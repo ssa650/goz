@@ -1,4 +1,5 @@
 import { setupTracePanel } from './decision-trace.js';
+import { overlayDiagnostic } from './tracking-diagnostics.js';
 import { museProgress } from './muse-status.js';
 import { currentObservation } from './adaptive-observation.js';
 import { trackerValue, trackingSummary } from './adaptive-tracker.js';
@@ -58,6 +59,8 @@ $('setup').addEventListener('submit', async event => {
   body.append('premise', $('premise').value);
   body.append('timeline', $('timeline').value);
   body.append('tracker', trackerValue($('tracker').value));
+  body.append('playback_mode', $('stream-playback').checked ? 'stream' : 'download');
+  body.append('eegRunMode', $('eeg-run-mode').value);
   body.append('characters', JSON.stringify(characters)); body.append('duration', $('duration').value); body.append('resolution', $('resolution').value);
   body.append('objects', JSON.stringify($('objects').value.split(',').map(n => n.trim()).filter(Boolean).map(n => ({name:n, description:n}))));
   submitting = true; $('start').disabled = true;
@@ -66,6 +69,16 @@ $('setup').addEventListener('submit', async event => {
   finally { submitting = false; $('start').disabled = !providerConfigured || !state?.setup?.generationReady; }
 });
 for (const [id,recenter] of [['gaze-check',false],['gaze-recenter',true]]) $(id).addEventListener('click',async()=>{try {await post('/api/sensors/gaze-check',{recenter});}catch(e){error(e.message);}});
+let eegCalibrationPending = false;
+for (const [id, action] of [['eeg-calibration-start','start_or_recalibrate'],['eeg-gaze-only','gaze_only']]) {
+  $(id).addEventListener('click', async () => {
+    if (eegCalibrationPending) return;
+    eegCalibrationPending = true; $(id).disabled = true;
+    try { await post('/api/adaptive/muse/calibration',{action}); }
+    catch (e) { error(e.message); }
+    finally { eegCalibrationPending = false; }
+  });
+}
 $('sensor-retry').addEventListener('click', async () => {
   try { await request('/api/sensors/setup', {method:'POST'}); } catch (e) { error(e.message); }
 });
@@ -102,6 +115,17 @@ function screenRect() {
   const right = Math.min(c.left+c.w,r.right,innerWidth), bottom = Math.min(c.top+c.h,r.bottom,innerHeight);
   return {rect:convert(c), visible_rect:convert({left,top,w:Math.max(0,right-left),h:Math.max(0,bottom-top)})};
 }
+function transitionDiagnostic(diagnostic) {
+  const s = state?.session, sid = sessionId;
+  if (!s || s.id !== sid) return;
+  const source = diagnostic.previousIndex == null ? null : s.clips[diagnostic.previousIndex];
+  const target = s.clips[diagnostic.index], anchor = target || source;
+  if (!anchor) return;
+  const body = {session_id:sid,clip:anchor.index,clip_id:anchor.id,kind:'diagnostic',wall:Date.now()+clockOffset,
+    diagnostic:{...diagnostic,sourceClipId:source?.id ?? null,targetClipId:target?.id ?? null}};
+  // Capture identity/time now. A late response must never relabel another run.
+  void post('/api/adaptive/playback-event',body).catch(() => {});
+}
 async function playbackEvent(kind, v) {
   const clip = state?.session?.clips[v.clipIndex], sid = sessionId;
   if (!clip) return;
@@ -131,10 +155,11 @@ for (const v of videos) {
 const player = new PlaybackQueue(videos, event => {
   playerMode = event.state;
   if (event.state === 'playing') {
+    const changedVideo = video !== player.current;
     video = player.current; playingIndex = event.index; waitingFor = event.index;
     $('overlay').hidden = true;
     const key = `${sessionId}:${event.index}`;
-    if (lastPresentedClip !== key) { lastPresentedClip=key; playbackEpoch++; presented=null; void playbackEvent('playing',video); }
+    if (lastPresentedClip !== key || changedVideo) { lastPresentedClip=key; playbackEpoch++; presented=null; void playbackEvent('playing',video); }
   } else if (event.state === 'gesture') {
     $('overlay').hidden=false; $('overlay').textContent='Click the video to start playback.';
   } else if (['buffering','loading','stopped','error','finished','cancelled'].includes(event.state)) {
@@ -144,7 +169,7 @@ const player = new PlaybackQueue(videos, event => {
       event.state === 'error' ? 'Media could not play. Stop and restart to retry.' : event.state === 'stopped' ? 'Generation failed · holding last frame. Stop and restart when the provider is available.' :
       event.index ? 'BRIDGE · holding the last frame while the next generated scene becomes ready. No new viewer evidence is collected.' : 'Preparing the opening scene…';
   }
-});
+}, transitionDiagnostic);
 $('screen').addEventListener('click', () => { if (player.autoplayBlocked) void player.tryPlay(); });
 function managePlayer(s) {
   if (s.status === 'stopped') { if (!player.stopped) player.stop(); return; }
@@ -172,11 +197,20 @@ async function sendCapturedTick(payload) {
 setInterval(() => { if (!('requestVideoFrameCallback' in video) || !presented || performance.now()-presented.at > 300) void reportTick(!('requestVideoFrameCallback' in video)); }, 150);
 
 // -- overlay ------------------------------------------------------------------
+let lastOverlayDiagnosticAt = 0, overlayDiagnosticPending = false;
 function draw() {
   const r = canvas.getBoundingClientRect();
   if (canvas.width !== Math.round(r.width * devicePixelRatio) || canvas.height !== Math.round(r.height * devicePixelRatio)) { canvas.width = Math.round(r.width * devicePixelRatio); canvas.height = Math.round(r.height * devicePixelRatio); }
   ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0); ctx.clearRect(0, 0, r.width, r.height);
   const c = contentRect(), s = state?.session;
+  if (s && playingIndex != null && s.clips[playingIndex] && s.status === 'running' && !overlayDiagnosticPending && Date.now()-lastOverlayDiagnosticAt >= 1000) {
+      lastOverlayDiagnosticAt=Date.now(); overlayDiagnosticPending=true;
+      const clip=s.clips[playingIndex], vr=video.getBoundingClientRect();
+      const diagnostic=overlayDiagnostic({clip,mediaTime:video.currentTime,enabled:$('show-boxes').checked,
+        content:c,canvas:r,video:vr,active:clip?.status!=='watched',dpr:devicePixelRatio});
+      void post('/api/adaptive/overlay-diagnostic',{session_id:sessionId,clip_id:clip?.id,
+        wall:Date.now()+clockOffset,diagnostic}).catch(()=>{}).finally(()=>{overlayDiagnosticPending=false;});
+    }
   if (c && s && playingIndex != null) {
     ctx.save(); const vr=video.getBoundingClientRect(); ctx.beginPath(); ctx.rect(vr.left-r.left,vr.top-r.top,vr.width,vr.height);ctx.clip();
     const ox = c.left - r.left, oy = c.top - r.top;
@@ -233,6 +267,14 @@ function render(st) {
   $('muse-connect').disabled = submitting || museState.state === 'connecting' || museState.state === 'connected';
   $('muse-disconnect').disabled = submitting || museState.state === 'disconnected';
   $('sensor-retry').hidden = !setup?.canRetry; $('sensor-retry').disabled = s?.status === 'running';
+  const eegCalibration = setup?.eegCalibration;
+  $('eeg-calibration-progress').value = eegCalibration?.cleanSeconds || 0;
+  $('eeg-calibration-status').textContent = eegCalibration ?
+    `${eegCalibration.gazeOnly ? 'Gaze-only selected · ' : ''}${eegCalibration.ready ? 'EEG baseline ready' : eegCalibration.state} · ${eegCalibration.cleanSeconds.toFixed(1)} / 60 unique clean seconds · ${eegCalibration.reason}` : 'EEG calibration status unavailable.';
+  $('eeg-calibration-start').hidden = !eegCalibration?.supported;
+  $('eeg-calibration-start').textContent = eegCalibration?.ready ? 'Recalibrate for a different wearer or setup' : 'Start / restart 60-second EEG calibration';
+  $('eeg-calibration-start').disabled = eegCalibrationPending || submitting || s?.status === 'running' || !setup?.muse?.live;
+  $('eeg-gaze-only').disabled = eegCalibrationPending || submitting || s?.status === 'running' || !!eegCalibration?.gazeOnly;
   $('gaze-calibration-status').textContent = `Eye calibration: ${setup?.gaze?.calibrationState || 'required'}${setup?.gaze?.failureReason ? ' · '+setup.gaze.failureReason : ''}`;
   $('calibration-details').textContent=[setup?.gaze?.calibrationPath,setup?.gaze?.checkCommand,setup?.gaze?.checkGuidance].filter(Boolean).join('\n');
   $('gaze-calibration-remove').hidden = !setup?.gaze?.savedCalibration;
@@ -242,7 +284,7 @@ function render(st) {
   const gz = st.gaze, ee = st.eeg;
   pill('gaze-source', gz.error ? 'port busy' : gz.source === 'sim' ? 'SIM' : gz.live ? 'gazekit live' : 'no gaze', gz.source === 'sim' ? 'sim' : gz.live ? 'live' : 'off');
   pill('eeg-source', ee.source === 'sim' ? 'SIM' : ['muse', 'mindmonitor'].includes(ee.source) ? (ee.connectionState || (ee.live ? 'streaming' : 'disconnected')).replaceAll('_',' ') : 'off', ee.source === 'sim' ? 'sim' : ee.live ? 'live' : 'off');
-  $('eeg-state').textContent = (ee.source === 'mindmonitor' ? `${ee.state} · smoothed α/β ${ee.alphaBetaRatio?.toFixed(2) ?? '—'}` : `${ee.state} · relative β/(α+θ)`) + ` · confidence ${Math.round(100 * (ee.confidence || 0))}%`;
+  $('eeg-state').textContent = (ee.source === 'mindmonitor' ? `${ee.state} · smoothed α/β ${ee.alphaBetaRatio?.toFixed(2) ?? '—'}` : `${ee.state} · relative β/(α+θ)`) + ` · signal quality ${Math.round(100 * (ee.confidence || 0))}%`;
   $('eeg-quality').textContent = (!ee.live || !(ee.confidence > 0) ? 'EEG unavailable — gaze-only mode · ' : '') + (ee.qualityError || (ee.selectedChannels?.length ? `Clean channels: ${ee.selectedChannels.join(', ')}${ee.qualityWarning ? ' · '+ee.qualityWarning : ''}` : ee.goodChannels ? `Good channels: ${ee.goodChannels.join(', ')}` : ''));
   $('gaze-hz').textContent = gz.hz ?? '—'; $('blinks').textContent = gz.blinks_per_min ?? '—'; $('yaw').textContent = gz.yaw != null ? Math.round(gz.yaw) : '—';
   const point=currentObservation(gz.point,sessionId,s?.clips[playingIndex]?.id,(Date.now()+clockOffset)/1000);
@@ -301,6 +343,7 @@ function render(st) {
   $('current-decision').textContent=current ? `${running ? 'Playing' : 'Last played'} scene ${current.index+1} · decision ${current.decisionId || 'opening'} · ${currentChange}` : 'No clip playing';
   $('queue-state').textContent=`${playerMode} · ${s.clips.filter(c=>c.status==='ready').length} media ready · future queue limit 1`;
   $('latency').textContent=s.latency?.samples ? `Readiness ${s.latency.readinessS.map(t=>t.toFixed(1)+'s').join(', ')} (n=${s.latency.samples}); adaptation freezes at ${Math.min(3.5,current?.duration ?? s.duration).toFixed(1)}s of playback. Full-clip tracking runs independently.` : 'Waiting for measured readiness.';
+  $('latency').textContent += s.playbackMode === 'stream' ? ` Delivery: ${current?.playbackDelivery === 'stream' ? 'progressive MP4' : 'validated download'}; local copy ${current?.localMediaStatus || 'pending'}.` : ' Delivery: fully validated download.';
   $('mapping-state').textContent=screenMapping.valid(windowKey()) ? `Screen mapping measured (scale ${screenMapping.transform.scale.toFixed(3)}) · eye calibration remains a separate check.` : 'Move the pointer diagonally across the player to measure screen mapping. Eye calibration is checked separately.';
   if (latest) {
     const d = latest.decision;

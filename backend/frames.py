@@ -94,9 +94,20 @@ async def extract_last_frame(path):
 
 
 def media_metadata(path):
-    reader = imageio_ffmpeg.read_frames(str(path))
+    # Read a complete first frame, rather than trusting only the container header.
+    # Limit decoder/output work and let FFmpeg exit after that one frame.
+    reader = imageio_ffmpeg.read_frames(str(path),
+        input_params=["-protocol_whitelist", "file,pipe", "-threads", "2"],
+        output_params=["-map", "0:v:0", "-an", "-frames:v", "1", "-threads", "2"])
     try:
-        return next(reader)
+        metadata = next(reader)
+        try:
+            frame = next(reader)
+        except StopIteration as error:
+            raise ValueError("Downloaded provider result has no decodable video frame.") from error
+        if len(frame) != metadata["size"][0] * metadata["size"][1] * 3:
+            raise ValueError("Downloaded provider result has an incomplete video frame.")
+        return metadata
     finally:
         reader.close()
 

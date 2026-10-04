@@ -56,7 +56,12 @@ def test_scripted_screen_gaze_ground_truth_and_invalid_flags_never_change_gates(
 async def test_real_14_5s_offline_clip_retains_tail_coverage_and_measured_budget(tmp_path):
     path=tmp_path/'full.mp4'
     await ffmpeg('-loop','1','-i',ROOT/'presets/secret-box/frames/00-30.jpg','-t','14.5','-vf','scale=640:400','-r','8','-pix_fmt','yuv420p',path)
-    result=await local_tracker.detect_local(path,CAST,clip_id='a',session_id='s',generation_id='g')
+    # Match session startup: warm once before any clip tracking is submitted.
+    worker=await local_tracker.prewarm_local_tracker('opencv')
+    try:
+        result=await local_tracker.detect_local(path,CAST,clip_id='a',session_id='s',generation_id='g',warm_worker=worker)
+    finally:
+        await worker.close()
     assert len(result)==116 and result[0]['t']==0 and result[-1]['t']==14.375
     assert set(result[-1]['boxes'])==set(CAST)
     cost=result[-1]['scheduling']
@@ -64,6 +69,23 @@ async def test_real_14_5s_offline_clip_retains_tail_coverage_and_measured_budget
     assert cost['mode']=='offline_full_clip' and cost['dropped_stale_inputs']==0
     assert cost['queue_capacity']==2 and cost['worker_cpu_s']>0 and cost['worker_wall_s']>0
     assert all(r['clip_id']=='a' and r['generation_id']=='g' for r in result)
+    # The standalone cold helper remains reachable. Its contract is bounded
+    # progress, including real partial frames if startup/inference uses budget.
+    cold_progress=[];started=time.monotonic()
+    try:
+        cold=await local_tracker.detect_local(path,CAST,clip_id='cold',session_id='s',generation_id='cold-g',
+            on_progress=lambda rows:cold_progress.append(list(rows)))
+    except TimeoutError:
+        cold=cold_progress[-1] if cold_progress else []
+    assert time.monotonic()-started<=local_tracker.MAX_WALL_SECONDS+5
+    assert cold and cold[0]['t']==0 and cold[-1]['t']<=14.375
+    assert all(r['clip_id']=='cold' and r['generation_id']=='cold-g' and r['t']==r['media_timestamp_s'] for r in cold)
+    assert all(a['t']<b['t'] for a,b in zip(cold,cold[1:]))
+    gate=local_tracker._gates[asyncio.get_running_loop()]
+    deadline=time.monotonic()+10
+    while gate.locked() and time.monotonic()<deadline:await asyncio.sleep(.05)
+    assert not gate.locked()
+    print('COLD_BUDGET',dict(records=len(cold),throughMediaS=cold[-1]['t'],wallS=round(time.monotonic()-started,3)))
 
 
 @pytest.mark.asyncio
@@ -72,8 +94,8 @@ async def test_live_playback_skips_old_inference_and_keeps_unknown_provenance(tm
     await ffmpeg('-loop','1','-i',ROOT/'presets/secret-box/frames/00-30.jpg','-t','5','-vf','scale=640:400','-r','8','-pix_fmt','yuv420p',path)
     state=lambda:dict(media_t=4,at=time.monotonic(),playing=True,current=True,epoch=2)
     result=await local_tracker.detect_local(path,CAST,clip_id='a',session_id='s',generation_id='g',playback_state=state)
-    dropped=[r for r in result if r.get('abstention_reason')=='stale_work_skipped_for_playback']
-    assert dropped and all(not r['boxes'] and r['cut'] and r['valid_until']==r['t'] for r in dropped)
+    gaps=[r for r in result if r.get('input_gap')]
+    assert gaps and all(not r['cut'] for r in gaps)  # A decode skip is not a visual scene cut.
     assert all(r['t']>=3.75 for r in result if r['boxes'])
     assert result[-1]['t']==4.875 and result[-1]['scheduling']['dropped_stale_inputs']>0
 
