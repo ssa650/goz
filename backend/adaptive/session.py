@@ -166,6 +166,8 @@ class AdaptiveSession:
             eeg = self.eeg.window(t0, t1)
             timeline = fusion.label(samples, clip["ticks"], clip.get("track") or [])
             analysis = fusion.analyze(timeline, eeg, clip.get("track") or [], self.names, clip.get("plan"))
+            if self.eeg.source == "mindmonitor":
+                analysis.update(eeg_method="fable-alpha-beta-ema", eeg_unit="index")
             clip.update(analysis=analysis, timeline=timeline)
             self.dump(f"scene{index + 1}_signals.json", dict(gaze=samples, eeg=eeg, ticks=clip["ticks"],
                                                               timeline=timeline, analysis=analysis))

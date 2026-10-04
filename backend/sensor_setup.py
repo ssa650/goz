@@ -30,6 +30,7 @@ class SensorSetup:
         self.logs = {}
         self.readers = {}
         self.stopping = False
+        self.selected_camera = None
 
     def snapshot(self):
         eeg, gaze = self.sensors.eeg, self.sensors.gaze
@@ -51,6 +52,7 @@ class SensorSetup:
                        else "Gaze signal lost. Face the camera; retry setup if the camera stopped.")
         return dict(required=self.required, generationReady=bool(ready), phase=self.phase,
                     message=message, error=self.error, canRetry=self.required and (self.phase == "failed" or self.phase == "ready" and not ready),
+                    camera=dict(source=self.selected_camera),
                     muse=muse, gaze=dict(**gaze.status(), calibrated=self.gaze_calibrated,
                                         valid=gaze_live, report=self.gaze_report))
 
@@ -70,7 +72,7 @@ class SensorSetup:
     async def wait_for(self, predicate, timeout, child=None):
         deadline = time.monotonic() + timeout
         while not predicate():
-            if self.sensors.eeg.state.startswith("Muse connection error:"):
+            if self.phase in ("connecting_muse", "calibrating_muse") and self.sensors.eeg.state.startswith("Muse connection error:"):
                 raise ValueError(self.sensors.eeg.state)
             if child and child.returncode is not None:
                 raise ValueError("Sensor process stopped. " + self.log_tail(child))
@@ -95,7 +97,18 @@ class SensorSetup:
         self.logs[name] = []
         async def read():
             while line := await child.stdout.readline():
-                self.logs[name].append(line.decode(errors="replace").strip()[:400])
+                value = line.decode(errors="replace").strip()
+                if name == "gaze_calibration" and value == "GOZ_CAMERA_WINDOW ready":
+                    self.message = "Gazekit’s camera window is open. Select iPhone Camera (Continuity Camera). Keep the phone locked with its rear cameras facing you. Press R to refresh. Muse starts after gaze calibration."
+                if name == "gaze_calibration" and value.startswith("GOZ_CAMERA "):
+                    try:
+                        camera = json.loads(value[len("GOZ_CAMERA "):])["camera"]
+                        if isinstance(camera, str) and camera.isdigit():
+                            self.selected_camera = camera
+                            self.set_phase("calibrating_gaze", "Camera selected. Follow Gazekit's calibration targets and dismiss its results screen. Muse calibration comes next.")
+                    except (ValueError, KeyError, TypeError):
+                        pass
+                self.logs[name].append(value[:400])
                 self.logs[name] = self.logs[name][-20:]
         self.readers[name] = asyncio.create_task(read())
         return child
@@ -105,8 +118,8 @@ class SensorSetup:
             self.error = None
             self.gaze_calibrated = False
             self.gaze_report = None
-            if self.sensors.gaze_mode != "gazekit" or self.sensors.eeg_mode != "muse":
-                raise ValueError("Live generation requires GOZ_GAZE=gazekit and GOZ_EEG=muse. Use GOZ_DEMO=1 for a rehearsal.")
+            if self.sensors.gaze_mode != "gazekit" or self.sensors.eeg_mode not in ("muse", "mindmonitor"):
+                raise ValueError("Live generation requires GOZ_GAZE=gazekit and GOZ_EEG=mindmonitor (or muse). Use GOZ_DEMO=1 for a rehearsal.")
             if self.sensors.gaze_error:
                 raise ValueError(self.sensors.gaze_error)
             self.attempt_dir = self.directory / "calibration" / str(uuid4())
@@ -119,28 +132,12 @@ class SensorSetup:
                 raise ValueError("Gazekit was not found. Set GOZ_GAZEKIT_DIR to its checkout.")
             if not gaze_python.is_file():
                 raise ValueError("Gazekit Python was not found. Set GOZ_GAZEKIT_PYTHON to its interpreter.")
-            self.set_phase("connecting_muse", "Turn on and wear Muse 2. Connecting over Bluetooth…")
-            # Reuse an already-published Muse stream; don't take over its process.
-            try:
-                await self.wait_for(lambda: bool(self.sensors.eeg.device_id), 4)
-            except ValueError:
-                argv = [sys.executable, "-u", "-m", "muselsl", "stream", "--backend", "bleak", "--model", "legacy", "--lsltime", "--retries", "2"]
-                for option, env_name in (("--address", "GOZ_MUSE_ADDRESS"), ("--name", "GOZ_MUSE_NAME")):
-                    if os.getenv(env_name): argv += [option, os.environ[env_name]]
-                bridge = await self.launch("muse", argv, ROOT)
-                await self.wait_for(lambda: bool(self.sensors.eeg.device_id), 90, bridge)
-            self.set_phase("calibrating_muse", "Muse connected. Sit still with eyes open for 60 seconds of clean EEG. Adjust forehead/ear contacts if signal quality is poor.")
-            self.sensors.eeg.begin_calibration()
-            await self.wait_for(lambda: bool(self.sensors.eeg.calibration), 240, self.children.get("muse"))
-            (self.attempt_dir / "muse.json").write_text(json.dumps(self.sensors.eeg.calibration, indent=2))
-            (self.attempt_dir / "muse.json").chmod(0o600)
-            self.set_phase("calibrating_gaze", "Muse calibrated. Gazekit is opening: follow the targets, then press a key on its results screen.")
+            self.set_phase("select_camera", "Gazekit is opening automatically. Select your iPhone Camera in its native window, then follow the calibration targets. Keep the iPhone locked, with its rear cameras facing you. Muse comes afterward.")
             worker = [gaze_python, "-u", "-m", "backend.gaze_worker"]
-            camera = os.getenv("GOZ_GAZE_CAMERA", "0")
             model = self.attempt_dir / "gaze_model.pkl"
             report_path = self.attempt_dir / "gaze_ready.json"
             calibration = await self.launch("gaze_calibration", [*worker, "calibrate", "--repo", gaze_repo,
-                                                    "--camera", camera, "--model", model, "--report", report_path], ROOT)
+                                                    "--camera", "select", "--model", model, "--report", report_path], ROOT)
             try:
                 code = await asyncio.wait_for(calibration.wait(), timeout=900)
             except TimeoutError:
@@ -151,6 +148,10 @@ class SensorSetup:
             self.gaze_report = json.loads(report_path.read_text())
             if self.gaze_report.get("verdict") not in ("STABLE", "USABLE"):
                 raise ValueError("Gaze calibration was poor. Retry in better lighting while facing the camera.")
+            camera = self.gaze_report.get("camera")
+            if not isinstance(camera, str) or not camera.isdigit():
+                raise ValueError("Gazekit did not report the selected camera. Retry calibration.")
+            self.selected_camera = camera
             self.gaze_calibrated = True
             self.set_phase("starting_gaze", "Gaze calibrated. Complete Gazekit's quick alignment; waiting for valid gaze samples…")
             # Old samples from an unrelated external producer cannot unlock setup.
@@ -160,7 +161,28 @@ class SensorSetup:
                                       "--model", model, "--setup-id", self.attempt_dir.name,
                                       "--port", str(os.getenv("GOZ_GAZE_PORT", "5590"))], ROOT)
             await self.wait_for(lambda: any(s.get("valid") for s in self.sensors.gaze.window(time.time() - 1, time.time())), 90, stream)
-            self.set_phase("ready", "Muse and gaze are calibrated and live. You can generate your video.")
+            self.sensors.start_muse_reader()
+            if self.sensors.eeg_mode == "mindmonitor":
+                status = self.sensors.eeg.status()
+                self.set_phase("connecting_muse", f"Connect Muse 2 in Mind Monitor on your phone. On the same Wi-Fi, set OSC destination to {status['oscDestination']}, UDP port {status['oscPort']}, and enable OSC Stream Brainwaves (All Values or Average Only). Waiting for 10 readings with at least one good contact…")
+                await self.wait_for(lambda: self.sensors.eeg.status()["calibrated"], 240)
+            else:
+                self.set_phase("connecting_muse", "Turn on and wear Muse 2. Connecting over Bluetooth…")
+                # Reuse an already-published Muse stream; don't take over its process.
+                try:
+                    await self.wait_for(lambda: bool(self.sensors.eeg.device_id), 4)
+                except ValueError:
+                    argv = [sys.executable, "-u", "-m", "muselsl", "stream", "--backend", "bleak", "--model", "legacy", "--lsltime", "--retries", "2"]
+                    for option, env_name in (("--address", "GOZ_MUSE_ADDRESS"), ("--name", "GOZ_MUSE_NAME")):
+                        if os.getenv(env_name): argv += [option, os.environ[env_name]]
+                    bridge = await self.launch("muse", argv, ROOT)
+                    await self.wait_for(lambda: bool(self.sensors.eeg.device_id), 90, bridge)
+                self.set_phase("calibrating_muse", "Muse connected. Sit still with eyes open for 60 seconds of clean EEG. Adjust forehead/ear contacts if signal quality is poor.")
+                self.sensors.eeg.begin_calibration()
+                await self.wait_for(lambda: bool(self.sensors.eeg.calibration), 240, self.children.get("muse"))
+            (self.attempt_dir / "muse.json").write_text(json.dumps(self.sensors.eeg.calibration, indent=2))
+            (self.attempt_dir / "muse.json").chmod(0o600)
+            self.set_phase("ready", "Muse and gaze are ready and live. You can generate your video.")
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -198,6 +220,7 @@ class SensorSetup:
             self.sensors.eeg.disconnected()
         await self.stop_children(keep_muse=True)
         self.sensors.eeg.reset_calibration()
+        self.selected_camera = None
         self.set_phase("waiting", "Retrying sensor setup…")
         await self.start()
 

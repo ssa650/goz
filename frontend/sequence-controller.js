@@ -3,7 +3,7 @@ import { api, jsonRequest, sequenceFor } from './clip-state.js';
 /** @typedef {import('./clip-state.js').ClipRecord} ClipRecord */
 /** @typedef {import('./clip-state.js').SequenceRequest} SequenceRequest */
 /** @typedef {import('./clip-state.js').SequenceRun} SequenceRun */
-/** @typedef {{required:boolean,generationReady:boolean,phase:string,message:string,error:string|null,canRetry:boolean,muse:{cleanSeconds:number,targetSeconds:number,qualityError:string}}} SensorSetupState */
+/** @typedef {{required:boolean,generationReady:boolean,phase:string,message:string,error:string|null,canRetry:boolean,muse:{source?:string,startupSamples?:number,targetSamples?:number,goodChannels?:string[],cleanSeconds:number,targetSeconds:number,qualityError:string}}} SensorSetupState */
 /** @typedef {{configured:boolean,demo:boolean,pollMs:number,sensorSetup?:SensorSetupState}} PlayerConfig */
 /** @typedef {{getItem:(key:string)=>string|null,setItem:(key:string,value:string)=>void,removeItem:(key:string)=>void}} RequestStorage */
 

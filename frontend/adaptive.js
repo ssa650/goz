@@ -1,3 +1,4 @@
+import { museProgress } from './muse-status.js';
 const $ = id => document.getElementById(id);
 const COLORS = ['#e07a5f', '#3d85c6', '#81b29a', '#f2cc8f'];
 const video = $('video'), canvas = $('overlay-canvas'), ctx = canvas.getContext('2d');
@@ -142,18 +143,18 @@ function render(st) {
   const setup = st.setup;
   $('sensor-setup').hidden = !setup?.required;
   $('sensor-message').textContent = (setup?.error || setup?.message || '') +
-    (setup?.phase === 'calibrating_muse' ? ` (${setup.muse.cleanSeconds} / ${setup.muse.targetSeconds}s clean EEG${setup.muse.qualityError ? ' · '+setup.muse.qualityError : ''})` : '');
+    (setup && (setup.muse.source === 'mindmonitor' || setup.phase === 'calibrating_muse') ? ` (${museProgress(setup.muse)})` : '');
   $('sensor-retry').hidden = !setup?.canRetry; $('sensor-retry').disabled = s?.status === 'running';
   $('start').disabled = submitting || !providerConfigured || !setup?.generationReady;
   const gz = st.gaze, ee = st.eeg;
   pill('gaze-source', gz.error ? 'port busy' : gz.source === 'sim' ? 'SIM' : gz.live ? 'gazekit live' : 'no gaze', gz.source === 'sim' ? 'sim' : gz.live ? 'live' : 'off');
-  pill('eeg-source', ee.source === 'sim' ? 'SIM' : ee.source === 'muse' ? (ee.live ? 'Muse 2 live' : 'Muse 2 …') : 'off', ee.source === 'sim' ? 'sim' : ee.live ? 'live' : 'off');
-  $('eeg-state').textContent = `${ee.state} · β/(α+θ), z vs. rolling 60 s baseline`;
+  pill('eeg-source', ee.source === 'sim' ? 'SIM' : ['muse', 'mindmonitor'].includes(ee.source) ? (ee.live ? 'Muse 2 live' : 'Muse 2 …') : 'off', ee.source === 'sim' ? 'sim' : ee.live ? 'live' : 'off');
+  $('eeg-state').textContent = ee.source === 'mindmonitor' ? `${ee.state} · ${ee.label} · smoothed α/β ${ee.alphaBetaRatio?.toFixed(2) ?? '—'}` : `${ee.state} · β/(α+θ), z vs. calibrated baseline`;
   $('gaze-hz').textContent = gz.hz ?? '—'; $('blinks').textContent = gz.blinks_per_min ?? '—'; $('yaw').textContent = gz.yaw != null ? Math.round(gz.yaw) : '—';
   const target = gz.point?.target, tg = $('gaze-target'); tg.replaceChildren();
   if (target) { const sw = el('span', 'swatch'); sw.style.background = color(target); tg.append(sw, target); }
   else tg.textContent = gz.point ? (gz.point.on_video ? 'background' : 'off screen') : '—';
-  const z = ee.series.at(-1)?.z; $('eeg-z').textContent = z != null ? `${z >= 0 ? '+' : ''}${z.toFixed(2)}σ` : '—'; drawEeg(ee.series);
+  const z = ee.series.at(-1)?.z; $('eeg-z').textContent = z != null ? `${z >= 0 ? '+' : ''}${z.toFixed(2)}${ee.source === 'mindmonitor' ? '' : 'σ'}` : '—'; drawEeg(ee.series);
   if (!s) { $('stage').textContent = 'Idle.'; return; }
   if (s.id !== sessionId) { sessionId = s.id; playingIndex = null; waitingFor = 0; lastChanges = ''; video.removeAttribute('src'); video.load(); }
   running = s.status === 'running'; $('stop').disabled = !running; $('setup').hidden = running;

@@ -1,4 +1,5 @@
 // @ts-check
+import { museProgress } from './muse-status.js';
 import { PlaybackQueue } from './queue.js';
 import { SequencePlayback } from './sequence-playback.js';
 import { SequenceController, formatTime, runError } from './sequence-controller.js';
@@ -46,8 +47,8 @@ const {run,config}=controller,completed=run?.clips.filter(c=>c.status==='complet
   element('sensor-setup').hidden=!setup?.required;
   element('sensor-title').textContent=setup?.generationReady?'Sensors ready':'Sensor setup';
   element('sensor-message').textContent=setup?.error||setup?.message||'';
-  element('sensor-progress').textContent=setup?.phase==='calibrating_muse'
-    ?`${setup.muse.cleanSeconds.toFixed(1)} / ${setup.muse.targetSeconds} seconds of clean EEG${setup.muse.qualityError?' · '+setup.muse.qualityError:''}`:'';
+  element('sensor-progress').textContent=setup && (setup.muse.source === 'mindmonitor' || setup.phase === 'calibrating_muse')
+    ?museProgress(setup.muse):'';
   /** @type {HTMLButtonElement} */ const retry=element('sensor-retry');
   retry.hidden=!setup?.canRetry;retry.disabled=controller.busy;
   if(!run) {

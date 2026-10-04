@@ -31,7 +31,7 @@ def wave(feed, start, seconds, kind='clean'):
 
 
 def sensors():
-    return SimpleNamespace(gaze=GazeFeed(), eeg=EegFeed(), gaze_mode='gazekit', eeg_mode='muse', gaze_error=None)
+    return SimpleNamespace(gaze=GazeFeed(), eeg=EegFeed(), gaze_mode='gazekit', eeg_mode='muse', gaze_error=None, start_muse_reader=lambda: None)
 
 
 def test_clip_list_annotations_resolve_without_shadowing_builtin_list():
@@ -123,7 +123,8 @@ class Child:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('passed', [True, False])
-async def test_owned_startup_calibrates_both_then_unblocks_and_cleans_up(tmp_path, monkeypatch, passed):
+@pytest.mark.parametrize('eeg_mode', ['muse', 'mindmonitor'])
+async def test_owned_startup_calibrates_both_then_unblocks_and_cleans_up(tmp_path, monkeypatch, passed, eeg_mode):
     monkeypatch.setenv('GOZ_REQUIRE_SENSORS', '1')
     repo = tmp_path / 'gazekit'
     (repo / 'gazekit').mkdir(parents=True)
@@ -136,6 +137,11 @@ async def test_owned_startup_calibrates_both_then_unblocks_and_cleans_up(tmp_pat
     monkeypatch.setenv('OPENAI_API_KEY', 'must-not-reach-child')
     monkeypatch.setenv('FAL_KEY', 'must-not-reach-child')
     sn, calls, children, signals = sensors(), [], {}, []
+    if eeg_mode == 'mindmonitor':
+        from backend.adaptive.mindmonitor import MindMonitorFeed
+        sn.eeg, sn.eeg_mode = MindMonitorFeed(), eeg_mode
+    readers = []
+    sn.start_muse_reader = lambda: readers.append('started')
     async def spawn(*argv, **kwargs):
         assert 'OPENAI_API_KEY' not in kwargs['env'] and 'FAL_KEY' not in kwargs['env']
         assert kwargs['start_new_session'] is True
@@ -145,7 +151,7 @@ async def test_owned_startup_calibrates_both_then_unblocks_and_cleans_up(tmp_pat
         if 'calibrate' in argv:
             child = Child(0)
             Path(argv[argv.index('--model') + 1]).write_bytes(b'validated local model')
-            Path(argv[argv.index('--report') + 1]).write_text(json.dumps(dict(verdict='STABLE' if passed else 'POOR')))
+            Path(argv[argv.index('--report') + 1]).write_text(json.dumps(dict(verdict='STABLE' if passed else 'POOR', camera='2')))
         else: child = Child()
         children[child.pid] = child
         return child
@@ -157,8 +163,19 @@ async def test_owned_startup_calibrates_both_then_unblocks_and_cleans_up(tmp_pat
     setup = SensorSetup(sn, tmp_path, spawn=spawn)
     async def wait_for(predicate, timeout, child=None):
         if setup.phase == 'connecting_muse':
-            if not calls: raise ValueError('No pre-existing bridge')
-            sn.eeg.connected('Muse-owned-device')
+            assert [argv[4] for argv in calls[:2]] == ['calibrate', 'stream']
+            if eeg_mode == 'mindmonitor':
+                from unittest.mock import patch
+                now = time.time() - 1
+                with patch('backend.adaptive.mindmonitor.time.time', return_value=now):
+                    sn.eeg.receive('phone', '/muse/elements/horseshoe', 4, 1, 4, 4)
+                for i in range(10):
+                    with patch('backend.adaptive.mindmonitor.time.time', return_value=now + (i + 1) * .1):
+                        sn.eeg.receive('phone', '/muse/elements/alpha_absolute', 0.)
+                        sn.eeg.receive('phone', '/muse/elements/beta_absolute', 0.)
+            else:
+                if 'muse' not in setup.children: raise ValueError('No pre-existing bridge')
+                sn.eeg.connected('Muse-owned-device')
         elif setup.phase == 'calibrating_muse':
             sn.eeg.calibration_started -= 70
             wave(sn.eeg, time.time() - 65, 65)
@@ -171,8 +188,14 @@ async def test_owned_startup_calibrates_both_then_unblocks_and_cleans_up(tmp_pat
     await setup.task
     if passed:
         assert setup.snapshot()['generationReady'] and setup.phase == 'ready'
-        assert '--backend' in calls[0] and 'bleak' in calls[0] and '--lsltime' in calls[0]
-        assert [argv[4] for argv in calls[1:]] == ['calibrate', 'stream']
+        if eeg_mode == 'muse':
+            assert '--backend' in calls[2] and 'bleak' in calls[2] and '--lsltime' in calls[2]
+        else:
+            assert len(calls) == 2 and 'muse' not in setup.children
+        assert [argv[4] for argv in calls[:2]] == ['calibrate', 'stream']
+        assert calls[0][calls[0].index('--camera') + 1] == 'select'
+        assert calls[1][calls[1].index('--camera') + 1] == '2'
+        assert readers == ['started']
         assert (setup.attempt_dir / 'muse.json').exists()
         setup.require_ready()
         sn.gaze.last_rx = 0
@@ -180,15 +203,17 @@ async def test_owned_startup_calibrates_both_then_unblocks_and_cleans_up(tmp_pat
         with pytest.raises(FalError): setup.require_ready()
     else:
         assert setup.phase == 'failed' and 'poor' in setup.error.lower()
-        assert len(calls) == 2 and not setup.snapshot()['generationReady']
+        assert len(calls) == 1 and not setup.snapshot()['generationReady']
+        assert not readers and 'muse' not in setup.children
     # Recalibration must reuse the live Muse bridge and replace only the gaze worker.
-    bridge = setup.children['muse']
+    bridge = setup.children.get('muse')
     await setup.retry()
     await setup.task
-    assert setup.children['muse'] is bridge
-    assert sum('muselsl' in argv for argv in calls) == 1
+    assert setup.children.get('muse') is bridge
+    assert sum('muselsl' in argv for argv in calls) == (1 if passed and eeg_mode == 'muse' else 0)
     await setup.close()
-    assert not setup.children and signals
+    assert not setup.children
+    assert bool(signals) is passed
 
 
 @pytest.mark.asyncio
@@ -224,3 +249,76 @@ async def test_server_sensor_status_and_retry_busy_guard(tmp_path):
         engine.new_job(dict(mode='text', prompt='Existing', duration=5, resolution='480P'))
         response = await client.post('/api/sensors/setup')
         assert response.status_code == 409
+
+
+def test_external_camera_reference_is_shared_with_dataset(tmp_path, monkeypatch):
+    from backend.gaze_worker import configure_camera
+    attempt = tmp_path / 'attempt'
+    attempt.mkdir()
+    model = attempt / 'gaze.pkl'
+    dataset = SimpleNamespace()
+    monkeypatch.chdir(tmp_path)
+    configure_camera(2, model, dataset)
+    assert dataset.CONFIG_PATH == attempt / 'camera.json'
+    assert json.loads(dataset.CONFIG_PATH.read_text()) == {'camera':'2'}
+    assert Path.cwd() == attempt
+
+
+@pytest.mark.parametrize('keys,expected,iphone', [([255,13], '2', True), ([255,ord('2')], '0', True),
+                                               ([255,27], None, True), ([255,13,27], None, False)])
+def test_gazekit_native_camera_selection(keys, expected, iphone, monkeypatch):
+    from backend.gaze_worker import choose_camera
+    import backend.gaze_worker as worker
+    presses = iter(keys)
+    closed = []
+    class Window:
+        name, w, h = 'camera-test', 1200, 800
+        def canvas(self): return None
+        def show(self, img): return next(presses)
+        def close(self): closed.append(True)
+    ui = SimpleNamespace(FullscreenWindow=lambda *a: Window(), center_text=lambda *a: None, ACCENT=1, WHITE=2)
+    cv2 = SimpleNamespace(EVENT_LBUTTONDOWN=1, setMouseCallback=lambda *a: None, waitKey=lambda *a: None)
+    cameras = [dict(index=0, name="FaceTime HD Camera")]
+    if iphone: cameras.append(dict(index=2, name="iPhone Camera"))
+    camera = SimpleNamespace(list_cameras=lambda **kw: cameras)
+    monkeypatch.setattr(worker, "connected_cameras", lambda module: module.list_cameras())
+    if expected is None:
+        with pytest.raises(ValueError, match='cancelled'):
+            choose_camera(ui, cv2, camera, lambda: (1200,800))
+    else:
+        assert choose_camera(ui, cv2, camera, lambda: (1200,800)) == expected
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_gazekit_screen_coordinates_arrive_in_goz_over_udp():
+    import socket
+    feed = GazeFeed()
+    feed.expected_setup_id = 'validated-attempt'
+    await feed.listen(0)
+    sample = dict(t=time.time(), x=452.5, y=218.25, sw=1512, sh=982,
+                  valid=True, face=True, setupId='validated-attempt')
+    async def receive():
+        while feed.latest() is None:
+            await asyncio.sleep(0)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            sender.sendto(json.dumps(sample).encode(), feed.transport.get_extra_info('sockname'))
+        await asyncio.wait_for(receive(), 1)
+        assert feed.latest() == sample
+        assert feed.status()['live'] and feed.status()['source'] == 'gazekit'
+    finally:
+        feed.close()
+
+
+
+def test_continuity_enumeration_keeps_waiting_camera_and_matching_avfoundation_index(monkeypatch):
+    import backend.gaze_worker as worker
+    # Mac metadata indexes are sorted by device ID, independently of UI ordering.
+    devices = [dict(_name='iPhone Camera', **{'spcamera_unique-id':'Z'}),
+               dict(_name='FaceTime HD Camera', **{'spcamera_unique-id':'A'})]
+    monkeypatch.setattr(worker.subprocess, 'run', lambda *a, **kw: SimpleNamespace(stdout=json.dumps({'SPCameraDataType':devices})))
+    camera = SimpleNamespace(list_cameras=lambda **kw: pytest.fail('Do not hide cameras while awaiting their first frame'))
+    if sys.platform != 'darwin': pytest.skip('macOS enumeration')
+    found = worker.connected_cameras(camera)
+    assert [(c['index'],c['name']) for c in found] == [(0,'FaceTime HD Camera'), (1,'iPhone Camera')]

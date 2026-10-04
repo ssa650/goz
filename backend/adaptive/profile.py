@@ -25,6 +25,7 @@ def update(profile, analysis):
     """Returns (new_profile, changes[]) — each change names the evidence."""
     p = copy.deepcopy(profile)
     changes = []
+    unit = " index" if analysis.get("eeg_unit") == "index" else "σ"
     chars = analysis["characters"]
     total = sum(c["response"] for c in chars.values())
     if total > 0:
@@ -36,9 +37,9 @@ def update(profile, analysis):
             if abs(after - before) >= 0.03:
                 why = f"looked at {name} {round(100 * c['attention'])}% of the time they were on screen"
                 if c["eeg_response"]:
-                    why += f", EEG {c['eeg_response']:+.2f}σ after looking"
+                    why += f", EEG {c['eeg_response']:+.2f}{unit} after looking"
                 if c.get("speaking_response") is not None:
-                    why += f", EEG {c['speaking_response']:+.2f}σ while {name} spoke"
+                    why += f", EEG {c['speaking_response']:+.2f}{unit} while {name} spoke"
                 changes.append(dict(key=f"character:{name}", before=before, after=after,
                                     strong=c["strong"], why=why))
     z, blink, away = analysis["eeg_mean_z"], analysis["blink_rate_per_min"], analysis["look_away_frac"]
@@ -47,7 +48,7 @@ def update(profile, analysis):
         before = p["pacing"]
         p["pacing"] = round(clamp(before + 0.25 * bored), 3)
         changes.append(dict(key="pacing", before=before, after=p["pacing"], strong=bored >= 2,
-                            why=f"signs of low engagement: EEG {z:+.2f}σ, blinks {blink}/min, looked away {round(100 * (away or 0))}%"))
+                            why=f"signs of low engagement: EEG {z:+.2f}{unit}, blinks {blink}/min, looked away {round(100 * (away or 0))}%"))
     dialogue = [b["engagement_z"] for b in analysis["beats"] if b.get("dialogue") and b["engagement_z"] is not None]
     silent = [b["engagement_z"] for b in analysis["beats"] if not b.get("dialogue") and b["engagement_z"] is not None]
     if dialogue and silent:
@@ -56,7 +57,7 @@ def update(profile, analysis):
             before = p["dialogue"]
             p["dialogue"] = round(clamp(before + clamp(0.3 * delta, -STEP, STEP)), 3)
             changes.append(dict(key="dialogue", before=before, after=p["dialogue"], strong=abs(delta) > 0.6,
-                                why=f"EEG {delta:+.2f}σ during dialogue vs. silent moments"))
+                                why=f"EEG {delta:+.2f}{unit} during dialogue vs. silent moments"))
     for genre in GENRES:
         zs = [b["engagement_z"] for b in analysis["beats"] if genre in b.get("tags", []) and b["engagement_z"] is not None]
         if zs:
@@ -64,7 +65,7 @@ def update(profile, analysis):
             p["genres"][genre] = round(clamp(before + clamp(0.3 * sum(zs) / len(zs), -STEP, STEP)), 3)
             if abs(p["genres"][genre] - before) >= 0.1:
                 changes.append(dict(key=f"genre:{genre}", before=before, after=p["genres"][genre], strong=False,
-                                    why=f"EEG {sum(zs) / len(zs):+.2f}σ during {genre} moments"))
+                                    why=f"EEG {sum(zs) / len(zs):+.2f}{unit} during {genre} moments"))
     p["clips"] += 1
     return p, changes
 

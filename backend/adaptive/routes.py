@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse
 from starlette.datastructures import UploadFile
 
 from .sensors import EegFeed, GazeFeed, Simulator, run_muse, GAZE_PORT
+from .mindmonitor import MindMonitorFeed, run_mindmonitor
 from .session import AdaptiveSession
 from ..sensor_setup import SensorSetup
 
@@ -22,18 +23,19 @@ MAX_OPENING_BYTES = 100 * 1024 * 1024
 
 class Sensors:
     def __init__(self, directory=None, demo=False):
-        self.gaze, self.eeg = GazeFeed(), EegFeed()
+        self.eeg_mode = os.getenv("GOZ_EEG", "mindmonitor")
+        self.gaze, self.eeg = GazeFeed(), MindMonitorFeed() if self.eeg_mode == "mindmonitor" else EegFeed()
         self.stop_event = threading.Event()
         self.sim_task, self.session = None, None
         self.gaze_mode = os.getenv("GOZ_GAZE", "gazekit")
-        self.eeg_mode = os.getenv("GOZ_EEG", "muse")
         self.gaze_error = None
         self.muse_thread = None
         self.setup = SensorSetup(self, directory or "data", demo)
 
     def start_muse_reader(self):
-        if self.eeg_mode == "muse" and (not self.muse_thread or not self.muse_thread.is_alive()):
-            self.muse_thread = threading.Thread(target=run_muse, args=(self.eeg, self.stop_event), daemon=True)
+        if self.eeg_mode in ("muse", "mindmonitor") and (not self.muse_thread or not self.muse_thread.is_alive()):
+            reader = run_mindmonitor if self.eeg_mode == "mindmonitor" else run_muse
+            self.muse_thread = threading.Thread(target=reader, args=(self.eeg, self.stop_event), daemon=True)
             self.muse_thread.start()
 
     async def start(self):
@@ -43,7 +45,8 @@ class Sensors:
                 self.gaze.source = "waiting for `gazekit stream`"
             except OSError as error:
                 self.gaze_error = f"UDP port busy: {error}"
-        self.start_muse_reader()
+        if not self.setup.required or self.eeg_mode == "mindmonitor":
+            self.start_muse_reader()
         simulate_gaze, simulate_eeg = self.gaze_mode == "sim", self.eeg_mode == "sim"
         if simulate_gaze or simulate_eeg:
             favourite = int(os.getenv("GOZ_SIM_FAVORITE", "1"))

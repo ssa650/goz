@@ -172,7 +172,6 @@ def create_app(engine=None):
         async with e.lock:
             if e.busy() or sensors.session and sensors.session.status == "running":
                 raise FalError("Stop or finish the current generation before recalibrating sensors.", 409)
-            sensors.start_muse_reader()
             await sensors.setup.retry()
         return sensors.setup.snapshot()
 
