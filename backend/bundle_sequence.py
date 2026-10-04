@@ -76,6 +76,7 @@ class BundleSequenceService:
                 if existing.get("mode") != "bundles":
                     raise FalError("This run ID belongs to another sequence.", 409)
                 return self.snapshot(existing)
+            e.generation_guard()
             ordered = self.validate(body.get("clips"))
             if not e.adapter.configured():
                 raise FalError("Add your Fal key first.", 503)

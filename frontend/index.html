@@ -6,6 +6,12 @@
 </head>
 <body><main>
   <header><a class="brand" href="/">GOZ<span class="dot"></span></a><span id="backend-status" class="badge">Connecting…</span></header>
+  <section id="sensor-setup" aria-label="Sensor setup" hidden>
+    <strong id="sensor-title">Connecting sensors</strong>
+    <p id="sensor-message" role="status" aria-live="polite"></p>
+    <p id="sensor-progress"></p>
+    <button id="sensor-retry" class="secondary" type="button" hidden>Retry sensor setup</button>
+  </section>
   <section class="player-panel" aria-label="Video player">
     <div class="player-heading"><h1>Your next scene.</h1><button id="fullscreen" type="button" class="secondary">Fullscreen</button></div>
     <div id="screen">

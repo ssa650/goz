@@ -3,7 +3,8 @@ import { api, jsonRequest, sequenceFor } from './clip-state.js';
 /** @typedef {import('./clip-state.js').ClipRecord} ClipRecord */
 /** @typedef {import('./clip-state.js').SequenceRequest} SequenceRequest */
 /** @typedef {import('./clip-state.js').SequenceRun} SequenceRun */
-/** @typedef {{configured:boolean,demo:boolean,pollMs:number}} PlayerConfig */
+/** @typedef {{required:boolean,generationReady:boolean,phase:string,message:string,error:string|null,canRetry:boolean,muse:{cleanSeconds:number,targetSeconds:number,qualityError:string}}} SensorSetupState */
+/** @typedef {{configured:boolean,demo:boolean,pollMs:number,sensorSetup?:SensorSetupState}} PlayerConfig */
 /** @typedef {{getItem:(key:string)=>string|null,setItem:(key:string,value:string)=>void,removeItem:(key:string)=>void}} RequestStorage */
 
 /** Regenerate the frozen inputs, including the exact seeds and asset IDs.
@@ -43,6 +44,16 @@ export class SequenceController {
     this.starting=false;this.error='';this.connectionError='';
   }
   get busy() {return this.starting||!!this.run?.generationBusy||!!this.run&&!['completed','failed','cancelled','interrupted'].includes(this.run.status);}
+  get generationReady() {return this.config?.sensorSetup?.generationReady??true;}
+  async retrySensorSetup() {
+    if(this.busy) return;
+    try {
+      const state=await this.request('/api/sensors/setup',{method:'POST'});
+      if(this.config) this.config.sensorSetup=state;
+      this.error='';
+    } catch(error) {this.error=error instanceof Error?error.message:String(error);}
+    this.changed(this);
+  }
   async init() {
     try {
       const [config,clips,runs]=await Promise.all([
@@ -67,6 +78,10 @@ export class SequenceController {
   /** @param {boolean} [regenerate] */
   async generate(regenerate=false) {
     if(this.busy||!this.config?.configured) return;
+    if(!this.generationReady) {
+      this.error=this.config.sensorSetup?.error||this.config.sensorSetup?.message||'Complete sensor calibration first.';
+      this.changed(this);return;
+    }
     this.starting=true;this.error='';this.changed(this);
     try {
       if(!this.pending) {
@@ -91,10 +106,13 @@ export class SequenceController {
     } finally {this.starting=false;this.changed(this);}
   }
   async refresh() {
-    if(!this.run||this.starting) return;
+    if(this.starting) return;
     try {
-      /** @type {SequenceRun} */ const run=await this.request(`/api/sequences/${this.run.id}`);
-      this.run=run;this.connectionError='';this.playback(run);
+      const [config,run]=await Promise.all([
+        this.request('/api/config'),this.run?this.request(`/api/sequences/${this.run.id}`):Promise.resolve(null)
+      ]);
+      this.config=config;this.connectionError='';
+      if(run) {this.run=run;this.playback(run);}
     } catch(error) {this.connectionError=error instanceof Error?error.message:String(error);}
     this.changed(this);
   }

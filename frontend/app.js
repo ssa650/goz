@@ -38,13 +38,26 @@ fullscreen.addEventListener('click',async()=>{
 });
 /** @param {SequenceController} controller */
 function render(controller) {
-  const {run,config}=controller,completed=run?.clips.filter(c=>c.status==='completed').length||0;
+const {run,config}=controller,completed=run?.clips.filter(c=>c.status==='completed').length||0;
   element('backend-status').textContent=config?(config.demo?'Local demo':'Connected'):'Disconnected';
-  generate.disabled=!config?.configured||controller.busy;
-  regenerate.disabled=!config?.configured||controller.busy||!run;
+  generate.disabled=!config?.configured||controller.busy||!controller.generationReady;
+  regenerate.disabled=!config?.configured||controller.busy||!run||!controller.generationReady;
+  const setup=config?.sensorSetup;
+  element('sensor-setup').hidden=!setup?.required;
+  element('sensor-title').textContent=setup?.generationReady?'Sensors ready':'Sensor setup';
+  element('sensor-message').textContent=setup?.error||setup?.message||'';
+  element('sensor-progress').textContent=setup?.phase==='calibrating_muse'
+    ?`${setup.muse.cleanSeconds.toFixed(1)} / ${setup.muse.targetSeconds} seconds of clean EEG${setup.muse.qualityError?' · '+setup.muse.qualityError:''}`:'';
+  /** @type {HTMLButtonElement} */ const retry=element('sensor-retry');
+  retry.hidden=!setup?.canRetry;retry.disabled=controller.busy;
+  if(!run) {
+    element('overlay-message').textContent=controller.generationReady?'Your sequence is ready. Click Generate.':'Complete sensor setup to begin.';
+    element('playback-status').textContent=`${controller.clips.length} clips · playback starts as soon as clip 1 is ready.`;
+  }
   download.disabled=!run?.finalVideoUrl||run.status!=='completed';
   generate.textContent=controller.starting?'Starting…':controller.pending?'Reconnect':'Generate';
   const status=!config?'Connecting to the backend…':!config.configured?'Set FAL_KEY in .env, then restart the app.'
+    :!controller.generationReady?'Complete sensor calibration before starting a new generation.'
     :controller.starting?'Starting your sequence…':!run?`${controller.clips.length} clips ready.`
     :run.status==='completed'?`${completed}/${run.clips.length} clips completed · Your video is ready to download.`
     :run.status==='stitching'?`${completed}/${run.clips.length} clips completed · Stitching your download…`
@@ -66,6 +79,7 @@ function render(controller) {
   }).flat());
 }
 const controller=new SequenceController(render,run=>playback.update(run));
+element('sensor-retry').addEventListener('click',()=>void controller.retrySensorSetup());
 generate.addEventListener('click',()=>void controller.generate());
 regenerate.addEventListener('click',()=>void controller.generate(true));
 download.addEventListener('click',()=>{

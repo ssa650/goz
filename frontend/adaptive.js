@@ -2,6 +2,7 @@ const $ = id => document.getElementById(id);
 const COLORS = ['#e07a5f', '#3d85c6', '#81b29a', '#f2cc8f'];
 const video = $('video'), canvas = $('overlay-canvas'), ctx = canvas.getContext('2d');
 let state = null, sessionId = null, playingIndex = null, waitingFor = 0, sound = false, lastChanges = '', running = false;
+let providerConfigured = false, submitting = false;
 
 async function request(path, options) {
   const r = await fetch(path, options); const value = await r.json();
@@ -28,6 +29,7 @@ function syncSequenceSettings() {
 $('use-sequence').addEventListener('change', syncSequenceSettings);
 $('setup').addEventListener('submit', async event => {
   event.preventDefault(); error('');
+  if (state?.setup && !state.setup.generationReady) { error(state.setup.error || state.setup.message); return; }
   const characters = [...$('characters').children].map(r => ({ name: r.children[0].value.trim(), description: r.children[1].value.trim() })).filter(c => c.name);
   const body = new FormData(), file = $('opening').files[0];
   if (file) body.append(file.type.startsWith('video/') ? 'opening' : 'start', file);
@@ -35,10 +37,13 @@ $('setup').addEventListener('submit', async event => {
   body.append('premise', $('premise').value);
   body.append('timeline', $('timeline').value);
   body.append('characters', JSON.stringify(characters)); body.append('duration', $('duration').value); body.append('resolution', $('resolution').value);
-  $('start').disabled = true;
+  submitting = true; $('start').disabled = true;
   try { await request('/api/adaptive/sessions', { method: 'POST', body }); }
   catch (e) { error(e.message); }
-  finally { $('start').disabled = false; }
+  finally { submitting = false; $('start').disabled = !providerConfigured || !state?.setup?.generationReady; }
+});
+$('sensor-retry').addEventListener('click', async () => {
+  try { await request('/api/sensors/setup', {method:'POST'}); } catch (e) { error(e.message); }
 });
 $('stop').addEventListener('click', async () => { try { await post('/api/adaptive/stop', {}); } catch (e) { error(e.message); } });
 $('sound').addEventListener('click', () => { sound = !sound; video.muted = !sound; $('sound').textContent = sound ? 'Mute sound' : 'Enable sound'; });
@@ -134,6 +139,12 @@ function drawEeg(series) {
 }
 function render(st) {
   state = st; const s = st.session;
+  const setup = st.setup;
+  $('sensor-setup').hidden = !setup?.required;
+  $('sensor-message').textContent = (setup?.error || setup?.message || '') +
+    (setup?.phase === 'calibrating_muse' ? ` (${setup.muse.cleanSeconds} / ${setup.muse.targetSeconds}s clean EEG${setup.muse.qualityError ? ' · '+setup.muse.qualityError : ''})` : '');
+  $('sensor-retry').hidden = !setup?.canRetry; $('sensor-retry').disabled = s?.status === 'running';
+  $('start').disabled = submitting || !providerConfigured || !setup?.generationReady;
   const gz = st.gaze, ee = st.eeg;
   pill('gaze-source', gz.error ? 'port busy' : gz.source === 'sim' ? 'SIM' : gz.live ? 'gazekit live' : 'no gaze', gz.source === 'sim' ? 'sim' : gz.live ? 'live' : 'off');
   pill('eeg-source', ee.source === 'sim' ? 'SIM' : ee.source === 'muse' ? (ee.live ? 'Muse 2 live' : 'Muse 2 …') : 'off', ee.source === 'sim' ? 'sim' : ee.live ? 'live' : 'off');
@@ -189,11 +200,13 @@ async function init() {
   addCharacter(); addCharacter();
   try {
     const config = await request('/api/config');
+    providerConfigured = config.configured;
     $('duration').replaceChildren(...config.durations.map(n => new Option(String(n), String(n)))); $('duration').value = '10';
     syncSequenceSettings();
     $('cost-note').textContent = config.demo ? 'DEMO mode: synthetic clips, no Fal calls.' : config.configured
       ? 'Each scene is a paid Fal generation (and an OpenAI call if OPENAI_API_KEY is set).' : 'Fal key missing: set FAL_KEY in .env and restart.';
   } catch (e) { error(e.message); }
+  $('start').disabled = !providerConfigured || !state?.setup?.generationReady;
   void poll();
 }
 void init();

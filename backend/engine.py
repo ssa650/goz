@@ -39,6 +39,7 @@ class Engine:
         self.tasks, self.sequence_tasks, self.uploads, self.media_locks = set(), {}, {}, {}
         self.monitored = set()
         self.stopping = False
+        self.generation_guard = lambda: None
         for sequence in self.sequences.values():
             if sequence["status"] not in SEQUENCE_TERMINAL:
                 sequence.update(status="interrupted", finishedAt=now(), error="Server restarted. No more clips will be submitted. Check the saved Fal request before starting another run.")
@@ -256,6 +257,7 @@ class Engine:
         async with self.lock:
             if run_id in self.sequences:
                 return self.sequences[run_id]
+            self.generation_guard()
             if not self.adapter.configured():
                 raise FalError("Add your Fal key first.", 503)
             if self.busy():

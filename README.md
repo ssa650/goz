@@ -20,16 +20,18 @@ Copy `.env.example` to `.env` and set `FAL_KEY`, then restart the Python backend
 
 http://127.0.0.1:3210/adaptive.html plays an ordered story with subtle adjustments from the viewer's responses. While a 5–15 s scene plays, the backend timestamps gaze, blinks, head direction (from [gazekit](../gazekit), `gazekit stream`) and Muse 2 EEG engagement, hit-tests gaze against the characters detected in that scene, and updates a viewer profile. At 70 % of the scene, `gpt-6-luna` chooses one bounded engagement action using the Responses API with strict Structured Outputs. Python applies one short, predefined cue to the next saved prompt; OpenAI never supplies a replacement video prompt. The original scene, dialogue, seed, initial/end frame asset IDs, expansion mode, duration and resolution are preserved. The dashboard shows the current gaze target, the EEG trace, which preference changed and why, and the AI's decision.
 
-Run it with three terminals:
+Backend startup now handles the sensor setup automatically. Wear and turn on Muse 2, then run `.venv/bin/python -m backend` and open the player. The setup panel shows these steps:
 
-```sh
-# 1. Muse 2 (turn it on; grant Bluetooth to the terminal)
-.venv/bin/muselsl stream
-# 2. gaze (calibrate first: python3 -m gazekit calibrate --camera 0)
-cd ../gazekit && python3 -m gazekit stream --camera 0
-# 3. GOZ (FAL_KEY + OPENAI_API_KEY in .env)
-.venv/bin/python -m backend
-```
+1. Reuse an existing Muse LSL stream, or launch MuseLSL with the Bleak backend and connect over Bluetooth.
+2. Collect **60 seconds of clean, eyes-open EEG**. The four channels are checked for excessive movement, flat signals, clipping, missing packets, and strong 50/60 Hz interference. Rejected windows do not count. The completed baseline is frozen for this connection rather than continuously adapting to the viewer's predicted engagement.
+3. Launch Gazekit's existing full target calibration. Follow its targets and press a key on the results screen. A cancelled, failed or poor result cannot unlock generation.
+4. Start Gazekit streaming with that exact validated model, perform its quick alignment, and wait for fresh valid gaze samples. Samples are tagged with the calibration attempt ID; another producer cannot unlock this setup.
+
+**Generate**, **Regenerate**, individual clip generation, legacy generation and the adaptive-start API all require calibrated, live signals. If a signal drops or becomes noisy, new starts are blocked. Previously accepted jobs and downloads remain available. Use **Retry sensor setup** after fixing a setup failure or losing a calibration; retries preserve an owned, still-running Muse bridge and replace the gaze process. Restarting the backend always requires fresh calibration. Backend shutdown terminates only the sensor processes it launched; an existing external Muse stream remains yours.
+
+Gazekit defaults to the sibling `../gazekit` checkout and the backend's Python interpreter. The ridge calibration path uses the NumPy, OpenCV, MediaPipe and scikit-learn dependencies already installed with `requirements.txt`; it does not need CNN training. `GOZ_GAZEKIT_DIR`, `GOZ_GAZEKIT_PYTHON`, `GOZ_GAZE_CAMERA`, `GOZ_MUSE_ADDRESS` and `GOZ_MUSE_NAME` override the local paths, camera or device. macOS may ask for Bluetooth/camera permissions. The official MediaPipe face model is downloaded once if absent. Recordings, the trained gaze model, validation report and Muse baseline remain inside `data/calibration/`, locally; child processes do not receive OpenAI/Fal keys.
+
+`GOZ_REQUIRE_SENSORS=0` explicitly disables the gate for development. `GOZ_DEMO=1` also skips real hardware calibration and is labelled as a demo; neither is evidence of hardware readiness. The Muse checks are application-level signal-quality checks, not a device-native impedance test. Live connection/calibration requires the user's physical headset, camera and participation.
 
 Open the page in a browser window at 100 % zoom (full screen is most accurate: gaze arrives in screen points and the page maps it onto the video using its window position). Keep **Use the saved ordered prompts and frame pairs** checked to freeze the existing clip bundles in their current order. No image upload is required for that mode. An optional opening episode clip plays as-is in place of Clip 1; uncheck the saved-sequence option to use a custom opening image/video and premise instead. Name the characters with a short look description ("green octopus with a long nose"), write the premise, optionally add the clip's timeline, and press **Start**.
 
@@ -54,7 +56,7 @@ Rehearse without hardware or spending credits (synthetic clips, simulated viewer
 GOZ_DEMO=1 GOZ_GAZE=sim GOZ_EEG=sim GOZ_DATA_DIR=output/demo-data PORT=3211 .venv/bin/python -m backend
 ```
 
-`GOZ_GAZE` is `gazekit|sim|off`, `GOZ_EEG` is `muse|sim|off`. `GOZ_SIM_FAVORITE` (character index) and `GOZ_SIM_BIAS` tune the simulator. SIM sources are labelled on the dashboard.
+`GOZ_GAZE` is `gazekit|sim|off`, `GOZ_EEG` is `muse|sim|off`. Real gated generation requires `gazekit` and `muse`; simulated/off modes are for explicitly configured demos or development. `GOZ_SIM_FAVORITE` (character index) and `GOZ_SIM_BIAS` tune the simulator. SIM sources are labelled on the dashboard.
 
 ## Ordered video sequence
 
@@ -81,6 +83,7 @@ Open http://127.0.0.1:3211. The UI explicitly says **DEMO**. This produces synth
 ## Project layout
 
 - `backend/app.py`: FastAPI routes and static frontend serving.
+- `backend/sensor_setup.py`, `backend/gaze_worker.py`: sensor process ownership, startup calibration, readiness gating, retries and Gazekit integration. `GET /api/sensors` exposes setup status; `POST /api/sensors/setup` retries while generation is idle.
 - `backend/clips.py`, `backend/clip_settings.py`: independent clip definitions, typed validation and shared H3 routing.
 - `backend/bundle_sequence.py`: frozen clip batches, bounded concurrency, per-clip validation and ordered assembly.
 - `backend/engine.py`: generation pipeline, history and recovery; deprecated multipart requests convert to complete clip definitions at ingress.
@@ -131,3 +134,5 @@ There is no configured lint command. Verification includes the Python integratio
 The simplified player was checked with all 12 bundled clip inputs in an isolated local demo, using five-second synthetic clips and a delayed Clip 2. Clip 1 played while generation was active, the player waited for Clip 2, and all clips continued automatically through the end. Download produced a valid 60.02-second MP4; Regenerate retained every input and started a new run; reload recovered saved results without extra POSTs. The real saved failure was also checked: the UI now displays Fal's exhausted-balance error. No new paid generation was submitted during verification.
 
 Adaptive integration tests use fake OpenAI/Fal HTTP transports and simulated viewer data. They check strict JSON schemas, refusal/incomplete/invalid output, bounded prompt changes without truncation, and exact ordered clip prompt/seed/first/end-frame associations in all four input modes. Live provider calls and Muse/gaze hardware are not verified by those tests. The main `/` player remains the saved-sequence generator; `/adaptive.html` runs the sensor-driven decision loop.
+
+Sensor tests cover clean baseline collection, flat/clipped/mains/movement rejection, frozen calibration and dropout invalidation, Muse stream selection/clock conversion, Gazekit attempt IDs, successful/failed calibration process lifecycles, bridge reuse on retry, and generation-route bypass prevention. The `ClipService.list` annotations use `builtins.list` to avoid the method name shadowing Python’s list type, including on Python versions that evaluate annotations eagerly.

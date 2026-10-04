@@ -12,6 +12,10 @@
     <span id="backend-status" class="badge">Connecting…</span></header>
   <div class="layout">
     <section class="stage-col" aria-label="Story player">
+      <section id="sensor-setup" aria-label="Sensor setup" hidden>
+        <strong>Sensor setup</strong><p id="sensor-message" role="status" aria-live="polite"></p>
+        <button id="sensor-retry" class="secondary" type="button" hidden>Retry sensor setup</button>
+      </section>
       <div id="screen">
         <video id="video" muted playsinline preload="auto" disablepictureinpicture disableremoteplayback></video>
         <canvas id="overlay-canvas"></canvas>

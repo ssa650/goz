@@ -14,19 +14,27 @@ from starlette.datastructures import UploadFile
 
 from .sensors import EegFeed, GazeFeed, Simulator, run_muse, GAZE_PORT
 from .session import AdaptiveSession
+from ..sensor_setup import SensorSetup
 
 MAX_CHARACTERS = 4
 MAX_OPENING_BYTES = 100 * 1024 * 1024
 
 
 class Sensors:
-    def __init__(self):
+    def __init__(self, directory=None, demo=False):
         self.gaze, self.eeg = GazeFeed(), EegFeed()
         self.stop_event = threading.Event()
         self.sim_task, self.session = None, None
         self.gaze_mode = os.getenv("GOZ_GAZE", "gazekit")
         self.eeg_mode = os.getenv("GOZ_EEG", "muse")
         self.gaze_error = None
+        self.muse_thread = None
+        self.setup = SensorSetup(self, directory or "data", demo)
+
+    def start_muse_reader(self):
+        if self.eeg_mode == "muse" and (not self.muse_thread or not self.muse_thread.is_alive()):
+            self.muse_thread = threading.Thread(target=run_muse, args=(self.eeg, self.stop_event), daemon=True)
+            self.muse_thread.start()
 
     async def start(self):
         if self.gaze_mode == "gazekit":
@@ -35,8 +43,7 @@ class Sensors:
                 self.gaze.source = "waiting for `gazekit stream`"
             except OSError as error:
                 self.gaze_error = f"UDP port busy: {error}"
-        if self.eeg_mode == "muse":
-            threading.Thread(target=run_muse, args=(self.eeg, self.stop_event), daemon=True).start()
+        self.start_muse_reader()
         simulate_gaze, simulate_eeg = self.gaze_mode == "sim", self.eeg_mode == "sim"
         if simulate_gaze or simulate_eeg:
             favourite = int(os.getenv("GOZ_SIM_FAVORITE", "1"))
@@ -51,13 +58,17 @@ class Sensors:
                     return proxy.session.live_target() if proxy.session else None
 
             self.sim_task = asyncio.create_task(Simulator(Live(), self.gaze, self.eeg, favourite, bias).run(simulate_gaze, simulate_eeg))
+        await self.setup.start()
 
     async def close(self):
         self.stop_event.set()
+        await self.setup.close()
         self.gaze.close()
         if self.sim_task:
             self.sim_task.cancel()
             await asyncio.gather(self.sim_task, return_exceptions=True)
+        if self.muse_thread:
+            await asyncio.to_thread(self.muse_thread.join, 5)
 
 
 def number(value, lo, hi):
@@ -79,6 +90,7 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
     @app.post("/api/adaptive/sessions", status_code=202)
     async def start(request: Request):
         e, sn = request.app.state.engine, sensors(request)
+        sn.setup.require_ready()
         form = await multipart(request, {"start", "opening"})
         try:
             premise = str(form.get("premise", "")).strip()
@@ -171,6 +183,7 @@ def register(app, json_body, images, multipart, duration_value, resolution_value
         latest = sn.gaze.latest()
         return dict(
             session=s.public() if s else None,
+            setup=sn.setup.snapshot(),
             gaze=dict(**sn.gaze.status(), error=sn.gaze_error, point=s.live_gaze() if s else None,
                       blinks_per_min=round(2 * blinks, 1) if recent else None,
                       yaw=latest.get("yaw") if latest else None, pitch=latest.get("pitch") if latest else None),

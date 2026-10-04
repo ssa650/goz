@@ -100,7 +100,9 @@ def create_app(engine=None):
         else:
             app.state.engine = engine
         from .adaptive.routes import Sensors
-        app.state.sensors = Sensors()
+        e = app.state.engine
+        app.state.sensors = Sensors(e.directory, demo=e.adapter.demo)
+        e.generation_guard = app.state.sensors.setup.require_ready
         await app.state.sensors.start()
         await app.state.engine.resume()
         yield
@@ -156,8 +158,23 @@ def create_app(engine=None):
     async def config(request: Request):
         e = request.app.state.engine
         return dict(configured=e.adapter.configured(), demo=e.adapter.demo, backend="python", models=MODELS,
+                    sensorSetup=request.app.state.sensors.setup.snapshot(),
                     duration=DURATION, durations=DURATIONS, maxImageBytes=MAX_IMAGE_BYTES,
                     maxCharacters=MAX_CHARACTERS, maxClips=MAX_CLIPS, promptExpansionModes=["disabled", "balanced", "quality"], individualClips=True, canUndoImport="beforeImport" in e.sequences.get("individual-clips", {}), pollMs=int(e.poll_seconds*1000), sequenceRunner=True, presetAvailable=True)
+
+    @app.get("/api/sensors")
+    async def sensor_state(request: Request):
+        return request.app.state.sensors.setup.snapshot()
+
+    @app.post("/api/sensors/setup", status_code=202)
+    async def sensor_retry(request: Request):
+        e, sensors = request.app.state.engine, request.app.state.sensors
+        async with e.lock:
+            if e.busy() or sensors.session and sensors.session.status == "running":
+                raise FalError("Stop or finish the current generation before recalibrating sensors.", 409)
+            sensors.start_muse_reader()
+            await sensors.setup.retry()
+        return sensors.setup.snapshot()
 
     @app.post("/api/key")
     async def key(request: Request):
@@ -414,6 +431,7 @@ def create_app(engine=None):
             if mode == "frames" and uploaded["characters"] or mode == "characters" and (uploaded["start"] or uploaded["end"]):
                 raise ValueError("Use combined mode to send frames with character references.")
             async with e.lock:
+                e.generation_guard()
                 if not e.adapter.configured():
                     raise FalError("Add your Fal API key first.", 503)
                 if e.busy():

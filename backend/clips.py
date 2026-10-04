@@ -1,4 +1,5 @@
 """Independent editable clips backed by the existing sequence/job histories."""
+import builtins
 from copy import deepcopy
 from typing import TYPE_CHECKING
 from uuid import uuid4, UUID
@@ -102,14 +103,14 @@ class ClipService:
         result["status"] = job["status"] if job and job["status"] in ACTIVE_STATUSES else record["status"]
         return result
 
-    def list(self) -> list[dict]:
+    def list(self) -> builtins.list[dict]:
         return [self.snapshot(record) for record in self.library()["clipDefinitions"]]
 
     def require_editable(self):
         if self.engine.bundles.active():
             raise FalError("Wait for the sequence and its accepted requests before editing clip bundles.", 409)
 
-    def reorder(self, clip_ids: list[str]) -> list[dict]:
+    def reorder(self, clip_ids: builtins.list[str]) -> builtins.list[dict]:
         self.require_editable()
         records = self.library()["clipDefinitions"]
         if not isinstance(clip_ids, list) or any(not isinstance(i, str) for i in clip_ids) or len(clip_ids) != len(records) or set(clip_ids) != {c["id"] for c in records}:
@@ -170,7 +171,7 @@ class ClipService:
         self.library()
         self.engine.persist()
 
-    def import_prompts(self, text: str, mode=None) -> list[dict]:
+    def import_prompts(self, text: str, mode=None) -> builtins.list[dict]:
         self.require_editable()
         self.require_idle_cards()
         imported, structured = parse_clip_import(text)
@@ -253,6 +254,7 @@ class ClipService:
             existing = next((j for j in e.jobs.values() if j.get("clipId") == clip_id and j.get("clientToken") == token), None)
             if existing:
                 return e.public_job(existing)
+            e.generation_guard()
             if not e.adapter.configured():
                 raise FalError("Add your Fal API key first.", 503)
             active = e.jobs.get(record.get("jobId"))

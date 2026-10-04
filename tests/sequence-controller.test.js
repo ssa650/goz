@@ -77,3 +77,31 @@ test('Existing generic failure shows the actual billing error and timing values'
   run.clips[2].error='Invalid image';assert.match(runError(run),/Clip 3: Invalid image/);
   assert.equal(formatTime(null),'—');assert.equal(formatTime(0),'0.0s');assert.equal(formatTime(12300),'12.3s');assert.equal(formatTime(92000),'1m 32s');
 });
+
+test('Sensor calibration blocks Generate/Regenerate and polling unlocks without an existing run',async()=>{
+  let ready=false;const submitted=[];
+  const request=async(path,options)=>{
+    if(path==='/api/config')return {...config,sensorSetup:{required:true,generationReady:ready,phase:ready?'ready':'calibrating_muse',message:'Collecting clean EEG',error:null,canRetry:false,muse:{cleanSeconds:20,targetSeconds:60,qualityError:''}}};
+    if(path==='/api/clips')return clips();
+    if(!options)return [];
+    const body=JSON.parse(options.body);submitted.push(body);return runFor(body);
+  };
+  const controller=new SequenceController(()=>{},()=>{},request,storage());await controller.init();
+  assert.equal(controller.generationReady,false);
+  await controller.generate();assert.equal(submitted.length,0);assert.match(controller.error,/EEG/);
+  ready=true;await controller.refresh();assert.equal(controller.generationReady,true);
+  await controller.generate();assert.equal(submitted.length,1);
+});
+
+test('Sensor retry uses only the setup route and never starts a generation',async()=>{
+  const requests=[];
+  const setup={required:true,generationReady:false,phase:'connecting_muse',message:'Connecting',error:null,canRetry:false,muse:{cleanSeconds:0,targetSeconds:60,qualityError:''}};
+  const request=async(path,options)=>{
+    if(path==='/api/config')return {...config,sensorSetup:setup};
+    if(path==='/api/clips')return clips();if(!options)return [];
+    requests.push([path,options]);return setup;
+  };
+  const controller=new SequenceController(()=>{},()=>{},request,storage());await controller.init();
+  await controller.retrySensorSetup();assert.deepEqual(requests,[['/api/sensors/setup',{method:'POST'}]]);
+  assert.equal(controller.pending,null);assert.equal(controller.config.sensorSetup.phase,'connecting_muse');
+});

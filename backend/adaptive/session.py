@@ -188,6 +188,7 @@ class AdaptiveSession:
     async def make_scene(self, decision, image, seeds, changes):
         index = len(self.clips)
         try:
+            self.engine.generation_guard()
             bundle = self.clip_bundles[index] if self.clip_bundles else None
             duration = bundle["duration"] if bundle else self.duration
             self.story["next_prompt"] = bundle["prompt"] if bundle else self.story["premise"]
@@ -196,6 +197,7 @@ class AdaptiveSession:
             decision = plan["decision"]
             if self.status != "running":
                 return
+            self.engine.generation_guard()
             clip = dict(index=index, status="generating", decision=decision, changes=changes, plan=plan,
                         writer=writer, duration=duration, ticks=[], seeds=seeds, createdAt=time.time(),
                         bundle=deepcopy(bundle), basePrompt=plan["base_prompt"])
